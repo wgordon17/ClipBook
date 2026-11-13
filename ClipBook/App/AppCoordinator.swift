@@ -121,8 +121,13 @@ final class AppCoordinator: ObservableObject {
       .store(in: &cancellables)
   }
   
-  func start() {
+  func loadAndReconcilePreferences() {
     model.preferences = preferencesStore.load()
+    model.forkPreferences = preferencesStore.loadForkPreferences()
+  }
+
+  func start() {
+    loadAndReconcilePreferences()
     #if DEBUG
     applyDebugTrialDates()
     #endif
@@ -537,6 +542,7 @@ final class AppCoordinator: ObservableObject {
     let changes = Self.preferenceChanges(from: lastAppliedPreferences, to: current)
 
     preferencesStore.save(current)
+    preferencesStore.saveForkPreferences(model.forkPreferences)
     if changes.appearance {
       applyAppearance()
     }
@@ -562,6 +568,7 @@ final class AppCoordinator: ObservableObject {
 
   func persistPreferences() {
     preferencesStore.save(model.preferences)
+    preferencesStore.saveForkPreferences(model.forkPreferences)
   }
 
   func refreshLicensingState() {
