@@ -3,8 +3,16 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - fork
   pull_request:
+    branches:
+      - fork
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
 
 permissions:
   contents: read
@@ -25,6 +33,7 @@ jobs:
       - name: Run Swift Testing suite
         env:
           RESULT_BUNDLE_PATH: ${{ runner.temp }}/ClipBookTests.xcresult
+          SNAPSHOT_EXPORT_DIR: ${{ runner.temp }}/exported-snapshots
         run: ./test.sh
 
       - name: Upload test results
@@ -33,5 +42,14 @@ jobs:
         with:
           name: ClipBookTests-xcresult
           path: ${{ runner.temp }}/ClipBookTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload exported snapshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ClipBookTests-snapshots
+          path: ${{ runner.temp }}/exported-snapshots
           if-no-files-found: ignore
           retention-days: 7

@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - fork
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Optional X.Y.Z override'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-fork
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/fork'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate optional input and run test suite
+        env:
+          RAW_UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+          SNAPSHOT_EXPORT_DIR: ${{ runner.temp }}/exported-snapshots
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_UPSTREAM_VERSION" =~ ^([0-9]+(\.[0-9]+){1,2})?$ ]]; then
+            printf 'Error: Invalid upstream_version input: %s\n' "$RAW_UPSTREAM_VERSION" >&2
+            exit 1
+          fi
+          printf 'VALIDATED_UPSTREAM_VERSION=%s\n' "$RAW_UPSTREAM_VERSION" >> "$GITHUB_ENV"
+          ./test.sh
+
+      - name: Upload exported snapshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ClipBookTests-snapshots
+          path: ${{ runner.temp }}/exported-snapshots
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fetch previous Sparkle build floor
+        run: |
+          set -euo pipefail
+          APPCAST_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml"
+          PREV_XML="$RUNNER_TEMP/prev-appcast.xml"
+          HTTP_CODE="$(curl -sSL --proto '=https' --tlsv1.2 --max-redirs 5 --connect-timeout 10 --max-time 20 --max-filesize 1048576 -o "$PREV_XML" -w '%{http_code}' "$APPCAST_URL")"
+          if [[ "$HTTP_CODE" == "404" ]]; then
+            rm -f "$PREV_XML"
+            printf 'PREVIOUS_BUILD=\n' >> "$GITHUB_ENV"
+          elif [[ "$HTTP_CODE" == "200" ]]; then
+            PREV_FLOOR="$(PREV_XML_PATH="$PREV_XML" /usr/bin/ruby -rrexml/document -rrexml/security -e '
+              REXML::Security.entity_expansion_limit = 0
+              raw = File.binread(ENV.fetch("PREV_XML_PATH"))
+              abort("Error: DTD/ENTITY declarations are forbidden in appcast.xml") if raw.match?(/<!\s*(?:DOCTYPE|ENTITY)/i)
+              doc = REXML::Document.new(raw)
+              ns = { "sparkle" => "http://www.andymatuschak.org/xml-namespaces/sparkle" }
+              raw_vals = REXML::XPath.match(doc, "//sparkle:version", ns).map { |e| e.text.to_s.strip } +
+                         REXML::XPath.match(doc, "//@sparkle:version", ns).map { |a| a.value.to_s.strip }
+              versions = raw_vals.reject(&:empty?).map do |v|
+                abort("Error: Non-numeric <sparkle:version>: #{v}") unless v.match?(/\A[1-9][0-9]*\z/)
+                v.to_i
+              end
+              abort("Error: No positive <sparkle:version> found in previous appcast.xml") if versions.empty? || versions.max <= 0
+              puts versions.max
+            ')"
+            rm -f "$PREV_XML"
+            if [[ ! "$PREV_FLOOR" =~ ^[1-9][0-9]*$ ]]; then
+              printf 'Error: Invalid parsed PREVIOUS_BUILD: %s\n' "$PREV_FLOOR" >&2
+              exit 1
+            fi
+            printf 'PREVIOUS_BUILD=%s\n' "$PREV_FLOOR" >> "$GITHUB_ENV"
+          else
+            rm -f "$PREV_XML"
+            printf 'Error: Unexpected HTTP status %s fetching %s; failing closed.\n' "$HTTP_CODE" "$APPCAST_URL" >&2
+            exit 1
+          fi
+
+      - name: Install verified rcodesign and stage ephemeral signing files
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
+        run: |
+          # Never enable set -x: signing secrets are staged in this step.
+          set -euo pipefail
+          umask 077
+
+          RCODESIGN_BIN="$RUNNER_TEMP/rcodesign-bin/rcodesign"
+          CERT_P12="$RUNNER_TEMP/fork-signing.p12"
+          CERT_PASS_FILE="$RUNNER_TEMP/fork-signing.pass"
+          ED_KEY_FILE="$RUNNER_TEMP/fork-sparkle-ed25519.key"
+
+          {
+            printf 'RCODESIGN_BIN=%s\n' "$RCODESIGN_BIN"
+            printf 'CERT_P12=%s\n' "$CERT_P12"
+            printf 'CERT_PASS_FILE=%s\n' "$CERT_PASS_FILE"
+            printf 'ED_KEY_FILE=%s\n' "$ED_KEY_FILE"
+          } >> "$GITHUB_ENV"
+
+          TARBALL="$RUNNER_TEMP/apple-codesign-0.29.0-macos-universal.tar.gz"
+          EXPECTED_SHA256="d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d"
+          curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 5 --connect-timeout 10 --max-time 60 \
+            -o "$TARBALL" \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz"
+          ACTUAL_SHA256="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
+          if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+            printf 'Error: rcodesign SHA-256 mismatch: expected %s, got %s\n' "$EXPECTED_SHA256" "$ACTUAL_SHA256" >&2
+            rm -f "$TARBALL"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/rcodesign-bin"
+          tar -xzf "$TARBALL" --strip-components=1 -C "$RUNNER_TEMP/rcodesign-bin"
+          rm -f "$TARBALL"
+          test -x "$RCODESIGN_BIN"
+
+          if [[ -z "$MACOS_CERT_P12_BASE64" || -z "$MACOS_CERT_PASSWORD" || -z "$SPARKLE_ED25519_PRIVATE_KEY" ]]; then
+            printf 'Error: Required release Environment signing secrets are empty.\n' >&2
+            exit 1
+          fi
+
+          printf '%s' "$MACOS_CERT_P12_BASE64" | tr -d '\r\n[:space:]' | /usr/bin/base64 --decode > "$CERT_P12"
+          printf '%s' "$MACOS_CERT_PASSWORD" > "$CERT_PASS_FILE"
+          printf '%s' "$SPARKLE_ED25519_PRIVATE_KEY" > "$ED_KEY_FILE"
+          chmod 600 "$CERT_P12" "$CERT_PASS_FILE" "$ED_KEY_FILE"
+
+      - name: Build universal archive, sign, and generate signed appcast
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ -n "${PREVIOUS_BUILD:-}" ]]; then
+            EXTRA_ARGS+=(--previous-build "$PREVIOUS_BUILD")
+          fi
+          if [[ -n "${VALIDATED_UPSTREAM_VERSION:-}" ]]; then
+            EXTRA_ARGS+=(--upstream-version "$VALIDATED_UPSTREAM_VERSION")
+          fi
+          ./scripts/release-fork.sh \
+            --run-number "${GITHUB_RUN_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --p12-file "$CERT_P12" \
+            --p12-password-file "$CERT_PASS_FILE" \
+            --ed-key-file "$ED_KEY_FILE" \
+            --rcodesign-bin "$RCODESIGN_BIN" \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+
+      - name: Publish GitHub Release atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          source Releases/fork/release-metadata.env
+          if IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$IS_DRAFT" == "true" ]]; then
+              gh release delete "$TAG" --yes
+            else
+              printf 'Error: Published GitHub Release %s already exists; refusing to overwrite.\n' "$TAG" >&2
+              exit 1
+            fi
+          fi
+          gh release create "$TAG" \
+            --draft \
+            --target "${GITHUB_SHA}" \
+            --title "ClipBook ${MARKETING_VERSION}" \
+            --generate-notes \
+            "$DMG_PATH" \
+            "$APPCAST_PATH"
+          gh release edit "$TAG" --draft=false --latest
+
+      - name: Remove ephemeral signing files
+        if: always()
+        run: |
+          rm -f "${CERT_P12:-}" "${CERT_PASS_FILE:-}" "${ED_KEY_FILE:-}"
