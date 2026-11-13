@@ -28,6 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   var scratchStorageForTests: (directory: URL?, suiteName: String?) {
     (testSupportDirectory, testDefaultsSuiteName)
   }
+
+  var usesSparkleUpdaterForTests: Bool {
+    updateService is SparkleUpdateService
+  }
   #endif
 
   // Hosted unit tests launch the app process before running any test, so they
@@ -70,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       (try? historyStore.loadingFormatting(of: item)) ?? item
     }
     globalShortcuts = GlobalShortcutService(isEnabled: !Self.isRunningTests)
-    updateService = SparkleUpdateService()
+    updateService = Self.isRunningTests ? DisabledUpdateService() : SparkleUpdateService()
     licensingService = LicensingService()
     clipboardMonitor = PasteboardMonitor(historyStore: historyStore, fileManager: fileManager, supportDirectory: supportDirectory)
     coordinator = AppCoordinator(
@@ -474,4 +478,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     isQuitConfirmed = true
     NSApp.terminate(nil)
   }
+}
+
+private final class DisabledUpdateService: UpdateService {
+  let isRelaunchingToInstallUpdate = false
+
+  func setAutomaticallyChecksForUpdates(_: Bool) {}
+  func checkForUpdates(presenting _: NSWindow?) {}
 }
