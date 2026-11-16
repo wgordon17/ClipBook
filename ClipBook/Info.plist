@@ -17,7 +17,7 @@
 	<key>SUFeedURL</key>
 	<string>https://github.com/wgordon17/ClipBook/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>oQDl3fpWpRKjRpG5Dkyt3iE7uFGw8Xu6/cL1W5oeFTc=</string>
+	<string>nV/18uulJnmpkrNQxDcydx1ygqXVy9GZk4NFZ7UoCq8=</string>
 	<key>SURequireSignedFeed</key>
 	<true/>
 	<key>SUScheduledCheckInterval</key>

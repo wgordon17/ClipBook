@@ -1,6 +1,7 @@
 import AppKit
 @testable import ClipBook
 import Foundation
+import Security
 import Testing
 
 @Suite struct ForkReleaseConfigTests {
@@ -80,9 +81,26 @@ import Testing
         let publicEDKey = try #require(info["SUPublicEDKey"] as? String)
         let decodedKey = try #require(Data(base64Encoded: publicEDKey))
         #expect(decodedKey.count == 32)
+        #expect(publicEDKey != "oQDl3fpWpRKjRpG5Dkyt3iE7uFGw8Xu6/cL1W5oeFTc=", "SUPublicEDKey must be the fork key, not upstream's")
 
         let expandedDefaultsDomain = Bundle.main.object(forInfoDictionaryKey: "SUDefaultsDomain") as? String
         #expect(expandedDefaultsDomain == "com.ikryanov.clipbook.v2.debug.fork.sparkle")
+    }
+
+    @Test func publicCodeSigningCertificateParsesWithForkCommonName() throws {
+        let certURL = Self.repoRootURL.appendingPathComponent("scripts/ClipBookForkCodeSigning.crt")
+        let pem = try String(contentsOf: certURL, encoding: .utf8)
+        #expect(!pem.contains("PRIVATE KEY"))
+
+        let pemBody = pem
+            .split(whereSeparator: \.isNewline)
+            .filter { !$0.hasPrefix("-----") }
+            .joined()
+        let derData = try #require(Data(base64Encoded: pemBody, options: .ignoreUnknownCharacters))
+        #expect(!derData.isEmpty)
+
+        let certificate = try #require(SecCertificateCreateWithData(nil, derData as CFData))
+        #expect(SecCertificateCopySubjectSummary(certificate) as String? == "ClipBook Fork Code Signing")
     }
 
     @Test
