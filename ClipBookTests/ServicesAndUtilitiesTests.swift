@@ -67,6 +67,9 @@ enum ServicesAndUtilitiesTests {
             #expect(service.hasHandler(for: .pasteNext))
             #expect(!service.hasHandler(for: .pauseCapture))
 
+            service.register(.showHistory, shortcut: "cmd+cmd") {}
+            #expect(service.hasHandler(for: .showHistory))
+
             // A bare key, or one that does not parse, is never registered.
             service.register(.pauseCapture, shortcut: "return") {}
             service.register(.pasteNextRich, shortcut: "cmd+unknownkey") {}

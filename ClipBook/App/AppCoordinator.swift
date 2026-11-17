@@ -713,6 +713,7 @@ final class AppCoordinator: ObservableObject {
       }
       removeAssetFiles(for: deletedItems, remainingItems: model.items.filter { keepingItems && shouldKeepWhenClearingHistory($0) })
       model.remove(Set(deletedItems.map(\.id)))
+      HistoryRowTextCache.removeAll()
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -1210,6 +1211,7 @@ final class AppCoordinator: ObservableObject {
       removeAssetFiles(for: items, remainingItems: remainingItems)
     }
     model.remove(deletedItemIDs)
+    HistoryRowTextCache.removeAll()
   }
 
   // MARK: - Trash
@@ -1361,6 +1363,15 @@ final class AppCoordinator: ObservableObject {
       return
     }
     guard !items.isEmpty else {
+      // The history shows that the Trash is empty, but Settings does not,
+      // so the button would otherwise seem to do nothing.
+      if fromSettings {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L10n.string("Trash is empty")
+        alert.informativeText = L10n.string("There are no items to delete.")
+        present(alert) { _ in }
+      }
       return
     }
 
@@ -2949,7 +2960,12 @@ final class AppCoordinator: ObservableObject {
     kernelBootTime: TimeInterval = AppCoordinator.systemBootTime().timeIntervalSince1970,
     uptimeRelativeBootTime: TimeInterval = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime).timeIntervalSince1970
   ) {
+    // The first launch after updating from a build that stored only the uptime
+    // estimate falls back to it. The estimate is never earlier than the real
+    // boot time, so the one-sided check below still ignores time spent asleep,
+    // and a restart since that launch still counts as a reboot.
     let previousBootTime = preferencesStore.lastKnownKernelBootTime()
+      ?? preferencesStore.lastKnownUptimeRelativeBootTime()
     preferencesStore.recordBootTimes(
       kernelBootTime: kernelBootTime,
       uptimeRelativeBootTime: uptimeRelativeBootTime

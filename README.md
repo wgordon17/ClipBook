@@ -168,3 +168,15 @@ Fork and Upstream builds can share data safely in both directions without migrat
   ```bash
   tccutil reset Accessibility com.ikryanov.clipbook.v2
   ```
+
+## License
+
+ClipBook’s source code is provided for transparency and personal use. However, its use in commercial or redistributed products is restricted without a license. Please refer to the [LICENSE](LICENSE.md) file for details.
+
+## Terms of Use
+
+By using ClipBook, you agree to the [Terms of Use](https://clipbook.app/terms/) and [Privacy Policy](https://clipbook.app/privacy/).
+
+## Support
+
+For questions or support, please [contact me](mailto:vladimir.ikryanov@clipbook.app).
