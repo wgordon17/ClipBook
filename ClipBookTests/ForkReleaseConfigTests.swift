@@ -1058,4 +1058,118 @@ import Testing
             #expect(try Data(contentsOf: publicCertURL) == baselinePublicCert)
         }
     }
+
+    @Test
+    func releaseForkVerifySignedTargetHandlesUnquotedAndQuotedCsreqIdentifiers() throws {
+        let scriptURL = Self.repoRootURL.appendingPathComponent("scripts/release-fork.sh")
+        let scriptText = try String(contentsOf: scriptURL, encoding: .utf8)
+
+        let helperStart = try #require(scriptText.range(of: "assert_runtime_and_authority() {")?.lowerBound)
+        let helperEnd = try #require(
+            scriptText.range(of: "\nverify_signed_target \"$STAGED_APP\"")?.lowerBound
+        )
+        let extractedFunctions = String(scriptText[helperStart..<helperEnd])
+            .replacingOccurrences(of: "/usr/bin/codesign", with: "codesign")
+
+        try TestSupport.withTemporaryDirectory { tempDir in
+            let leafSHA1 = "d8190d8f86de555ccea7f5008e49dfd8b6c1dd8a"
+
+            func decompiledCsreq(for identifier: String) throws -> String {
+                let blobURL = tempDir.appendingPathComponent("\(identifier).csreq")
+                let reqSpec = "identifier \"\(identifier)\" and certificate leaf = H\"\(leafSHA1)\"\n"
+                let compile = try Self.runProcess(
+                    executablePath: "/usr/bin/csreq",
+                    arguments: ["-r-", "-b", blobURL.path],
+                    stdinData: Data(reqSpec.utf8)
+                )
+                #expect(compile.status == 0)
+                let decompile = try Self.runProcess(
+                    executablePath: "/usr/bin/csreq",
+                    arguments: ["-r", blobURL.path, "-t"]
+                )
+                #expect(decompile.status == 0)
+                return decompile.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            let autoupdateDR = try decompiledCsreq(for: "Autoupdate")
+            let appDR = try decompiledCsreq(for: "com.ikryanov.clipbook.v2")
+            #expect(autoupdateDR.contains("identifier Autoupdate "))
+            #expect(!autoupdateDR.contains("identifier \"Autoupdate\""))
+            #expect(appDR.contains("identifier \"com.ikryanov.clipbook.v2\""))
+
+            let stubBin = tempDir.appendingPathComponent("bin", isDirectory: true)
+            try FileManager.default.createDirectory(at: stubBin, withIntermediateDirectories: true)
+            let codesignStub = stubBin.appendingPathComponent("codesign")
+            let codesignScript = """
+            #!/bin/bash
+            if [[ "${1:-}" == "-dvvv" ]]; then
+              printf 'Identifier=%s\\nCodeDirectory v=20500 size=1024 flags=0x10000(runtime)\\nAuthority=ClipBook CI Smoke Signing\\nSealed Resources version=2 rules=13 files=1\\n' "$STUB_ACTUAL_ID"
+              exit 0
+            fi
+            if [[ "${1:-}" == "-dr" ]]; then
+              printf 'designated => %s\\n' "$STUB_DR_TEXT"
+              exit 0
+            fi
+            if [[ "${1:-}" == "-d" && "${2:-}" == "--entitlements" ]]; then
+              exit 0
+            fi
+            exit 1
+            """
+            try Data(codesignScript.utf8).write(to: codesignStub)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: codesignStub.path)
+
+            let harnessURL = tempDir.appendingPathComponent("verify-harness.sh")
+            let harnessScript = """
+            #!/bin/bash
+            set -euo pipefail
+            USES_ADHOC_SIGNING=0
+            SMOKE_TEST=1
+            EXPECTED_AUTHORITY="ClipBook CI Smoke Signing"
+            P12_FILE="/nonexistent/smoke.p12"
+            LEAF_SHA1="\(leafSHA1)"
+            REPO_CERT_SHA1="\(leafSHA1)"
+            EFFECTIVE_SIGNING_IDENTITY="-"
+            WORK_DIR="\(tempDir.path)"
+            \(extractedFunctions)
+            verify_signed_target "$1" "$2" "$3" 0
+            """
+            try Data(harnessScript.utf8).write(to: harnessURL)
+
+            var env = ProcessInfo.processInfo.environment
+            let basePath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            env["PATH"] = "\(stubBin.path):\(basePath)"
+
+            // Single-token identifier ("Autoupdate") emitted without quotes by Apple csreq/codesign.
+            env["STUB_ACTUAL_ID"] = "Autoupdate"
+            env["STUB_DR_TEXT"] = autoupdateDR
+            let autoupdatePass = try Self.runProcess(
+                executablePath: "/bin/bash",
+                arguments: [harnessURL.path, "/stub/Autoupdate", "Autoupdate", "0"],
+                environment: env
+            )
+            #expect(autoupdatePass.status == 0, "\(autoupdatePass.stderr)")
+
+            // Dotted bundle identifier ("com.ikryanov.clipbook.v2") emitted with quotes.
+            env["STUB_ACTUAL_ID"] = "com.ikryanov.clipbook.v2"
+            env["STUB_DR_TEXT"] = appDR
+            let appPass = try Self.runProcess(
+                executablePath: "/bin/bash",
+                arguments: [harnessURL.path, "/stub/ClipBook.app", "com.ikryanov.clipbook.v2", "1"],
+                environment: env
+            )
+            #expect(appPass.status == 0, "\(appPass.stderr)")
+
+            // Prefix mismatch ("AutoupdateHelper" vs expected "Autoupdate") must fail closed.
+            let prefixMismatchDR = try decompiledCsreq(for: "AutoupdateHelper")
+            env["STUB_ACTUAL_ID"] = "Autoupdate"
+            env["STUB_DR_TEXT"] = prefixMismatchDR
+            let prefixFail = try Self.runProcess(
+                executablePath: "/bin/bash",
+                arguments: [harnessURL.path, "/stub/Autoupdate", "Autoupdate", "0"],
+                environment: env
+            )
+            #expect(prefixFail.status != 0)
+            #expect(prefixFail.stderr.contains("Designated requirement missing identifier"))
+        }
+    }
 }

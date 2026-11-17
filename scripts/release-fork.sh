@@ -694,7 +694,8 @@ verify_signed_target() {
   if [[ "$USES_ADHOC_SIGNING" -eq 0 ]]; then
     local dr_out
     dr_out="$(/usr/bin/codesign -dr - "$target_path" 2>&1)"
-    if ! grep -Fq "identifier \"${expected_id}\"" <<< "$dr_out"; then
+    if ! grep -Fq "identifier \"${expected_id}\"" <<< "$dr_out" \
+      && ! grep -Fq "identifier ${expected_id} " <<< "$dr_out"; then
       printf 'Error: Designated requirement missing identifier "%s" on %s:\n%s\n' "$expected_id" "$target_path" "$dr_out" >&2
       exit 1
     fi
