@@ -4,6 +4,10 @@ set -euo pipefail
 
 FALLBACK_ED_PRIVKEY="${SPARKLE_ED25519_PRIVATE_KEY:-}"
 unset SPARKLE_ED25519_PRIVATE_KEY
+for rc_var in $(compgen -v RCODESIGN_ || true); do
+  unset "$rc_var"
+done
+unset rc_var
 EFFECTIVE_ED_PRIVKEY=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +25,7 @@ SIGNING_IDENTITY="${SIGNING_IDENTITY:-ClipBook Fork Code Signing}"
 KEYCHAIN_PATH="${KEYCHAIN_PATH:-}"
 P12_FILE=""
 P12_PASSWORD_FILE=""
-RCODESIGN_BIN=""
+SIGNER_BIN=""
 ED_KEY_FILE=""
 DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$ROOT_DIR/DerivedData/Release}"
 REPO="wgordon17/ClipBook"
@@ -104,7 +108,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --rcodesign-bin)
       require_option_arg "$@"
-      RCODESIGN_BIN="$2"
+      SIGNER_BIN="$2"
       shift 2
       ;;
     --ed-key-file)
@@ -190,6 +194,17 @@ require_tool() {
   fi
 }
 
+run_rcodesign() {
+  (
+    local bin="$SIGNER_BIN"
+    local rc_var
+    for rc_var in $(compgen -v RCODESIGN_ || true); do
+      unset "$rc_var"
+    done
+    exec "$bin" "$@"
+  )
+}
+
 # Normalize paths, validate version/run-number, enforce monotonic build floor, prepare workspace.
 mkdir -p "$OUTPUT_DIR" "$DERIVED_DATA_PATH"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
@@ -207,16 +222,16 @@ fi
 if [[ -n "$ED_KEY_FILE" ]]; then
   ED_KEY_FILE="$(normalize_existing_file "--ed-key-file" "$ED_KEY_FILE")"
 fi
-if [[ -n "$RCODESIGN_BIN" ]]; then
-  if [[ ! -f "$RCODESIGN_BIN" || ! -x "$RCODESIGN_BIN" ]]; then
-    printf 'Error: --rcodesign-bin is missing or not executable: %s\n' "$RCODESIGN_BIN" >&2
+if [[ -n "$SIGNER_BIN" ]]; then
+  if [[ ! -f "$SIGNER_BIN" || ! -x "$SIGNER_BIN" ]]; then
+    printf 'Error: --rcodesign-bin is missing or not executable: %s\n' "$SIGNER_BIN" >&2
     exit 1
   fi
-  RCODESIGN_BIN="$(cd "$(dirname "$RCODESIGN_BIN")" && pwd)/$(basename "$RCODESIGN_BIN")"
+  SIGNER_BIN="$(cd "$(dirname "$SIGNER_BIN")" && pwd)/$(basename "$SIGNER_BIN")"
 fi
 
-if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$RCODESIGN_BIN" ]]; then
-  if [[ -z "$P12_FILE" || -z "$P12_PASSWORD_FILE" || -z "$RCODESIGN_BIN" ]]; then
+if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$SIGNER_BIN" ]]; then
+  if [[ -z "$P12_FILE" || -z "$P12_PASSWORD_FILE" || -z "$SIGNER_BIN" ]]; then
     printf 'Error: --p12-file, --p12-password-file, and --rcodesign-bin must all be provided together.\n' >&2
     exit 1
   fi
@@ -556,7 +571,7 @@ if [[ -n "$P12_FILE" ]]; then
   q_installer_csreq="$(toml_quote "$WORK_DIR/installer.csreq")"
   q_downloader_csreq="$(toml_quote "$WORK_DIR/downloader.csreq")"
 
-  RCODESIGN_TOML="$WORK_DIR/rcodesign.toml"
+  SIGNER_TOML="$WORK_DIR/rcodesign.toml"
   {
     printf '[default.sign]\n'
     printf 'signer.p12 = { path = %s, password_path = %s }\n\n' \
@@ -587,16 +602,9 @@ if [[ -n "$P12_FILE" ]]; then
     printf '[default.sign.path."Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc"]\n'
     printf 'code_signature_flags = ["runtime"]\n'
     printf 'code_requirements_file = %s\n' "$q_downloader_csreq"
-  } > "$RCODESIGN_TOML"
+  } > "$SIGNER_TOML"
 
-  (
-    signer_bin="$RCODESIGN_BIN"
-    signer_toml="$RCODESIGN_TOML"
-    for rc_var in $(compgen -v RCODESIGN_ || true); do
-      unset "$rc_var"
-    done
-    "$signer_bin" -C "$signer_toml" sign --timestamp-url none "$APP_PATH"
-  )
+  run_rcodesign -C "$SIGNER_TOML" sign --timestamp-url none "$APP_PATH"
 else
   CODESIGN_KEYCHAIN_ARGS=()
   if [[ -n "$KEYCHAIN_PATH" && "$EFFECTIVE_SIGNING_IDENTITY" != "-" ]]; then
@@ -637,7 +645,7 @@ if [[ -n "$P12_FILE" ]]; then
     "Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater" \
     "Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" \
     "Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"; do
-    "$RCODESIGN_BIN" verify "$STAGED_APP/$macho_rel"
+    run_rcodesign verify "$STAGED_APP/$macho_rel"
   done
 else
   /usr/bin/codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
