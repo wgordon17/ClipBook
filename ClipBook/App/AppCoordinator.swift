@@ -121,8 +121,17 @@ final class AppCoordinator: ObservableObject {
       .store(in: &cancellables)
   }
   
-  func start() {
+  func loadAndReconcilePreferences() {
     model.preferences = preferencesStore.load()
+    model.forkPreferences = preferencesStore.loadForkPreferences()
+  }
+
+  func applyUpdatePreferences() {
+    updateService.setAutomaticallyChecksForUpdates(model.preferences.checkForUpdatesAutomatically)
+  }
+
+  func start() {
+    loadAndReconcilePreferences()
     #if DEBUG
     applyDebugTrialDates()
     #endif
@@ -133,7 +142,7 @@ final class AppCoordinator: ObservableObject {
     model.historySortOption = HistorySortOption(preferenceValue: model.preferences.historySortOption)
     model.isHistorySortReversed = model.preferences.isHistorySortReversed
     applyLanguage()
-    updateService.setAutomaticallyChecksForUpdates(model.preferences.checkForUpdatesAutomatically)
+    applyUpdatePreferences()
     var shouldSavePreferences = false
     if model.preferences.deleteItemShortcut == "delete" {
       model.preferences.deleteItemShortcut = AppPreferences.defaultDeleteItemShortcut
@@ -537,6 +546,7 @@ final class AppCoordinator: ObservableObject {
     let changes = Self.preferenceChanges(from: lastAppliedPreferences, to: current)
 
     preferencesStore.save(current)
+    preferencesStore.saveForkPreferences(model.forkPreferences)
     if changes.appearance {
       applyAppearance()
     }
@@ -551,7 +561,7 @@ final class AppCoordinator: ObservableObject {
       LaunchAtLoginService.setEnabled(current.launchAtLogin)
     }
     if changes.automaticUpdateChecks {
-      updateService.setAutomaticallyChecksForUpdates(current.checkForUpdatesAutomatically)
+      applyUpdatePreferences()
     }
     if changes.globalShortcuts {
       configureShortcuts()
@@ -562,6 +572,7 @@ final class AppCoordinator: ObservableObject {
 
   func persistPreferences() {
     preferencesStore.save(model.preferences)
+    preferencesStore.saveForkPreferences(model.forkPreferences)
   }
 
   func refreshLicensingState() {

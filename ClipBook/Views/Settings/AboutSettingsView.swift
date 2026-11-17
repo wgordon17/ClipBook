@@ -41,6 +41,7 @@ struct AboutSettingsView: View {
                         aboutLink(L10n.string("Support"), url: "https://clipbook.app/contacts/")
                         aboutLink(L10n.string("Changelog"), url: "https://clipbook.app/changelog/")
                         aboutLink(L10n.string("Feedback"), url: "https://feedback.clipbook.app/board/all")
+                        aboutLink("GitHub", url: "https://github.com/wgordon17/ClipBook/releases")
                     }
 
                     Text(copyrightText)

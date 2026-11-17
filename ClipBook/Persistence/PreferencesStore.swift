@@ -11,8 +11,8 @@ final class PreferencesStore {
 
     let userDefaults: UserDefaults
     private let key = "ClipBookPreferencesV2"
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
+    let encoder = JSONEncoder()
+    let decoder = JSONDecoder()
 
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults

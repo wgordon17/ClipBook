@@ -11,4 +11,13 @@ enum AppDirectories {
     try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     return directory
   }
+
+  static func forkSupportDirectory(
+    in supportDirectory: URL,
+    fileManager: FileManager = .default
+  ) -> URL {
+    let directory = supportDirectory.appendingPathComponent("Fork", isDirectory: true)
+    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+  }
 }
