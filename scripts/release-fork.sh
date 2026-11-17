@@ -58,7 +58,7 @@ usage() {
   printf '%s\n' "  --previous-build INT         Optional monotonic CFBundleVersion floor."
   printf '%s\n' "  --output-dir DIR             Output root directory (default: Releases/fork)."
   printf '%s\n' "  --arch-list \"arm64 x86_64\"   Space-separated architectures to archive."
-  printf '%s\n' "  --smoke-test                 Local unprivileged verification mode (ad-hoc + ephemeral Ed25519)."
+  printf '%s\n' "  --smoke-test                 Unprivileged verification mode (ephemeral Ed25519; ad-hoc unless --p12-file is set)."
   printf '%s\n' "  -h, --help                   Show this help."
 }
 
@@ -220,10 +220,11 @@ if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$RCODESIGN_BIN" ]]; then
     printf 'Error: --p12-file, --p12-password-file, and --rcodesign-bin must all be provided together.\n' >&2
     exit 1
   fi
-  if [[ "$SMOKE_TEST" -eq 1 ]]; then
-    printf 'Error: --smoke-test cannot be combined with --p12-file.\n' >&2
-    exit 1
-  fi
+fi
+
+if [[ "$SMOKE_TEST" -eq 1 && -n "$ED_KEY_FILE" ]]; then
+  printf 'Error: --smoke-test cannot be combined with --ed-key-file.\n' >&2
+  exit 1
 fi
 
 if [[ ! "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
@@ -282,6 +283,10 @@ if [[ ! -f "$ENTITLEMENTS_PATH" ]]; then
   printf 'Error: Release entitlements file not found: %s\n' "$ENTITLEMENTS_PATH" >&2
   exit 1
 fi
+if [[ ! -x /usr/bin/openssl ]]; then
+  printf 'Error: Expected macOS /usr/bin/openssl to be present and executable.\n' >&2
+  exit 1
+fi
 
 require_tool xcodebuild
 require_tool xcrun
@@ -303,13 +308,75 @@ rm -rf "$WORK_DIR" "$APPCAST_DIR"
 rm -f "$OUTPUT_DIR/release-metadata.env"
 mkdir -p "$WORK_DIR" "$STAGING_PATH" "$APPCAST_DIR"
 
-# Key & Sparkle preflight (before any xcodebuild / SwiftPM subprocess runs).
+# Key, certificate & Sparkle preflight (before any xcodebuild / SwiftPM subprocess runs).
 SMOKE_PUBLIC_ED_KEY=""
 EFFECTIVE_SIGNING_IDENTITY="$SIGNING_IDENTITY"
+USES_ADHOC_SIGNING=0
+LEAF_SHA1=""
+REPO_CERT_SHA1=""
+EXPECTED_AUTHORITY="$SIGNING_IDENTITY"
+
+if [[ "$SMOKE_TEST" -eq 0 ]]; then
+  REPO_CERT_PATH="$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt"
+  if [[ ! -f "$REPO_CERT_PATH" ]]; then
+    printf 'Error: Committed code-signing certificate not found at %s; run bootstrap-fork-signing.sh first.\n' "$REPO_CERT_PATH" >&2
+    exit 1
+  fi
+  if ! /usr/bin/openssl x509 -in "$REPO_CERT_PATH" -noout -checkend 172800 >/dev/null 2>&1; then
+    printf 'Error: Committed code-signing certificate (%s) is invalid or expires within 48 hours.\n' "$REPO_CERT_PATH" >&2
+    exit 1
+  fi
+  REPO_RAW_FP="$(/usr/bin/openssl x509 -in "$REPO_CERT_PATH" -noout -fingerprint -sha1)"
+  REPO_CERT_SHA1="$(printf '%s' "${REPO_RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$REPO_CERT_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Error: Could not extract 40-hex SHA-1 fingerprint from %s.\n' "$REPO_CERT_PATH" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$P12_FILE" ]]; then
+  if ! LEAF_CERT_PEM="$(/usr/bin/openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin file:"$P12_PASSWORD_FILE" 2>/dev/null)" || [[ -z "$LEAF_CERT_PEM" ]]; then
+    printf 'Error: Could not extract leaf certificate PEM from PKCS#12 file (invalid bundle or passphrase).\n' >&2
+    exit 1
+  fi
+  CERT_MIN_SECONDS=172800
+  if [[ "$SMOKE_TEST" -eq 1 ]]; then
+    CERT_MIN_SECONDS=3600
+  fi
+  if ! /usr/bin/openssl x509 -noout -checkend "$CERT_MIN_SECONDS" <<< "$LEAF_CERT_PEM" >/dev/null 2>&1; then
+    printf 'Error: PKCS#12 leaf certificate is expired or expires within %s seconds.\n' "$CERT_MIN_SECONDS" >&2
+    exit 1
+  fi
+  RAW_FP="$(/usr/bin/openssl x509 -noout -fingerprint -sha1 <<< "$LEAF_CERT_PEM")"
+  LEAF_SHA1="$(printf '%s' "${RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$LEAF_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Error: Could not extract 40-hex leaf SHA-1 fingerprint from PKCS#12 certificate (got: %s).\n' "$LEAF_SHA1" >&2
+    exit 1
+  fi
+  LEAF_SUBJECT="$(/usr/bin/openssl x509 -noout -subject -nameopt RFC2253 <<< "$LEAF_CERT_PEM" | tr -d '\r\n')"
+  if [[ "$LEAF_SUBJECT" != *CN=* ]]; then
+    printf 'Error: PKCS#12 leaf certificate subject is missing CN= (got: %s).\n' "$LEAF_SUBJECT" >&2
+    exit 1
+  fi
+  EXPECTED_AUTHORITY="${LEAF_SUBJECT#*CN=}"
+  EXPECTED_AUTHORITY="${EXPECTED_AUTHORITY%%,*}"
+  if [[ -z "$EXPECTED_AUTHORITY" ]]; then
+    printf 'Error: PKCS#12 leaf certificate has an empty Common Name (subject: %s).\n' "$LEAF_SUBJECT" >&2
+    exit 1
+  fi
+  if [[ "$SMOKE_TEST" -eq 0 && "$LEAF_SHA1" != "$REPO_CERT_SHA1" ]]; then
+    printf 'Error: PKCS#12 leaf SHA-1 (%s) does not match committed scripts/ClipBookForkCodeSigning.crt (%s).\n' \
+      "$LEAF_SHA1" "$REPO_CERT_SHA1" >&2
+    exit 1
+  fi
+fi
 
 if [[ "$SMOKE_TEST" -eq 1 ]]; then
   unset FALLBACK_ED_PRIVKEY
-  EFFECTIVE_SIGNING_IDENTITY="-"
+  if [[ -z "$P12_FILE" ]]; then
+    EFFECTIVE_SIGNING_IDENTITY="-"
+    USES_ADHOC_SIGNING=1
+  fi
   SMOKE_KEYPAIR="$(swift -e '
     import CryptoKit
     import Foundation
@@ -372,28 +439,24 @@ fi
 
 resolve_sparkle_tool() {
   local tool="$1"
-  local candidates=()
 
   if [[ -n "${SPARKLE_BIN:-}" ]]; then
-    candidates+=("$SPARKLE_BIN/$tool")
+    local override="$SPARKLE_BIN/$tool"
+    if [[ ! -f "$override" || ! -x "$override" ]]; then
+      printf 'Error: SPARKLE_BIN tool is missing or not executable: %s\n' "$override" >&2
+      exit 1
+    fi
+    printf '%s\n' "$override"
+    return 0
   fi
 
-  candidates+=("$DERIVED_DATA_PATH/SourcePackages/artifacts/sparkle/Sparkle/bin/$tool")
+  local candidate="$DERIVED_DATA_PATH/SourcePackages/artifacts/sparkle/Sparkle/bin/$tool"
+  if [[ -f "$candidate" && -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
 
-  shopt -s nullglob
-  candidates+=("$DERIVED_DATA_PATH"/SourcePackages/artifacts/*/Sparkle/bin/"$tool")
-  candidates+=("$HOME"/Library/Developer/Xcode/DerivedData/*/SourcePackages/artifacts/*/Sparkle/bin/"$tool")
-  shopt -u nullglob
-
-  local candidate
-  for candidate in "${candidates[@]}"; do
-    if [[ -x "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  printf 'Error: Could not find Sparkle tool: %s\n' "$tool" >&2
+  printf 'Error: Could not find Sparkle tool %s at %s\n' "$tool" "$candidate" >&2
   exit 1
 }
 
@@ -465,32 +528,7 @@ for strip_target in \
   /usr/bin/codesign --remove-signature "$strip_target"
 done
 
-LEAF_SHA1=""
-EXPECTED_AUTHORITY="$SIGNING_IDENTITY"
 if [[ -n "$P12_FILE" ]]; then
-  LEAF_CERT_PEM="$(/usr/bin/openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin file:"$P12_PASSWORD_FILE")"
-  if [[ -z "$LEAF_CERT_PEM" ]]; then
-    printf 'Error: Could not extract leaf certificate PEM from PKCS#12 file.\n' >&2
-    exit 1
-  fi
-  RAW_FP="$(/usr/bin/openssl x509 -noout -fingerprint -sha1 <<< "$LEAF_CERT_PEM")"
-  LEAF_SHA1="$(printf '%s' "${RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
-  if [[ ! "$LEAF_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
-    printf 'Error: Could not extract 40-hex leaf SHA-1 fingerprint from PKCS#12 certificate (got: %s).\n' "$LEAF_SHA1" >&2
-    exit 1
-  fi
-  LEAF_SUBJECT="$(/usr/bin/openssl x509 -noout -subject -nameopt RFC2253 <<< "$LEAF_CERT_PEM" | tr -d '\r\n')"
-  if [[ "$LEAF_SUBJECT" != *CN=* ]]; then
-    printf 'Error: PKCS#12 leaf certificate subject is missing CN= (got: %s).\n' "$LEAF_SUBJECT" >&2
-    exit 1
-  fi
-  EXPECTED_AUTHORITY="${LEAF_SUBJECT#*CN=}"
-  EXPECTED_AUTHORITY="${EXPECTED_AUTHORITY%%,*}"
-  if [[ -z "$EXPECTED_AUTHORITY" ]]; then
-    printf 'Error: PKCS#12 leaf certificate has an empty Common Name (subject: %s).\n' "$LEAF_SUBJECT" >&2
-    exit 1
-  fi
-
   compile_csreq() {
     local target_identifier="$1"
     local output_csreq="$2"
@@ -605,21 +643,11 @@ else
   /usr/bin/codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 fi
 
-verify_signed_target() {
+assert_runtime_and_authority() {
   local target_path="$1"
-  local expected_id="$2"
-  local is_bundle="$3"
-  local is_outer_app="$4"
+  local dv_out="$2"
 
-  local dv_out
-  dv_out="$(/usr/bin/codesign -dvvv "$target_path" 2>&1)"
-
-  if ! grep -Fq "Identifier=${expected_id}" <<< "$dv_out"; then
-    printf 'Error: Expected Identifier=%s on %s, got:\n%s\n' "$expected_id" "$target_path" "$dv_out" >&2
-    exit 1
-  fi
-
-  if [[ "$SMOKE_TEST" -eq 1 ]]; then
+  if [[ "$USES_ADHOC_SIGNING" -eq 1 ]]; then
     if ! grep -Eq 'flags=0x10002\(.*runtime.*\)' <<< "$dv_out"; then
       printf 'Error: Expected adhoc+runtime flags (0x10002) on %s, got:\n%s\n' "$target_path" "$dv_out" >&2
       exit 1
@@ -638,6 +666,23 @@ verify_signed_target() {
       exit 1
     fi
   fi
+}
+
+verify_signed_target() {
+  local target_path="$1"
+  local expected_id="$2"
+  local is_bundle="$3"
+  local is_outer_app="$4"
+
+  local dv_out
+  dv_out="$(/usr/bin/codesign -dvvv "$target_path" 2>&1)"
+
+  if ! grep -Fq "Identifier=${expected_id}" <<< "$dv_out"; then
+    printf 'Error: Expected Identifier=%s on %s, got:\n%s\n' "$expected_id" "$target_path" "$dv_out" >&2
+    exit 1
+  fi
+
+  assert_runtime_and_authority "$target_path" "$dv_out"
 
   if [[ "$is_bundle" -eq 1 ]]; then
     if ! grep -Fq "Sealed Resources version=" <<< "$dv_out" || grep -Fq "Sealed Resources=none" <<< "$dv_out"; then
@@ -646,7 +691,7 @@ verify_signed_target() {
     fi
   fi
 
-  if [[ "$SMOKE_TEST" -eq 0 ]]; then
+  if [[ "$USES_ADHOC_SIGNING" -eq 0 ]]; then
     local dr_out
     dr_out="$(/usr/bin/codesign -dr - "$target_path" 2>&1)"
     if ! grep -Fq "identifier \"${expected_id}\"" <<< "$dr_out"; then
@@ -660,38 +705,33 @@ verify_signed_target() {
     if [[ -n "$P12_FILE" ]] && ! grep -Fiq "H\"${LEAF_SHA1}\"" <<< "$dr_out"; then
       printf 'Error: Designated requirement missing leaf hash H"%s" on %s:\n%s\n' "$LEAF_SHA1" "$target_path" "$dr_out" >&2
       exit 1
+    elif [[ -z "$P12_FILE" && "$SMOKE_TEST" -eq 0 && "$EFFECTIVE_SIGNING_IDENTITY" == "ClipBook Fork Code Signing" ]] && ! grep -Fiq "H\"${REPO_CERT_SHA1}\"" <<< "$dr_out"; then
+      printf 'Error: Designated requirement missing committed certificate leaf hash H"%s" on %s:\n%s\n' "$REPO_CERT_SHA1" "$target_path" "$dr_out" >&2
+      exit 1
     fi
   fi
 
   local ent_xml
   ent_xml="$(/usr/bin/codesign -d --entitlements - --xml "$target_path" 2>/dev/null)"
-  if [[ "$is_outer_app" -eq 1 ]]; then
-    if [[ -z "$ent_xml" ]]; then
-      printf 'Error: Outer ClipBook.app is missing embedded entitlements.\n' >&2
-      exit 1
-    fi
+  if [[ "$is_outer_app" -eq 1 && -z "$ent_xml" ]]; then
+    printf 'Error: Outer ClipBook.app is missing embedded entitlements.\n' >&2
+    exit 1
+  fi
+  if [[ -n "$ent_xml" ]]; then
     local ent_tmp="$WORK_DIR/ent-verify.plist"
     printf '%s\n' "$ent_xml" > "$ent_tmp"
     /usr/bin/plutil -lint -s "$ent_tmp"
     local ent_json
     ent_json="$(/usr/bin/plutil -convert json -o - "$ent_tmp")"
     rm -f "$ent_tmp"
-    if [[ "$ent_json" != '{"com.apple.security.cs.disable-library-validation":true}' ]]; then
-      printf 'Error: Outer ClipBook.app entitlements must equal only disable-library-validation=true, got: %s\n' "$ent_json" >&2
-      exit 1
-    fi
-  else
-    if [[ -n "$ent_xml" ]]; then
-      local ent_tmp="$WORK_DIR/ent-verify.plist"
-      printf '%s\n' "$ent_xml" > "$ent_tmp"
-      /usr/bin/plutil -lint -s "$ent_tmp"
-      local ent_json
-      ent_json="$(/usr/bin/plutil -convert json -o - "$ent_tmp")"
-      rm -f "$ent_tmp"
-      if [[ "$ent_json" != '{}' ]]; then
-        printf 'Error: Nested Sparkle target %s must carry zero entitlements, got: %s\n' "$target_path" "$ent_json" >&2
+    if [[ "$is_outer_app" -eq 1 ]]; then
+      if [[ "$ent_json" != '{"com.apple.security.cs.disable-library-validation":true}' ]]; then
+        printf 'Error: Outer ClipBook.app entitlements must equal only disable-library-validation=true, got: %s\n' "$ent_json" >&2
         exit 1
       fi
+    elif [[ "$ent_json" != '{}' ]]; then
+      printf 'Error: Nested Sparkle target %s must carry zero entitlements, got: %s\n' "$target_path" "$ent_json" >&2
+      exit 1
     fi
   fi
 }
@@ -713,21 +753,7 @@ while IFS= read -r -d '' candidate_file; do
       printf 'Error: Unsigned Mach-O binary found in staged bundle: %s\n' "$candidate_file" >&2
       exit 1
     fi
-    if [[ "$SMOKE_TEST" -eq 1 ]]; then
-      if ! grep -Eq 'flags=0x10002\(.*runtime.*\)' <<< "$macho_dv"; then
-        printf 'Error: Mach-O binary missing adhoc+runtime flags (0x10002): %s\n%s\n' "$candidate_file" "$macho_dv" >&2
-        exit 1
-      fi
-    else
-      if ! grep -Eq 'flags=0x10000\(runtime\)' <<< "$macho_dv"; then
-        printf 'Error: Mach-O binary missing Hardened Runtime flag (0x10000): %s\n%s\n' "$candidate_file" "$macho_dv" >&2
-        exit 1
-      fi
-      if grep -Fq "Signature=adhoc" <<< "$macho_dv" || ! grep -Fq "Authority=${EXPECTED_AUTHORITY}" <<< "$macho_dv"; then
-        printf 'Error: Mach-O binary missing expected Authority=%s: %s\n%s\n' "$EXPECTED_AUTHORITY" "$candidate_file" "$macho_dv" >&2
-        exit 1
-      fi
-    fi
+    assert_runtime_and_authority "$candidate_file" "$macho_dv"
   fi
 done < <(find "$STAGED_APP" -type f -print0)
 

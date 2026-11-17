@@ -145,7 +145,7 @@ enum UpstreamInteropStubs {
         "expiresAt"
     ]
 
-    enum UpstreamAppAppearanceStub: String, Codable, Equatable {
+    enum UpstreamAppAppearanceStub: String, Codable, CaseIterable, Equatable {
         case system
         case light
         case dark
@@ -309,11 +309,93 @@ enum UpstreamInteropStubs {
         var expiresAt: Date?
     }
 
+    static let expectedArchiveManifestKeys: Set<String> = [
+        "formatVersion",
+        "appName",
+        "appVersion",
+        "exportedAt"
+    ]
+
+    static let expectedArchiveTagKeys: Set<String> = [
+        "id",
+        "name",
+        "color"
+    ]
+
+    static let expectedArchiveLinkPreviewDetailsKeys: Set<String> = [
+        "url",
+        "title",
+        "description",
+        "imagePath",
+        "faviconPath",
+        "fetchedAt"
+    ]
+
+    static let expectedArchiveItemKeys: Set<String> = [
+        "id",
+        "kind",
+        "title",
+        "text",
+        "qrCodeText",
+        "rtfBase64",
+        "html",
+        "assetPath",
+        "filePaths",
+        "sourceAppName",
+        "sourceBundleIdentifier",
+        "copiedAt",
+        "firstCopiedAt",
+        "byteSize",
+        "isFavorite",
+        "tagIDs",
+        "tagNames",
+        "copyCount",
+        "linkPreviewDetails",
+        "copySequenceID",
+        "copySequenceOrder",
+        "favoriteOrder",
+        "tagOrders",
+        "sensitivity"
+    ]
+
     struct UpstreamArchiveManifestStub: Codable, Equatable {
         var formatVersion: Int
         var appName: String
         var appVersion: String?
         var exportedAt: Date
+    }
+
+    struct UpstreamArchiveTagStub: Codable, Equatable {
+        var id: String
+        var name: String
+        var color: String
+    }
+
+    struct UpstreamArchiveItemStub: Codable, Equatable {
+        var id: UUID
+        var kind: String
+        var title: String?
+        var text: String?
+        var qrCodeText: String?
+        var rtfBase64: String?
+        var html: String?
+        var assetPath: String?
+        var filePaths: [String]
+        var sourceAppName: String?
+        var sourceBundleIdentifier: String?
+        var copiedAt: Date
+        var firstCopiedAt: Date
+        var byteSize: Int
+        var isFavorite: Bool
+        var tagIDs: [String]
+        var tagNames: [String]
+        var copyCount: Int
+        var linkPreviewDetails: UpstreamLinkPreviewDetailsStub?
+        var copySequenceID: Date?
+        var copySequenceOrder: Int?
+        var favoriteOrder: Int?
+        var tagOrders: [String: Int]?
+        var sensitivity: String?
     }
 
     static func makeFullyPopulatedPreferences() -> AppPreferences {
@@ -350,15 +432,45 @@ struct UpstreamInteropContractTests {
         let jsonObject = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(Set(jsonObject.keys) == UpstreamInteropStubs.expectedAppPreferencesKeys)
 
+        #expect(
+            Set(AppAppearance.allCases.map(\.rawValue))
+                == Set(UpstreamInteropStubs.UpstreamAppAppearanceStub.allCases.map(\.rawValue))
+        )
+        #expect(Set(AppAppearance.allCases.map(\.rawValue)) == ["system", "light", "dark"])
+        #expect(
+            Set(HistoryWindowOpenStrategy.allCases.map(\.rawValue))
+                == ["lastLocation", "activeScreenCenter", "activeWindowCenter", "screenWithCursor", "mouseCursor", "inputCursor"]
+        )
+        #expect(
+            Set(HistorySortOption.allCases.map(\.rawValue))
+                == ["Last Copy Time", "First Copy Time", "Number of Copies", "Size"]
+        )
+        #expect(
+            Set(HistoryItemClickActionPreference.allCases.map(\.rawValue))
+                == ["select", "paste", "copy"]
+        )
+        #expect(
+            Set(CopyAndMergeSeparatorPreference.allCases.map(\.rawValue))
+                == ["newLine", "space", "comma", "empty"]
+        )
+        #expect(
+            Set(PasteInterItemAction.allCases.map(\.rawValue))
+                == ["none", "returnKey", "shiftReturn", "keyUp", "keyDown", "tab", "space", "commaSpace"]
+        )
+        #expect(
+            Set(HistoryItemActionPreference.allCases.map(\.rawValue))
+                == ["paste", "copy"]
+        )
+
         let upstreamStub = try JSONDecoder().decode(UpstreamInteropStubs.UpstreamAppPreferencesStub.self, from: data)
         #expect(upstreamStub.appearance == .dark)
-        #expect(["lastLocation", "activeScreenCenter", "activeWindowCenter", "screenWithCursor", "mouseCursor", "inputCursor"].contains(upstreamStub.openWindowStrategy))
-        #expect(["Last Copy Time", "First Copy Time", "Number of Copies", "Size"].contains(upstreamStub.historySortOption))
-        #expect(["select", "paste", "copy"].contains(upstreamStub.singleClickAction))
-        #expect(["newLine", "space", "comma", "empty"].contains(upstreamStub.copyAndMergeSeparator))
-        #expect(["none", "returnKey", "shiftReturn", "keyUp", "keyDown", "tab", "space", "commaSpace"].contains(upstreamStub.multiPasteKey))
-        #expect(["paste", "copy"].contains(upstreamStub.doubleClickAction))
-        #expect(["paste", "copy"].contains(upstreamStub.numberKeyAction))
+        #expect(upstreamStub.openWindowStrategy == "activeScreenCenter")
+        #expect(upstreamStub.historySortOption == "Last Copy Time")
+        #expect(upstreamStub.singleClickAction == "select")
+        #expect(upstreamStub.copyAndMergeSeparator == "newLine")
+        #expect(upstreamStub.multiPasteKey == "shiftReturn")
+        #expect(upstreamStub.doubleClickAction == "paste")
+        #expect(upstreamStub.numberKeyAction == "paste")
         #expect(upstreamStub.hasClearedLegacyPauseShortcut)
 
         // Defensive decoding of ClipBookForkPreferencesV1 on missing, empty, forward-compatible, or malformed payloads.
@@ -482,6 +594,9 @@ struct UpstreamInteropContractTests {
         try TestSupport.withTemporaryDirectory { supportDirectory in
             let clipAID = UUID()
             let clipBID = UUID()
+            let clipCID = UUID()
+            let clipARtfData = Data(#"{\rtf1\ansi\b Initial Fork Clip A\b0}"#.utf8)
+            let clipAHtml = "<b>Initial Fork Clip A</b>"
             var createdTagID = 0
 
             do {
@@ -491,9 +606,13 @@ struct UpstreamInteropContractTests {
 
                 var clipA = ClipboardItem.fixture(
                     id: clipAID,
-                    kind: .text,
+                    kind: .richText,
+                    title: "Initial Title A",
                     text: "Initial Fork Clip A",
+                    rtfData: clipARtfData,
+                    html: clipAHtml,
                     copiedAt: Date(timeIntervalSince1970: 1_700_000_100),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_700_000_050),
                     tags: [tag.id]
                 )
                 clipA.tagOrders = [tag.id: 4]
@@ -522,8 +641,19 @@ struct UpstreamInteropContractTests {
                 )
                 clipB.expiresAt = clipBExpiresAt
 
+                let clipC = ClipboardItem.fixture(
+                    id: clipCID,
+                    kind: .image,
+                    text: nil,
+                    assetPath: "Images/\(clipCID.uuidString).png",
+                    imageDigest: "sha256-clip-c",
+                    copiedAt: Date(timeIntervalSince1970: 1_700_000_150),
+                    byteSize: 512
+                )
+
                 try store.upsert(clipA)
                 try store.upsert(clipB)
+                try store.upsert(clipC)
             }
 
             let dbPath = supportDirectory.appendingPathComponent("History.sqlite").path
@@ -617,32 +747,63 @@ struct UpstreamInteropContractTests {
                 #expect(tagsColumns.map(\.name) == expectedTagsColumns.map(\.0))
                 #expect(tagsColumns.map(\.type) == expectedTagsColumns.map(\.1))
 
-                // 4. Decode every `clips.payload` via `UpstreamClipboardItemStub`.
+                // 4. Decode every `clips.payload` via `UpstreamClipboardItemStub` and verify `html`/`rtf` columns.
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
                 var decodedByID: [UUID: UpstreamInteropStubs.UpstreamClipboardItemStub] = [:]
+                var unionOfPayloadKeys: Set<String> = []
+                var storedFormattingByID: [UUID: (html: String?, rtf: Data?)] = [:]
 
                 do {
                     var stmt: OpaquePointer?
-                    #expect(sqlite3_prepare_v2(db, "SELECT payload FROM clips;", -1, &stmt, nil) == SQLITE_OK)
+                    #expect(sqlite3_prepare_v2(db, "SELECT payload, html, rtf FROM clips;", -1, &stmt, nil) == SQLITE_OK)
                     defer { sqlite3_finalize(stmt) }
                     while sqlite3_step(stmt) == SQLITE_ROW {
                         let bytes = try #require(sqlite3_column_blob(stmt, 0))
                         let length = Int(sqlite3_column_bytes(stmt, 0))
                         let payloadData = Data(bytes: bytes, count: length)
                         let rawJSON = try #require(try JSONSerialization.jsonObject(with: payloadData) as? [String: Any])
-                        #expect(Set(rawJSON.keys).isSubset(of: UpstreamInteropStubs.expectedClipboardItemKeys))
+                        let rowKeys = Set(rawJSON.keys)
+                        #expect(rowKeys.isSubset(of: UpstreamInteropStubs.expectedClipboardItemKeys))
+                        unionOfPayloadKeys.formUnion(rowKeys)
+                        if let previewJSON = rawJSON["linkPreviewDetails"] as? [String: Any] {
+                            #expect(Set(previewJSON.keys) == UpstreamInteropStubs.expectedArchiveLinkPreviewDetailsKeys)
+                        }
 
                         let stub = try decoder.decode(
                             UpstreamInteropStubs.UpstreamClipboardItemStub.self,
                             from: payloadData
                         )
                         decodedByID[stub.id] = stub
+
+                        let htmlCol = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
+                        let rtfCol: Data?
+                        if let rtfPtr = sqlite3_column_blob(stmt, 2) {
+                            rtfCol = Data(bytes: rtfPtr, count: Int(sqlite3_column_bytes(stmt, 2)))
+                        } else {
+                            rtfCol = nil
+                        }
+                        storedFormattingByID[stub.id] = (htmlCol, rtfCol)
                     }
                 }
 
+                #expect(
+                    unionOfPayloadKeys
+                        == UpstreamInteropStubs.expectedClipboardItemKeys.subtracting(["rtfData", "html"])
+                )
+
                 var updatedClipA = try #require(decodedByID[clipAID])
+                #expect(updatedClipA.title == "Initial Title A")
+                #expect(updatedClipA.hasFormatting == true)
+                #expect(updatedClipA.htmlDigest != nil)
                 #expect(updatedClipA.tagOrders == [createdTagID: 4])
+                #expect(storedFormattingByID[clipAID]?.html == clipAHtml)
+                #expect(storedFormattingByID[clipAID]?.rtf == clipARtfData)
+
+                let decodedClipC = try #require(decodedByID[clipCID])
+                #expect(decodedClipC.assetPath == "Images/\(clipCID.uuidString).png")
+                #expect(decodedClipC.imageDigest == "sha256-clip-c")
+
                 let decodedClipB = try #require(decodedByID[clipBID])
                 #expect(decodedClipB.sensitivity == ItemSensitivity.sensitive.rawValue)
                 #expect(decodedClipB.expiresAt == Date(timeIntervalSince1970: 1_700_003_800))
@@ -685,26 +846,25 @@ struct UpstreamInteropContractTests {
                     var stmt: OpaquePointer?
                     #expect(sqlite3_prepare_v2(db, upsertSQL, -1, &stmt, nil) == SQLITE_OK)
                     defer { sqlite3_finalize(stmt) }
-                    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                    sqlite3_bind_text(stmt, 1, clipAID.uuidString, -1, transient)
-                    sqlite3_bind_text(stmt, 2, updatedClipA.kind.rawValue, -1, transient)
+                    sqlite3_bind_text(stmt, 1, clipAID.uuidString, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(stmt, 2, updatedClipA.kind.rawValue, -1, SQLITE_TRANSIENT)
                     sqlite3_bind_double(stmt, 3, updatedClipA.copiedAt.timeIntervalSince1970)
                     sqlite3_bind_int(stmt, 4, updatedClipA.isFavorite ? 1 : 0)
-                    sqlite3_bind_text(stmt, 5, updatedClipA.sourceAppName ?? "", -1, transient)
-                    sqlite3_bind_text(stmt, 6, updatedClipA.searchText, -1, transient)
-                    sqlite3_bind_text(stmt, 7, "text:Updated By Upstream Clip A", -1, transient)
+                    sqlite3_bind_text(stmt, 5, updatedClipA.sourceAppName ?? "", -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(stmt, 6, updatedClipA.searchText, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(stmt, 7, "text:Updated By Upstream Clip A", -1, SQLITE_TRANSIENT)
                     _ = updatedPayload.withUnsafeBytes { buffer in
-                        sqlite3_bind_blob(stmt, 8, buffer.baseAddress, Int32(updatedPayload.count), transient)
+                        sqlite3_bind_blob(stmt, 8, buffer.baseAddress, Int32(updatedPayload.count), SQLITE_TRANSIENT)
                     }
                     #expect(sqlite3_step(stmt) == SQLITE_DONE)
                 }
 
                 do {
                     var stmt: OpaquePointer?
-                    #expect(sqlite3_prepare_v2(db, "DELETE FROM clips WHERE id = ?;", -1, &stmt, nil) == SQLITE_OK)
+                    #expect(sqlite3_prepare_v2(db, "DELETE FROM clips WHERE id IN (?, ?);", -1, &stmt, nil) == SQLITE_OK)
                     defer { sqlite3_finalize(stmt) }
-                    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                    sqlite3_bind_text(stmt, 1, clipBID.uuidString, -1, transient)
+                    sqlite3_bind_text(stmt, 1, clipBID.uuidString, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(stmt, 2, clipCID.uuidString, -1, SQLITE_TRANSIENT)
                     #expect(sqlite3_step(stmt) == SQLITE_DONE)
                 }
 
@@ -716,8 +876,12 @@ struct UpstreamInteropContractTests {
                 let reopenedStore = SQLiteHistoryStore(directory: supportDirectory)
                 let items = try reopenedStore.fetchAll()
                 #expect(items.map(\.id) == [clipAID])
-                #expect(items.first?.text == "Updated By Upstream Clip A")
-                #expect(items.first?.tagOrders == [createdTagID: 4])
+                let reopenedClipA = try #require(items.first)
+                #expect(reopenedClipA.text == "Updated By Upstream Clip A")
+                #expect(reopenedClipA.tagOrders == [createdTagID: 4])
+                let hydratedClipA = try reopenedStore.loadingFormatting(of: reopenedClipA)
+                #expect(hydratedClipA.html == clipAHtml)
+                #expect(hydratedClipA.rtfData == clipARtfData)
             }
 
             do {
@@ -739,39 +903,29 @@ struct UpstreamInteropContractTests {
 
     @Test
     @MainActor
-    func supportDirectoryIsolationAndArchiveFormatVersionOneLock() async throws {
+    func supportDirectoryIsolationSweepsOrphanImagesWhileSparingFork() async throws {
         let harness = try TestSupport.makeTestCoordinator()
         defer { harness.cleanup() }
 
         let fileManager = FileManager.default
-        let imagesDirectory = harness.supportDirectory.appendingPathComponent("Images", isDirectory: true)
-        try fileManager.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
-        let orphanSentinel = imagesDirectory.appendingPathComponent("orphan-sentinel.png")
-        try Data("orphan".utf8).write(to: orphanSentinel)
-
-        let forkDirectory = AppDirectories.forkSupportDirectory(in: harness.supportDirectory, fileManager: fileManager)
-        #expect(forkDirectory.lastPathComponent == "Fork")
-        let forkStateURL = forkDirectory.appendingPathComponent("state.json")
-        let forkPayload = Data("{\"ok\":true}".utf8)
-        try forkPayload.write(to: forkStateURL)
-
-        let backdated = Date().addingTimeInterval(-20 * 60)
-        let attributes: [FileAttributeKey: Any] = [
-            .creationDate: backdated,
-            .modificationDate: backdated
-        ]
-        try fileManager.setAttributes(attributes, ofItemAtPath: orphanSentinel.path)
-        try fileManager.setAttributes(attributes, ofItemAtPath: forkStateURL.path)
+        let sentinels = try stageBackdatedOrphanAndForkSentinels(
+            in: harness.supportDirectory,
+            fileManager: fileManager
+        )
+        #expect(sentinels.forkDirectory.lastPathComponent == "Fork")
 
         harness.coordinator.loadHistory()
         let orphanRemoved = await TestSupport.waitUntil {
-            !fileManager.fileExists(atPath: orphanSentinel.path)
+            !fileManager.fileExists(atPath: sentinels.orphanSentinelURL.path)
         }
         #expect(orphanRemoved)
-        #expect(fileManager.fileExists(atPath: forkStateURL.path))
-        #expect(try Data(contentsOf: forkStateURL) == forkPayload)
+        #expect(fileManager.fileExists(atPath: sentinels.forkStateURL.path))
+        #expect(try Data(contentsOf: sentinels.forkStateURL) == sentinels.forkPayload)
+    }
 
-        // `.clipbookarchive` formatVersion == 1 & `tagOrders` export/import round-trip.
+    @Test
+    func archiveFormatVersionOneAndWireSchemaRoundTrip() throws {
+        let fileManager = FileManager.default
         try TestSupport.withTemporaryDirectory { archiveWorkspace in
             let archiveURL = archiveWorkspace.appendingPathComponent("Export.clipbookarchive", isDirectory: true)
             let sourceSupport = archiveWorkspace.appendingPathComponent("SourceSupport", isDirectory: true)
@@ -779,20 +933,96 @@ struct UpstreamInteropContractTests {
             try fileManager.createDirectory(at: sourceSupport, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: destSupport, withIntermediateDirectories: true)
 
+            let sourceImageURL = sourceSupport.appendingPathComponent("clip-image.png")
+            let sourcePreviewURL = sourceSupport.appendingPathComponent("og-preview.png")
+            let sourceFaviconURL = sourceSupport.appendingPathComponent("favicon.ico")
+            let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x11, 0x22])
+            let previewBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x33, 0x44])
+            let faviconBytes = Data([0x00, 0x00, 0x01, 0x00, 0x01, 0x00])
+            try imageBytes.write(to: sourceImageURL)
+            try previewBytes.write(to: sourcePreviewURL)
+            try faviconBytes.write(to: sourceFaviconURL)
+
             let tag = Tag(id: 9, name: "ArchiveTag", color: "#00AA88")
-            var item = ClipboardItem.fixture(
-                kind: .text,
+            let rtfPayload = Data(#"{\rtf1\ansi\b Archived clip with tagOrders\b0}"#.utf8)
+            var richItem = ClipboardItem.fixture(
+                kind: .richText,
+                title: "Formatted Spec",
                 text: "Archived clip with tagOrders",
+                rtfData: rtfPayload,
+                html: "<b>Archived clip with tagOrders</b>",
+                copiedAt: Date(timeIntervalSince1970: 1_700_001_000),
+                firstCopiedAt: Date(timeIntervalSince1970: 1_700_000_500),
+                isFavorite: true,
+                tags: [tag.id],
+                copyCount: 3,
+                favoriteOrder: 2
+            )
+            richItem.tagOrders = [tag.id: 7]
+
+            let imageItem = ClipboardItem.fixture(
+                kind: .image,
+                title: "QR Diagram",
+                text: "OCR Diagram",
+                qrCodeText: "https://qr.example/archive",
+                assetPath: sourceImageURL.path,
+                imageDigest: ContentDigest.sha256(imageBytes),
+                copiedAt: Date(timeIntervalSince1970: 1_700_001_010),
+                firstCopiedAt: Date(timeIntervalSince1970: 1_700_000_510),
+                byteSize: imageBytes.count,
                 tags: [tag.id]
             )
-            item.tagOrders = [tag.id: 7]
+
+            let linkItem = ClipboardItem.fixture(
+                kind: .link,
+                text: "https://example.com/archive",
+                copiedAt: Date(timeIntervalSince1970: 1_700_001_020),
+                firstCopiedAt: Date(timeIntervalSince1970: 1_700_000_520),
+                linkPreviewDetails: LinkPreviewDetails(
+                    url: "https://example.com/archive",
+                    title: "Archive Preview",
+                    description: "Preview body",
+                    imagePath: sourcePreviewURL.path,
+                    faviconPath: sourceFaviconURL.path,
+                    fetchedAt: Date(timeIntervalSince1970: 1_700_001_015)
+                ),
+                copySequenceID: Date(timeIntervalSince1970: 1_700_001_000),
+                copySequenceOrder: 1,
+                sensitivity: .sensitive
+            )
 
             let exportService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: sourceSupport)
-            try exportService.export(items: [item], tags: [tag], to: archiveURL)
+            try exportService.export(items: [richItem, imageItem, linkItem], tags: [tag], to: archiveURL)
 
-            let manifestData = try Data(contentsOf: archiveURL.appendingPathComponent("manifest.json"))
+            let manifestURL = archiveURL.appendingPathComponent("manifest.json")
+            let tagsURL = archiveURL.appendingPathComponent("tags.json")
+            let historyURL = archiveURL.appendingPathComponent("history.json")
+
+            let manifestData = try Data(contentsOf: manifestURL)
             let manifestJSON = try #require(try JSONSerialization.jsonObject(with: manifestData) as? [String: Any])
-            #expect(Set(manifestJSON.keys).isSubset(of: ["formatVersion", "appName", "appVersion", "exportedAt"]))
+            #expect(Set(manifestJSON.keys).isSubset(of: UpstreamInteropStubs.expectedArchiveManifestKeys))
+            #expect(Set(["formatVersion", "appName", "exportedAt"]).isSubset(of: Set(manifestJSON.keys)))
+
+            let tagsData = try Data(contentsOf: tagsURL)
+            let tagsJSON = try #require(try JSONSerialization.jsonObject(with: tagsData) as? [[String: Any]])
+            #expect(tagsJSON.count == 1)
+            for tagObject in tagsJSON {
+                #expect(Set(tagObject.keys) == UpstreamInteropStubs.expectedArchiveTagKeys)
+            }
+
+            let historyData = try Data(contentsOf: historyURL)
+            let historyJSON = try #require(try JSONSerialization.jsonObject(with: historyData) as? [[String: Any]])
+            #expect(historyJSON.count == 3)
+            var unionOfHistoryKeys: Set<String> = []
+            for itemObject in historyJSON {
+                let itemKeys = Set(itemObject.keys)
+                #expect(itemKeys.isSubset(of: UpstreamInteropStubs.expectedArchiveItemKeys))
+                unionOfHistoryKeys.formUnion(itemKeys)
+                if let previewObject = itemObject["linkPreviewDetails"] as? [String: Any] {
+                    #expect(Set(previewObject.keys) == UpstreamInteropStubs.expectedArchiveLinkPreviewDetailsKeys)
+                }
+            }
+            #expect(unionOfHistoryKeys == UpstreamInteropStubs.expectedArchiveItemKeys)
 
             let archiveDecoder = JSONDecoder()
             archiveDecoder.dateDecodingStrategy = .iso8601
@@ -803,16 +1033,91 @@ struct UpstreamInteropContractTests {
             #expect(manifest.formatVersion == 1)
             #expect(manifest.appName == "ClipBook")
 
+            let decodedTags = try archiveDecoder.decode(
+                [UpstreamInteropStubs.UpstreamArchiveTagStub].self,
+                from: tagsData
+            )
+            #expect(decodedTags == [UpstreamInteropStubs.UpstreamArchiveTagStub(id: "9", name: "ArchiveTag", color: "#00AA88")])
+
+            let decodedItems = try archiveDecoder.decode(
+                [UpstreamInteropStubs.UpstreamArchiveItemStub].self,
+                from: historyData
+            )
+            let decodedByID = Dictionary(uniqueKeysWithValues: decodedItems.map { ($0.id, $0) })
+
+            let decodedRich = try #require(decodedByID[richItem.id])
+            #expect(decodedRich.kind == ClipboardKind.richText.rawValue)
+            #expect(decodedRich.title == "Formatted Spec")
+            #expect(decodedRich.text == "Archived clip with tagOrders")
+            #expect(decodedRich.rtfBase64 == rtfPayload.base64EncodedString())
+            #expect(decodedRich.html == "<b>Archived clip with tagOrders</b>")
+            #expect(decodedRich.copiedAt == Date(timeIntervalSince1970: 1_700_001_000))
+            #expect(decodedRich.firstCopiedAt == Date(timeIntervalSince1970: 1_700_000_500))
+            #expect(decodedRich.isFavorite)
+            #expect(decodedRich.tagIDs == ["9"])
+            #expect(decodedRich.tagNames == ["ArchiveTag"])
+            #expect(decodedRich.copyCount == 3)
+            #expect(decodedRich.favoriteOrder == 2)
+            #expect(decodedRich.tagOrders == ["9": 7])
+
+            let decodedImage = try #require(decodedByID[imageItem.id])
+            #expect(decodedImage.kind == ClipboardKind.image.rawValue)
+            #expect(decodedImage.qrCodeText == "https://qr.example/archive")
+            #expect(decodedImage.assetPath == "assets/images/clip-image.png")
+
+            let decodedLink = try #require(decodedByID[linkItem.id])
+            #expect(decodedLink.kind == ClipboardKind.link.rawValue)
+            #expect(decodedLink.copySequenceID == Date(timeIntervalSince1970: 1_700_001_000))
+            #expect(decodedLink.copySequenceOrder == 1)
+            #expect(decodedLink.sensitivity == ItemSensitivity.sensitive.rawValue)
+            #expect(
+                decodedLink.linkPreviewDetails
+                    == UpstreamInteropStubs.UpstreamLinkPreviewDetailsStub(
+                        url: "https://example.com/archive",
+                        title: "Archive Preview",
+                        description: "Preview body",
+                        imagePath: "assets/link-previews/og-preview.png",
+                        faviconPath: "assets/link-previews/favicon.ico",
+                        fetchedAt: Date(timeIntervalSince1970: 1_700_001_015)
+                    )
+            )
+
+            // Re-encode via frozen Upstream stubs to prove Upstream-written archive JSON imports cleanly.
+            let archiveEncoder = JSONEncoder()
+            archiveEncoder.dateEncodingStrategy = .iso8601
+            try archiveEncoder.encode(manifest).write(to: manifestURL, options: .atomic)
+            try archiveEncoder.encode(decodedTags).write(to: tagsURL, options: .atomic)
+            try archiveEncoder.encode(decodedItems).write(to: historyURL, options: .atomic)
+
             let destinationStore = SQLiteHistoryStore(directory: destSupport)
             let importService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: destSupport)
             let importResult = try importService.import(from: archiveURL, into: destinationStore)
-            #expect(importResult.itemCount == 1)
+            #expect(importResult.itemCount == 3)
             #expect(importResult.tagCount == 1)
 
             let importedTag = try #require(try destinationStore.fetchTags().first)
-            let importedItem = try #require(try destinationStore.fetchAll().first)
-            #expect(importedItem.id == item.id)
-            #expect(importedItem.tagOrders == [importedTag.id: 7])
+            #expect(importedTag.name == "ArchiveTag")
+            #expect(importedTag.color == "#00AA88")
+
+            let importedByID = Dictionary(uniqueKeysWithValues: try destinationStore.fetchAll().map { ($0.id, $0) })
+            let importedRich = try destinationStore.loadingFormatting(of: try #require(importedByID[richItem.id]))
+            #expect(importedRich.tagOrders == [importedTag.id: 7])
+            #expect(importedRich.favoriteOrder == 2)
+            #expect(importedRich.rtfData == rtfPayload)
+            #expect(importedRich.html == "<b>Archived clip with tagOrders</b>")
+
+            let importedImage = try #require(importedByID[imageItem.id])
+            #expect(importedImage.qrCodeText == "https://qr.example/archive")
+            let importedAssetPath = try #require(importedImage.assetPath)
+            #expect(try Data(contentsOf: URL(fileURLWithPath: importedAssetPath)) == imageBytes)
+
+            let importedLink = try #require(importedByID[linkItem.id])
+            #expect(importedLink.sensitivity == .sensitive)
+            #expect(importedLink.copySequenceID == Date(timeIntervalSince1970: 1_700_001_000))
+            #expect(importedLink.copySequenceOrder == 1)
+            #expect(importedLink.linkPreviewDetails?.title == "Archive Preview")
+            #expect(importedLink.linkPreviewDetails?.description == "Preview body")
+            #expect(importedLink.linkPreviewDetails?.fetchedAt == Date(timeIntervalSince1970: 1_700_001_015))
         }
     }
 
@@ -823,12 +1128,20 @@ struct UpstreamInteropContractTests {
         defer { harness.cleanup() }
 
         let fileManager = FileManager.default
-        let imagesDirectory = harness.supportDirectory.appendingPathComponent("Images", isDirectory: true)
-        try fileManager.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+        let sentinels = try stageBackdatedOrphanAndForkSentinels(
+            in: harness.supportDirectory,
+            orphanFileName: "orphan-after-delete.png",
+            fileManager: fileManager
+        )
 
         let keptID = UUID()
-        let keptAssetURL = imagesDirectory.appendingPathComponent("\(keptID.uuidString).png")
+        let keptAssetURL = sentinels.imagesDirectory.appendingPathComponent("\(keptID.uuidString).png")
         try Data("kept-image".utf8).write(to: keptAssetURL)
+        let backdated = Date().addingTimeInterval(-20 * 60)
+        try fileManager.setAttributes(
+            [.creationDate: backdated, .modificationDate: backdated],
+            ofItemAtPath: keptAssetURL.path
+        )
         let keptItem = ClipboardItem.fixture(
             id: keptID,
             kind: .image,
@@ -839,7 +1152,7 @@ struct UpstreamInteropContractTests {
         )
 
         let deletedID = UUID()
-        let deletedAssetURL = imagesDirectory.appendingPathComponent("\(deletedID.uuidString).png")
+        let deletedAssetURL = sentinels.imagesDirectory.appendingPathComponent("\(deletedID.uuidString).png")
         try Data("deleted-image".utf8).write(to: deletedAssetURL)
         let deletedItem = ClipboardItem.fixture(
             id: deletedID,
@@ -850,10 +1163,52 @@ struct UpstreamInteropContractTests {
             byteSize: 13
         )
 
-        let orphanSentinel = imagesDirectory.appendingPathComponent("orphan-after-delete.png")
-        try Data("orphan".utf8).write(to: orphanSentinel)
+        try harness.historyStore.upsert(keptItem)
+        try harness.historyStore.upsert(deletedItem)
 
-        let forkDirectory = AppDirectories.forkSupportDirectory(in: harness.supportDirectory, fileManager: fileManager)
+        // Deferred startup/import load (`sweepsCaches: false`) populates `model.items` without starting orphan sweep.
+        #expect(harness.coordinator.loadHistory(sweepsCaches: false))
+        #expect(Set(harness.model.items.map(\.id)) == [keptID, deletedID])
+        #expect(fileManager.fileExists(atPath: sentinels.orphanSentinelURL.path))
+
+        // Post-load permanent deletion removes `deletedItem` from SQLite and `model.items` before sweeping.
+        harness.model.preferences.trashRetentionDays = 0
+        harness.coordinator.delete(deletedItem)
+        #expect(harness.model.items.map(\.id) == [keptID])
+        #expect(!fileManager.fileExists(atPath: deletedAssetURL.path))
+        #expect(fileManager.fileExists(atPath: sentinels.orphanSentinelURL.path))
+
+        // Running `loadHistory()` (`sweepsCaches: true` -> `removeOrphanedStoredFiles()`) after deletion settles
+        // sweeps the backdated orphan in `Images/` while sparing referenced assets and `Fork/`.
+        #expect(harness.coordinator.loadHistory())
+        let orphanRemoved = await TestSupport.waitUntil {
+            !fileManager.fileExists(atPath: sentinels.orphanSentinelURL.path)
+        }
+        #expect(orphanRemoved)
+        #expect(fileManager.fileExists(atPath: keptAssetURL.path))
+        #expect(fileManager.fileExists(atPath: sentinels.forkStateURL.path))
+        #expect(try Data(contentsOf: sentinels.forkStateURL) == sentinels.forkPayload)
+    }
+
+    private struct StagedSupportSentinels {
+        let imagesDirectory: URL
+        let orphanSentinelURL: URL
+        let forkDirectory: URL
+        let forkStateURL: URL
+        let forkPayload: Data
+    }
+
+    private func stageBackdatedOrphanAndForkSentinels(
+        in supportDirectory: URL,
+        orphanFileName: String = "orphan-sentinel.png",
+        fileManager: FileManager = .default
+    ) throws -> StagedSupportSentinels {
+        let imagesDirectory = supportDirectory.appendingPathComponent("Images", isDirectory: true)
+        try fileManager.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+        let orphanSentinelURL = imagesDirectory.appendingPathComponent(orphanFileName)
+        try Data("orphan".utf8).write(to: orphanSentinelURL)
+
+        let forkDirectory = AppDirectories.forkSupportDirectory(in: supportDirectory, fileManager: fileManager)
         let forkStateURL = forkDirectory.appendingPathComponent("state.json")
         let forkPayload = Data("{\"ok\":true}".utf8)
         try forkPayload.write(to: forkStateURL)
@@ -863,34 +1218,16 @@ struct UpstreamInteropContractTests {
             .creationDate: backdated,
             .modificationDate: backdated
         ]
-        try fileManager.setAttributes(attributes, ofItemAtPath: orphanSentinel.path)
+        try fileManager.setAttributes(attributes, ofItemAtPath: orphanSentinelURL.path)
         try fileManager.setAttributes(attributes, ofItemAtPath: forkStateURL.path)
 
-        try harness.historyStore.upsert(keptItem)
-        try harness.historyStore.upsert(deletedItem)
-
-        // Deferred startup/import load (`sweepsCaches: false`) populates `model.items` without starting orphan sweep.
-        #expect(harness.coordinator.loadHistory(sweepsCaches: false))
-        #expect(Set(harness.model.items.map(\.id)) == [keptID, deletedID])
-        #expect(fileManager.fileExists(atPath: orphanSentinel.path))
-
-        // Post-load permanent deletion removes `deletedItem` from SQLite and `model.items` before sweeping.
-        harness.model.preferences.trashRetentionDays = 0
-        harness.coordinator.delete(deletedItem)
-        #expect(harness.model.items.map(\.id) == [keptID])
-        #expect(!fileManager.fileExists(atPath: deletedAssetURL.path))
-        #expect(fileManager.fileExists(atPath: orphanSentinel.path))
-
-        // Running `loadHistory()` (`sweepsCaches: true` -> `removeOrphanedStoredFiles()`) after deletion settles
-        // sweeps the backdated orphan in `Images/` while sparing referenced assets and `Fork/`.
-        #expect(harness.coordinator.loadHistory())
-        let orphanRemoved = await TestSupport.waitUntil {
-            !fileManager.fileExists(atPath: orphanSentinel.path)
-        }
-        #expect(orphanRemoved)
-        #expect(fileManager.fileExists(atPath: keptAssetURL.path))
-        #expect(fileManager.fileExists(atPath: forkStateURL.path))
-        #expect(try Data(contentsOf: forkStateURL) == forkPayload)
+        return StagedSupportSentinels(
+            imagesDirectory: imagesDirectory,
+            orphanSentinelURL: orphanSentinelURL,
+            forkDirectory: forkDirectory,
+            forkStateURL: forkStateURL,
+            forkPayload: forkPayload
+        )
     }
 }
 

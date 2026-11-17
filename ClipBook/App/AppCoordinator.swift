@@ -126,6 +126,10 @@ final class AppCoordinator: ObservableObject {
     model.forkPreferences = preferencesStore.loadForkPreferences()
   }
 
+  func applyUpdatePreferences() {
+    updateService.setAutomaticallyChecksForUpdates(model.preferences.checkForUpdatesAutomatically)
+  }
+
   func start() {
     loadAndReconcilePreferences()
     #if DEBUG
@@ -138,7 +142,7 @@ final class AppCoordinator: ObservableObject {
     model.historySortOption = HistorySortOption(preferenceValue: model.preferences.historySortOption)
     model.isHistorySortReversed = model.preferences.isHistorySortReversed
     applyLanguage()
-    updateService.setAutomaticallyChecksForUpdates(model.preferences.checkForUpdatesAutomatically)
+    applyUpdatePreferences()
     var shouldSavePreferences = false
     if model.preferences.deleteItemShortcut == "delete" {
       model.preferences.deleteItemShortcut = AppPreferences.defaultDeleteItemShortcut
@@ -557,7 +561,7 @@ final class AppCoordinator: ObservableObject {
       LaunchAtLoginService.setEnabled(current.launchAtLogin)
     }
     if changes.automaticUpdateChecks {
-      updateService.setAutomaticallyChecksForUpdates(current.checkForUpdatesAutomatically)
+      applyUpdatePreferences()
     }
     if changes.globalShortcuts {
       configureShortcuts()

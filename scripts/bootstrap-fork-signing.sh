@@ -20,13 +20,20 @@ VERIFY_KC=""
 LOCAL_TRUST_ADDED=0
 REPO_FILES_MUTATED=0
 HAD_PREEXISTING_CERT=0
+GH_SECRETS_MUTATED=0
+BACKUP_DIR_PRESTAGED=0
+BACKUP_BUNDLE_WRITTEN=0
 
 cleanup_bootstrap() {
   local exit_code=$?
   if [[ -n "$VERIFY_KC" ]]; then
     security delete-keychain "$VERIFY_KC" 2>/dev/null || true
   fi
-  if [[ "$exit_code" -ne 0 && "$REPO_FILES_MUTATED" -eq 1 && "$LOCAL_TRUST_ADDED" -eq 0 ]]; then
+  if [[ "$exit_code" -ne 0 && "$BACKUP_DIR_PRESTAGED" -eq 1 && "$BACKUP_BUNDLE_WRITTEN" -eq 0 && -n "$OUTPUT_BACKUP_DIR" ]]; then
+    rm -f "$OUTPUT_BACKUP_DIR/.metadata_never_index" 2>/dev/null || true
+    rmdir "$OUTPUT_BACKUP_DIR" 2>/dev/null || true
+  fi
+  if [[ "$exit_code" -ne 0 && "$REPO_FILES_MUTATED" -eq 1 && "$LOCAL_TRUST_ADDED" -eq 0 && "$GH_SECRETS_MUTATED" -eq 0 ]]; then
     if [[ -n "$WORK_TMP" && -f "$WORK_TMP/Info.plist.bak" ]]; then
       cp "$WORK_TMP/Info.plist.bak" "$ROOT_DIR/ClipBook/Info.plist" 2>/dev/null || true
       chmod 644 "$ROOT_DIR/ClipBook/Info.plist" 2>/dev/null || true
@@ -38,15 +45,38 @@ cleanup_bootstrap() {
       rm -f "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" 2>/dev/null || true
     fi
   fi
-  if [[ -n "$WORK_TMP" && -d "$WORK_TMP" ]]; then
+  if [[ "$exit_code" -ne 0 && "$GH_SECRETS_MUTATED" -eq 1 && "$BACKUP_BUNDLE_WRITTEN" -eq 0 && -n "$WORK_TMP" && -d "$WORK_TMP" ]]; then
+    if [[ -n "${P12_PASSWORD:-}" ]]; then
+      printf '%s' "$P12_PASSWORD" > "$WORK_TMP/signing.p12.passphrase" 2>/dev/null || true
+      chmod 600 "$WORK_TMP/signing.p12.passphrase" 2>/dev/null || true
+    fi
+    if [[ -n "${SPARKLE_PRIV_B64:-}" ]]; then
+      printf '%s' "$SPARKLE_PRIV_B64" > "$WORK_TMP/sparkle_ed25519.key" 2>/dev/null || true
+      chmod 600 "$WORK_TMP/sparkle_ed25519.key" 2>/dev/null || true
+    fi
+    printf '\nCRITICAL: Bootstrap failed AFTER modifying GitHub Environment "%s" secrets on %s.\n' "$ENV_NAME" "$REPO" >&2
+    printf 'Emergency recovery key files were preserved (mode 0700/0600) at:\n  %s\n' "$WORK_TMP" >&2
+    printf 'Import or re-bootstrap before deleting %s.\n' "$WORK_TMP" >&2
+  elif [[ -n "$WORK_TMP" && -d "$WORK_TMP" ]]; then
     rm -rf "$WORK_TMP"
   fi
+  if [[ "$exit_code" -ne 0 && "$GH_SECRETS_MUTATED" -eq 1 && "$BACKUP_BUNDLE_WRITTEN" -eq 1 ]]; then
+    printf '\nWARNING: Bootstrap failed after modifying GitHub Environment "%s" secrets on %s (keys saved in %s).\n' \
+      "$ENV_NAME" "$REPO" "$OUTPUT_BACKUP_DIR" >&2
+  fi
   if [[ "$exit_code" -ne 0 && "$LOCAL_TRUST_ADDED" -eq 1 ]]; then
-    printf '\nBootstrap failed after modifying local certificate trust. Roll back with:\n' >&2
-    printf '  security remove-trusted-cert "%s" || true; security delete-certificate -c "%s" "%s" || true; git checkout -- ClipBook/Info.plist && rm -f scripts/ClipBookForkCodeSigning.crt\n' \
-      "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" \
-      "$CERT_CN" \
-      "$HOME/Library/Keychains/login.keychain-db" >&2
+    printf '\nBootstrap failed after modifying local certificate trust. Roll back local state with:\n' >&2
+    if [[ "$HAD_PREEXISTING_CERT" -eq 1 ]]; then
+      printf '  security remove-trusted-cert "%s" || true; security delete-certificate -c "%s" "%s" || true; git checkout -- ClipBook/Info.plist scripts/ClipBookForkCodeSigning.crt\n' \
+        "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" \
+        "$CERT_CN" \
+        "$HOME/Library/Keychains/login.keychain-db" >&2
+    else
+      printf '  security remove-trusted-cert "%s" || true; security delete-certificate -c "%s" "%s" || true; git checkout -- ClipBook/Info.plist && rm -f scripts/ClipBookForkCodeSigning.crt\n' \
+        "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" \
+        "$CERT_CN" \
+        "$HOME/Library/Keychains/login.keychain-db" >&2
+    fi
   fi
 }
 trap cleanup_bootstrap EXIT
@@ -160,6 +190,30 @@ if [[ -n "$OUTPUT_BACKUP_DIR" && ! -x /usr/bin/tmutil ]]; then
   printf 'Error: Expected /usr/bin/tmutil for backup directory Time Machine exclusion.\n' >&2
   exit 1
 fi
+if [[ -n "$OUTPUT_BACKUP_DIR" ]]; then
+  if [[ -e "$OUTPUT_BACKUP_DIR" && ! -d "$OUTPUT_BACKUP_DIR" ]]; then
+    printf 'Error: --output-backup-dir exists and is not a directory: %s\n' "$OUTPUT_BACKUP_DIR" >&2
+    exit 1
+  fi
+  if [[ -d "$OUTPUT_BACKUP_DIR" ]] && [[ -n "$(find "$OUTPUT_BACKUP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    printf 'Error: --output-backup-dir must be empty or not yet exist: %s\n' "$OUTPUT_BACKUP_DIR" >&2
+    exit 1
+  fi
+fi
+
+prestage_backup_dir() {
+  if [[ -z "$OUTPUT_BACKUP_DIR" || "$BACKUP_DIR_PRESTAGED" -eq 1 ]]; then
+    return 0
+  fi
+  mkdir -p "$OUTPUT_BACKUP_DIR"
+  chmod 700 "$OUTPUT_BACKUP_DIR"
+  OUTPUT_BACKUP_DIR="$(cd "$OUTPUT_BACKUP_DIR" && pwd)"
+  BACKUP_DIR_PRESTAGED=1
+
+  : > "$OUTPUT_BACKUP_DIR/.metadata_never_index"
+  chmod 600 "$OUTPUT_BACKUP_DIR/.metadata_never_index"
+  /usr/bin/tmutil addexclusion "$OUTPUT_BACKUP_DIR" >/dev/null
+}
 
 LOGIN_KC="$HOME/Library/Keychains/login.keychain-db"
 
@@ -188,6 +242,8 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
       exit 1
     fi
   fi
+
+  prestage_backup_dir
 fi
 
 # Ephemeral workspace & throwaway verification keychain path.
@@ -253,20 +309,34 @@ if grep -Fq 'PRIVATE KEY' "$WORK_TMP/signing.crt"; then
 fi
 
 printf '%s' "$P12_PASSWORD" > "$WORK_TMP/passphrase.verify"
-/usr/bin/openssl pkcs12 -in "$WORK_TMP/signing.p12" -clcerts -nokeys -passin file:"$WORK_TMP/passphrase.verify" >/dev/null
+/usr/bin/openssl pkcs12 -in "$WORK_TMP/signing.p12" -noout -passin file:"$WORK_TMP/passphrase.verify" >/dev/null
 rm -f "$WORK_TMP/passphrase.verify"
+
+# Verify macOS `security import` PKCS#12 cipher/MAC compatibility using a throwaway passphrase
+# so the production `$P12_PASSWORD` (`MACOS_CERT_PASSWORD`) never enters process `argv`.
+VERIFY_P12_PASS="$(/usr/bin/openssl rand -hex 32 | tr -d '\r\n[:space:]')"
+/usr/bin/openssl pkcs12 -export \
+  -inkey "$WORK_TMP/signing.key" \
+  -in "$WORK_TMP/signing.crt" \
+  -name "$CERT_CN" \
+  -certpbe PBE-SHA1-3DES \
+  -keypbe PBE-SHA1-3DES \
+  -macalg sha1 \
+  -passout stdin \
+  -out "$WORK_TMP/verify.p12" <<< "$VERIFY_P12_PASS"
 
 VERIFY_KC_PASS="$(/usr/bin/openssl rand -hex 32 | tr -d '\r\n[:space:]')"
 security create-keychain -p "$VERIFY_KC_PASS" "$VERIFY_KC"
 security unlock-keychain -p "$VERIFY_KC_PASS" "$VERIFY_KC"
-security import "$WORK_TMP/signing.p12" \
+security import "$WORK_TMP/verify.p12" \
   -k "$VERIFY_KC" \
-  -P "$P12_PASSWORD" \
+  -P "$VERIFY_P12_PASS" \
   -f pkcs12 \
   -T /usr/bin/codesign \
   -T /usr/bin/security >/dev/null
 security delete-keychain "$VERIFY_KC"
-unset VERIFY_KC_PASS
+rm -f "$WORK_TMP/verify.p12"
+unset VERIFY_KC_PASS VERIFY_P12_PASS
 
 # Generate Sparkle 2.9.3 32-byte Ed25519 seed + public key and verify with sign_update.
 ED_KEYPAIR_OUT="$(swift -e '
@@ -295,36 +365,26 @@ if [[ "${#SPARKLE_PRIV_B64}" -ne 44 || "${#SPARKLE_PUB_B64}" -ne 44 ]]; then
   exit 1
 fi
 
-find_sparkle_sign_update() {
-  local candidates=()
-  if [[ -n "${SPARKLE_BIN:-}" ]]; then
-    candidates+=("$SPARKLE_BIN/sign_update")
+if [[ -n "${SPARKLE_BIN:-}" ]]; then
+  SIGN_UPDATE="$SPARKLE_BIN/sign_update"
+  if [[ ! -f "$SIGN_UPDATE" || ! -x "$SIGN_UPDATE" ]]; then
+    printf 'Error: SPARKLE_BIN tool is missing or not executable: %s\n' "$SIGN_UPDATE" >&2
+    exit 1
   fi
-  candidates+=("$DERIVED_DATA_PATH/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update")
-  shopt -s nullglob
-  candidates+=("$DERIVED_DATA_PATH"/SourcePackages/artifacts/*/Sparkle/bin/sign_update)
-  candidates+=("$HOME"/Library/Developer/Xcode/DerivedData/*/SourcePackages/artifacts/*/Sparkle/bin/sign_update)
-  shopt -u nullglob
-
-  local candidate
-  for candidate in "${candidates[@]}"; do
-    if [[ -x "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-SIGN_UPDATE="$(find_sparkle_sign_update || true)"
-if [[ -z "$SIGN_UPDATE" ]]; then
-  mkdir -p "$DERIVED_DATA_PATH"
-  xcodebuild -resolvePackageDependencies \
-    -project "$ROOT_DIR/ClipBook.xcodeproj" \
-    -scheme "ClipBook" \
-    -derivedDataPath "$DERIVED_DATA_PATH" \
-    -onlyUsePackageVersionsFromResolvedFile >/dev/null
-  SIGN_UPDATE="$(find_sparkle_sign_update)"
+else
+  SIGN_UPDATE="$DERIVED_DATA_PATH/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
+  if [[ ! -f "$SIGN_UPDATE" || ! -x "$SIGN_UPDATE" ]]; then
+    mkdir -p "$DERIVED_DATA_PATH"
+    xcodebuild -resolvePackageDependencies \
+      -project "$ROOT_DIR/ClipBook.xcodeproj" \
+      -scheme "ClipBook" \
+      -derivedDataPath "$DERIVED_DATA_PATH" \
+      -onlyUsePackageVersionsFromResolvedFile >/dev/null
+  fi
+  if [[ ! -f "$SIGN_UPDATE" || ! -x "$SIGN_UPDATE" ]]; then
+    printf 'Error: Could not find Sparkle sign_update at %s\n' "$SIGN_UPDATE" >&2
+    exit 1
+  fi
 fi
 
 VERIFY_APPCAST_XML="$WORK_TMP/verify-appcast.xml"
@@ -336,13 +396,7 @@ write_backup_bundle() {
   if [[ -z "$OUTPUT_BACKUP_DIR" ]]; then
     return 0
   fi
-  mkdir -p "$OUTPUT_BACKUP_DIR"
-  chmod 700 "$OUTPUT_BACKUP_DIR"
-  OUTPUT_BACKUP_DIR="$(cd "$OUTPUT_BACKUP_DIR" && pwd)"
-
-  : > "$OUTPUT_BACKUP_DIR/.metadata_never_index"
-  chmod 600 "$OUTPUT_BACKUP_DIR/.metadata_never_index"
-  /usr/bin/tmutil addexclusion "$OUTPUT_BACKUP_DIR" >/dev/null
+  prestage_backup_dir
 
   cp "$WORK_TMP/signing.crt" "$OUTPUT_BACKUP_DIR/signing.crt"
   cp "$WORK_TMP/signing.p12" "$OUTPUT_BACKUP_DIR/signing.p12"
@@ -355,6 +409,7 @@ write_backup_bundle() {
     "$OUTPUT_BACKUP_DIR/signing.p12.passphrase" \
     "$OUTPUT_BACKUP_DIR/sparkle_ed25519.key" \
     "$OUTPUT_BACKUP_DIR/sparkle_ed25519.pub"
+  BACKUP_BUNDLE_WRITTEN=1
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -447,9 +502,14 @@ if not re.search(r"Number of trust settings\s*:\s*1\b", stanza):
 if not re.search(r"Policy OID\s*:\s*Code Signing\b", stanza):
     sys.stderr.write("Error: Certificate trust setting is not scoped to Code Signing policy.\n")
     sys.exit(1)
+for result_match in re.finditer(r"(?m)^\s*Result Type\s*:\s*(\S+)", stanza):
+    if result_match.group(1) not in ("kSecTrustSettingsResultTrustRoot", "kSecTrustSettingsResultTrustAsRoot"):
+        sys.stderr.write(f"Error: Certificate trust setting has disallowed Result Type: {result_match.group(1)}.\n")
+        sys.exit(1)
 '
 fi
 
+GH_SECRETS_MUTATED=1
 base64 < "$WORK_TMP/signing.p12" | tr -d '\r\n' | gh secret set MACOS_CERT_P12_BASE64 --env "$ENV_NAME" --repo "$REPO"
 printf '%s' "$P12_PASSWORD" | gh secret set MACOS_CERT_PASSWORD --env "$ENV_NAME" --repo "$REPO"
 printf '%s' "$SPARKLE_PRIV_B64" | gh secret set SPARKLE_ED25519_PRIVATE_KEY --env "$ENV_NAME" --repo "$REPO"

@@ -135,7 +135,7 @@ Upstream `./release.sh` remains untouched for Apple Developer ID + notarization 
   | `--previous-build INT` | Optional monotonic `CFBundleVersion` floor (`BUILD_NUMBER` must exceed `INT`). |
   | `--output-dir DIR` | Output root directory for artifacts and `release-metadata.env`. Default: `Releases/fork`. |
   | `--arch-list "arm64 x86_64"` | Space-separated architectures to archive and verify. Default: `arm64 x86_64`. |
-  | `--smoke-test` | Local unprivileged verification mode (ad-hoc Hardened Runtime + ephemeral Ed25519 keypair). |
+  | `--smoke-test` | Local/CI unprivileged verification mode (ephemeral Ed25519 keypair; ad-hoc Hardened Runtime unless `--p12-file` is also supplied). |
   | `-h`, `--help` | Show all options. |
 
 - **One-time maintainer signing & GitHub Environment bootstrap** (supports `--dry-run` for offline verification):

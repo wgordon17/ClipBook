@@ -40,43 +40,65 @@ jobs:
           printf '::add-mask::%s\n' "$AUTH_HEADER"
           unset BASIC_B64
 
-          git -c core.hooksPath=/dev/null -c submodule.recurse=false fetch --no-recurse-submodules origin +refs/heads/main:refs/remotes/origin/main
-          git -c core.hooksPath=/dev/null -c submodule.recurse=false fetch --no-recurse-submodules https://github.com/vladimir-ikryanov/ClipBook.git +refs/heads/main:refs/remotes/upstream/main
-          git -c core.hooksPath=/dev/null -c submodule.recurse=false fetch --no-recurse-submodules origin +refs/heads/chore/sync-upstream:refs/remotes/origin/chore/sync-upstream 2>/dev/null || true
-          PREV_SYNC_SHA="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false rev-parse -q --verify refs/remotes/origin/chore/sync-upstream || true)"
+          BOT_NAME="github-actions[bot]"
+          BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
 
-          MERGE_BASE_HEAD="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false merge-base HEAD refs/remotes/upstream/main)"
-          WF_DIFF_MAIN="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false diff --name-only refs/remotes/origin/main..refs/remotes/upstream/main -- .github/workflows/)"
-          WF_DIFF_HEAD="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false diff --name-only "${MERGE_BASE_HEAD}..refs/remotes/upstream/main" -- .github/workflows/)"
+          safe_git() {
+            git -c core.hooksPath=/dev/null -c submodule.recurse=false "$@"
+          }
+
+          safe_git_bot() {
+            safe_git -c "user.name=${BOT_NAME}" -c "user.email=${BOT_EMAIL}" "$@"
+          }
+
+          semver_gt() {
+            local lhs="$1"
+            local rhs="$2"
+            if [[ "$lhs" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              lhs="${lhs}.0"
+            fi
+            if [[ "$rhs" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              rhs="${rhs}.0"
+            fi
+            dpkg --compare-versions -- "$lhs" gt "$rhs"
+          }
+
+          safe_git fetch --no-recurse-submodules origin +refs/heads/main:refs/remotes/origin/main
+          safe_git fetch --no-recurse-submodules https://github.com/vladimir-ikryanov/ClipBook.git +refs/heads/main:refs/remotes/upstream/main
+          safe_git fetch --no-recurse-submodules origin +refs/heads/chore/sync-upstream:refs/remotes/origin/chore/sync-upstream 2>/dev/null || true
+          PREV_SYNC_SHA="$(safe_git rev-parse -q --verify refs/remotes/origin/chore/sync-upstream || true)"
+
+          MERGE_BASE_HEAD="$(safe_git merge-base HEAD refs/remotes/upstream/main)"
+          WF_DIFF_MAIN="$(safe_git diff --name-only refs/remotes/origin/main..refs/remotes/upstream/main -- .github/workflows/)"
+          WF_DIFF_HEAD="$(safe_git diff --name-only "${MERGE_BASE_HEAD}..refs/remotes/upstream/main" -- .github/workflows/)"
           if [[ -n "$WF_DIFF_MAIN" || -n "$WF_DIFF_HEAD" ]]; then
             printf 'Error: Upstream modified .github/workflows/. Manual security review is required before syncing:\n%s\n%s\n' \
               "$WF_DIFF_MAIN" "$WF_DIFF_HEAD" >&2
             exit 1
           fi
 
-          git -c core.hooksPath=/dev/null -c submodule.recurse=false \
-            -c "http.https://github.com/.extraheader=${AUTH_HEADER}" \
+          safe_git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" \
             push origin refs/remotes/upstream/main:refs/heads/main
 
           PR_NUMBER="$(gh api --method GET "repos/${GH_REPO}/pulls" -f state=open -f base=fork -f "head=${GITHUB_REPOSITORY_OWNER}:chore/sync-upstream" --jq "[.[] | select(.head.repo.full_name == \"${GH_REPO}\")][0].number // empty")"
-          UPSTREAM_SHA="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false rev-parse --short=7 refs/remotes/upstream/main)"
+          UPSTREAM_SHA="$(safe_git rev-parse --short=7 refs/remotes/upstream/main)"
 
           if [[ -n "$PR_NUMBER" && -n "$PREV_SYNC_SHA" ]]; then
-            if git -c core.hooksPath=/dev/null -c submodule.recurse=false log --format='%ae' refs/remotes/origin/chore/sync-upstream --not HEAD refs/remotes/upstream/main \
-              | grep -v '^41898282+github-actions\[bot\]@users\.noreply\.github\.com$' >/dev/null; then
+            if safe_git log --format='%ae%n%ce' refs/remotes/origin/chore/sync-upstream --not HEAD refs/remotes/upstream/main \
+              | grep -Fxv "$BOT_EMAIL" >/dev/null; then
               printf 'Open PR #%s has human commits on chore/sync-upstream; skipping automated overwrite.\n' "$PR_NUMBER"
               exit 0
             fi
           fi
 
-          CURRENT_HEAD_VERSION="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false show HEAD:FORK_UPSTREAM_VERSION | tr -d '[:space:]')"
+          CURRENT_HEAD_VERSION="$(safe_git show HEAD:FORK_UPSTREAM_VERSION | tr -d '[:space:]')"
           if [[ ! "$CURRENT_HEAD_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
             printf 'Error: Malformed HEAD:FORK_UPSTREAM_VERSION: %s\n' "$CURRENT_HEAD_VERSION" >&2
             exit 1
           fi
 
           if [[ -n "$PR_NUMBER" && -n "$PREV_SYNC_SHA" ]]; then
-            BASELINE_VERSION="$(git -c core.hooksPath=/dev/null -c submodule.recurse=false show refs/remotes/origin/chore/sync-upstream:FORK_UPSTREAM_VERSION | tr -d '[:space:]')"
+            BASELINE_VERSION="$(safe_git show refs/remotes/origin/chore/sync-upstream:FORK_UPSTREAM_VERSION | tr -d '[:space:]')"
           else
             BASELINE_VERSION="$CURRENT_HEAD_VERSION"
           fi
@@ -88,8 +110,34 @@ jobs:
           CANDIDATE_UPSTREAM_VERSION="$(
             curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 3 --connect-timeout 10 --max-time 20 --max-filesize 1048576 \
               https://clipbook.app/downloads/mac/appcast.xml \
-            | /usr/bin/python3 -I -c 'import re, sys, xml.etree.ElementTree as ET; raw = sys.stdin.buffer.read(1048577); (not raw or len(raw) > 1048576 or re.search(br"<!\s*(?:DOCTYPE|ENTITY)", raw, re.I)) and sys.exit(1); ns = "{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString"; root = ET.fromstring(raw); vals = [v for v in ([e.text.strip() for e in root.iter(ns) if e.text] + [e.attrib[ns].strip() for e in root.iter() if ns in e.attrib]) if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", v)]; vals or sys.exit(1); print(max(vals, key=lambda s: (tuple(int(p) for p in s.split(".")) + (0,))[:3]))' \
-              2>/dev/null || true
+            | /usr/bin/python3 -I -c '
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+
+          MAX_BYTES = 1048576
+          SPARKLE_SHORT_VERSION = "{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString"
+
+          raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+          if not raw or len(raw) > MAX_BYTES or re.search(br"<!\s*(?:DOCTYPE|ENTITY)", raw, re.I):
+              sys.exit(1)
+
+          root = ET.fromstring(raw)
+          raw_vals = [e.text.strip() for e in root.iter(SPARKLE_SHORT_VERSION) if e.text] + [
+              e.attrib[SPARKLE_SHORT_VERSION].strip()
+              for e in root.iter()
+              if SPARKLE_SHORT_VERSION in e.attrib
+          ]
+          vals = [v for v in raw_vals if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", v)]
+          if not vals:
+              sys.exit(1)
+
+          def version_key(s):
+              parts = tuple(int(p) for p in s.split("."))
+              return ((parts + (0,))[:3], len(parts))
+
+          print(max(vals, key=version_key))
+          ' 2>/dev/null || true
           )"
           if [[ -n "$CANDIDATE_UPSTREAM_VERSION" && ! "$CANDIDATE_UPSTREAM_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
             printf 'Error: Invalid CANDIDATE_UPSTREAM_VERSION parsed: %s\n' "$CANDIDATE_UPSTREAM_VERSION" >&2
@@ -97,15 +145,15 @@ jobs:
           fi
 
           COMMITS_TRACKED=0
-          if git -c core.hooksPath=/dev/null -c submodule.recurse=false merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+          if safe_git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
             COMMITS_TRACKED=1
           elif [[ -n "$PR_NUMBER" && -n "$PREV_SYNC_SHA" ]] && \
-            git -c core.hooksPath=/dev/null -c submodule.recurse=false log -1 --format='%B' refs/remotes/origin/chore/sync-upstream | grep -F "[upstream:${UPSTREAM_SHA}]" >/dev/null; then
+            safe_git log -1 --format='%B' refs/remotes/origin/chore/sync-upstream | grep -F "[upstream:${UPSTREAM_SHA}]" >/dev/null; then
             COMMITS_TRACKED=1
           fi
 
           VERSION_ADVANCED=0
-          if [[ -n "$CANDIDATE_UPSTREAM_VERSION" ]] && dpkg --compare-versions -- "$CANDIDATE_UPSTREAM_VERSION" gt "$BASELINE_VERSION"; then
+          if [[ -n "$CANDIDATE_UPSTREAM_VERSION" ]] && semver_gt "$CANDIDATE_UPSTREAM_VERSION" "$BASELINE_VERSION"; then
             VERSION_ADVANCED=1
           fi
 
@@ -114,20 +162,14 @@ jobs:
             exit 0
           fi
 
-          git -c core.hooksPath=/dev/null -c submodule.recurse=false switch -C chore/sync-upstream HEAD
+          safe_git switch -C chore/sync-upstream HEAD
 
-          if git -c core.hooksPath=/dev/null -c submodule.recurse=false \
-            -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            merge --no-edit -m "chore(upstream): merges upstream main [upstream:${UPSTREAM_SHA}]" refs/remotes/upstream/main; then
+          if safe_git_bot merge --no-edit -m "chore(upstream): merges upstream main [upstream:${UPSTREAM_SHA}]" refs/remotes/upstream/main; then
             VERSION_SUMMARY="Upstream marketing version baseline remains \`${CURRENT_HEAD_VERSION}\`."
-            if [[ -n "$CANDIDATE_UPSTREAM_VERSION" ]] && dpkg --compare-versions -- "$CANDIDATE_UPSTREAM_VERSION" gt "$CURRENT_HEAD_VERSION"; then
+            if [[ -n "$CANDIDATE_UPSTREAM_VERSION" ]] && semver_gt "$CANDIDATE_UPSTREAM_VERSION" "$CURRENT_HEAD_VERSION"; then
               printf '%s\n' "$CANDIDATE_UPSTREAM_VERSION" > FORK_UPSTREAM_VERSION
-              git -c core.hooksPath=/dev/null -c submodule.recurse=false add FORK_UPSTREAM_VERSION
-              git -c core.hooksPath=/dev/null -c submodule.recurse=false \
-                -c user.name="github-actions[bot]" \
-                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-                commit -m "chore(upstream): bumps baseline to ${CANDIDATE_UPSTREAM_VERSION} [upstream:${UPSTREAM_SHA}]"
+              safe_git add FORK_UPSTREAM_VERSION
+              safe_git_bot commit -m "chore(upstream): bumps baseline to ${CANDIDATE_UPSTREAM_VERSION} [upstream:${UPSTREAM_SHA}]"
               VERSION_SUMMARY="Bumps \`FORK_UPSTREAM_VERSION\` from \`${CURRENT_HEAD_VERSION}\` to \`${CANDIDATE_UPSTREAM_VERSION}\`."
             fi
             PR_TITLE="chore(upstream): syncs upstream ClipBook (${UPSTREAM_SHA})"
@@ -136,17 +178,15 @@ jobs:
           - ${VERSION_SUMMARY}
           - Mark this draft PR **Ready for review** in GitHub to trigger \`build-and-test\` before merging with a merge commit"
           else
-            git -c core.hooksPath=/dev/null -c submodule.recurse=false merge --abort
+            safe_git merge --abort
             COMMIT_FLAGS=(--allow-empty)
-            if [[ -n "$CANDIDATE_UPSTREAM_VERSION" ]] && dpkg --compare-versions -- "$CANDIDATE_UPSTREAM_VERSION" gt "$CURRENT_HEAD_VERSION"; then
+            if [[ -n "$CANDIDATE_UPSTREAM_VERSION" ]] && semver_gt "$CANDIDATE_UPSTREAM_VERSION" "$CURRENT_HEAD_VERSION"; then
               printf '%s\n' "$CANDIDATE_UPSTREAM_VERSION" > FORK_UPSTREAM_VERSION
-              git -c core.hooksPath=/dev/null -c submodule.recurse=false add FORK_UPSTREAM_VERSION
+              safe_git add FORK_UPSTREAM_VERSION
               COMMIT_FLAGS=()
             fi
-            git -c core.hooksPath=/dev/null -c submodule.recurse=false \
-              -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit ${COMMIT_FLAGS[@]+"${COMMIT_FLAGS[@]}"} -m "chore(upstream): flags sync conflict [upstream:${UPSTREAM_SHA}]"
+            safe_git_bot commit ${COMMIT_FLAGS[@]+"${COMMIT_FLAGS[@]}"} \
+              -m "chore(upstream): flags sync conflict [upstream:${UPSTREAM_SHA}]"
             PR_TITLE="chore(upstream): resolves upstream ClipBook sync (${UPSTREAM_SHA})"
             PR_BODY="## Summary
           - Upstream \`vladimir-ikryanov/ClipBook\` \`main\` (${UPSTREAM_SHA}) conflicted with \`fork\` during automated merge
@@ -160,8 +200,7 @@ jobs:
             fi
           fi
 
-          git -c core.hooksPath=/dev/null -c submodule.recurse=false \
-            -c "http.https://github.com/.extraheader=${AUTH_HEADER}" \
+          safe_git -c "http.https://github.com/.extraheader=${AUTH_HEADER}" \
             push --force-with-lease="refs/heads/chore/sync-upstream:${PREV_SYNC_SHA}" origin chore/sync-upstream:chore/sync-upstream
 
           if [[ -n "$PR_NUMBER" ]]; then
