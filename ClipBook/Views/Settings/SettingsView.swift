@@ -55,6 +55,9 @@ struct SettingsView: View {
         .onChange(of: model.preferences) { _ in
             coordinator.savePreferences()
         }
+        .onChange(of: model.forkPreferences) { _ in
+            coordinator.savePreferences()
+        }
         .onDisappear {
             coordinator.savePreferences()
         }

@@ -1,16 +1,27 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
+    branches:
+      - fork
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-test:
+  macos-test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -25,7 +36,77 @@ jobs:
       - name: Run Swift Testing suite
         env:
           RESULT_BUNDLE_PATH: ${{ runner.temp }}/ClipBookTests.xcresult
+          SNAPSHOT_EXPORT_DIR: ${{ runner.temp }}/exported-snapshots
         run: ./test.sh
+
+      - name: Smoke-test universal Release packaging and rcodesign signing
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          umask 077
+
+          SMOKE_TMP="$RUNNER_TEMP/ci-release-smoke"
+          rm -rf "$SMOKE_TMP"
+          mkdir -p "$SMOKE_TMP"
+          trap 'rm -rf "$SMOKE_TMP"' EXIT
+
+          TARBALL="$SMOKE_TMP/apple-codesign-0.29.0-macos-universal.tar.gz"
+          EXPECTED_SHA256="d98372d5524226ccf9dc0eda03d4e4f5826182dabb2fc3f2bd303ed9113a748d"
+          curl -fsSL --proto '=https' --tlsv1.2 --max-redirs 5 --connect-timeout 10 --max-time 60 \
+            -o "$TARBALL" \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz"
+          ACTUAL_SHA256="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
+          if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+            printf 'Error: rcodesign SHA-256 mismatch: expected %s, got %s\n' "$EXPECTED_SHA256" "$ACTUAL_SHA256" >&2
+            rm -rf "$SMOKE_TMP"
+            exit 1
+          fi
+          mkdir -p "$SMOKE_TMP/rcodesign-bin"
+          tar -xzf "$TARBALL" --strip-components=1 -C "$SMOKE_TMP/rcodesign-bin"
+          rm -f "$TARBALL"
+
+          {
+            printf '[req]\n'
+            printf 'distinguished_name = dn\n'
+            printf 'x509_extensions = v3_codesign\n'
+            printf 'prompt = no\n\n'
+            printf '[dn]\n'
+            printf 'CN = ClipBook CI Smoke Signing\n\n'
+            printf '[v3_codesign]\n'
+            printf 'basicConstraints = critical,CA:FALSE\n'
+            printf 'keyUsage = critical,digitalSignature\n'
+            printf 'extendedKeyUsage = critical,codeSigning\n'
+          } > "$SMOKE_TMP/openssl.cnf"
+
+          /usr/bin/openssl req -x509 -newkey rsa:3072 -nodes \
+            -keyout "$SMOKE_TMP/smoke.key" \
+            -out "$SMOKE_TMP/smoke.crt" \
+            -sha256 -days 1 \
+            -config "$SMOKE_TMP/openssl.cnf" \
+            -extensions v3_codesign 2>/dev/null
+
+          SMOKE_P12_PASS="$(/usr/bin/openssl rand -hex 32 | tr -d '\r\n[:space:]')"
+          printf '%s' "$SMOKE_P12_PASS" > "$SMOKE_TMP/smoke.pass"
+          /usr/bin/openssl pkcs12 -export \
+            -inkey "$SMOKE_TMP/smoke.key" \
+            -in "$SMOKE_TMP/smoke.crt" \
+            -name "ClipBook CI Smoke Signing" \
+            -certpbe PBE-SHA1-3DES \
+            -keypbe PBE-SHA1-3DES \
+            -macalg sha1 \
+            -passout stdin \
+            -out "$SMOKE_TMP/smoke.p12" <<< "$SMOKE_P12_PASS"
+          unset SMOKE_P12_PASS
+
+          ./scripts/release-fork.sh \
+            --run-number 1 \
+            --smoke-test \
+            --p12-file "$SMOKE_TMP/smoke.p12" \
+            --p12-password-file "$SMOKE_TMP/smoke.pass" \
+            --rcodesign-bin "$SMOKE_TMP/rcodesign-bin/rcodesign" \
+            --output-dir "$SMOKE_TMP/out"
+
+          rm -rf "$SMOKE_TMP"
 
       - name: Upload test results
         if: failure()
@@ -35,3 +116,36 @@ jobs:
           path: ${{ runner.temp }}/ClipBookTests.xcresult
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Upload exported snapshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ClipBookTests-snapshots
+          path: ${{ runner.temp }}/exported-snapshots
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-and-test:
+    if: always()
+    needs:
+      - macos-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require non-draft macOS CI success
+        env:
+          MACOS_RESULT: ${{ needs.macos-test.result }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [[ "$MACOS_RESULT" == "success" ]]; then
+            printf 'macOS CI succeeded.\n'
+            exit 0
+          fi
+          if [[ "$IS_DRAFT" == "true" ]]; then
+            printf 'Draft PR: macOS CI is deferred until marked Ready for review (macos-test=%s).\n' "$MACOS_RESULT" >&2
+            exit 1
+          fi
+          printf 'macOS CI did not succeed (macos-test=%s).\n' "$MACOS_RESULT" >&2
+          exit 1

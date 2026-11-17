@@ -11,8 +11,8 @@ final class PreferencesStore {
 
     let userDefaults: UserDefaults
     private let key = "ClipBookPreferencesV2"
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
+    let encoder = JSONEncoder()
+    let decoder = JSONDecoder()
 
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
@@ -34,6 +34,13 @@ final class PreferencesStore {
 
     func lastKnownKernelBootTime() -> Double? {
         userDefaults.object(forKey: Self.kernelBootTimeKey) as? Double
+    }
+
+    /// The boot time earlier builds stored, estimated as `Date() - systemUptime`.
+    /// Uptime pauses while the Mac sleeps, so the estimate is never earlier than
+    /// the real boot time.
+    func lastKnownUptimeRelativeBootTime() -> Double? {
+        userDefaults.object(forKey: Self.legacyUptimeBootTimeKey) as? Double
     }
 
     func recordBootTimes(kernelBootTime: TimeInterval, uptimeRelativeBootTime: TimeInterval) {

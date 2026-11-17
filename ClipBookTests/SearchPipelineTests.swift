@@ -448,12 +448,12 @@ struct SearchPipelineTests {
         let nonASCIICascadeResult = try #require(
             HistorySearchJob().run(corpus: largeCorpus, terms: nonASCIICascadeTerms, locale: locale)
         )
-        let expectedNonASCIICascade = largeTexts.map { haystack in
+        let expectedNonASCICI = largeTexts.map { haystack in
             nonASCIICascadeTerms.values.allSatisfy { term in
                 haystack.range(of: term, options: HistorySearchMatcher.compareOptions, locale: locale) != nil
             }
         }
-        #expect(nonASCIICascadeResult.matches == expectedNonASCIICascade)
+        #expect(nonASCIICascadeResult.matches == expectedNonASCICI)
         #expect(nonASCIICascadeResult.matchCount == 3)
     }
 
@@ -827,6 +827,42 @@ struct SearchPipelineTests {
         model.installSearchResult(currentLocaleResult)
         #expect((model.filteredItems.map(\.id) == [item.id]) == matchesUnderCurrentLocale)
     }
+
+    @Test
+    func mayContainSecretPrefilterCoversEverySecretPatternAndLongTextThreshold() {
+        #expect(!SensitiveContentDetector.mayContainSecret(in: ""))
+        #expect(!SensitiveContentDetector.mayContainSecret(in: "Ordinary prose with letters, commas, and spaces only."))
+        #expect(!SensitiveContentDetector.mayContainSecret(in: "日本語テキスト 한글 Café résumé"))
+
+        // Runtime-assembled fixtures covering digits, delimiters, and letter-only prefix families.
+        let samples = [
+            ["AI", "za", String(repeating: "B", count: 35)].joined(),
+            ["AK", "IA", String(repeating: "Q", count: 16)].joined(),
+            ["AS", "IA", String(repeating: "R", count: 16)].joined(),
+            ["S", "G.", String(repeating: "m", count: 22), ".", String(repeating: "n", count: 43)].joined(),
+            ["ey", "J", String(repeating: "a", count: 24), ".", "ey", "J", String(repeating: "b", count: 24)].joined(),
+            ["sk", "-", String(repeating: "a1B2c3D4", count: 4)].joined(),
+            ["ghp", "_", String(repeating: "x9Y8z7", count: 6)].joined(),
+            "password=alphabeta",
+            "https://user:secret@example.com",
+            "Bearer abcdefghijklmnop1"
+        ]
+        for sample in samples {
+            #expect(
+                SensitiveContentDetector.mayContainSecret(in: sample),
+                "Prefilter rejected sample: \(sample.prefix(6))"
+            )
+        }
+
+        // Long ordinary prose (>= 16,000 UTF-8 bytes) passes through so secrets beyond the prefix are still scanned.
+        let underLimit = String(repeating: "abcd ", count: 3_199)
+        #expect(underLimit.utf8.count < 16_000)
+        #expect(!SensitiveContentDetector.mayContainSecret(in: underLimit))
+
+        let atOrOverLimit = String(repeating: "abcd ", count: 3_201)
+        #expect(atOrOverLimit.utf8.count >= 16_000)
+        #expect(SensitiveContentDetector.mayContainSecret(in: atOrOverLimit))
+    }
 }
 
 extension SharedProcessStateTests {
@@ -860,6 +896,43 @@ extension SharedProcessStateTests {
             }
             #expect(completed)
             #expect(harness.model.filteredItems.count == 2)
+        }
+
+        @Test
+        @MainActor
+        func trailingWhitespacePreservesSelectionWhileTermChangesSelectFirstMatch() async throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+
+            let base = Date(timeIntervalSince1970: 1_700_000_000)
+            let secondMatch = ClipboardItem.fixture(text: "Needle older", copiedAt: base)
+            let firstMatch = ClipboardItem.fixture(text: "Needle newer", copiedAt: base.addingTimeInterval(10))
+            let unrelated = ClipboardItem.fixture(text: "Unrelated top", copiedAt: base.addingTimeInterval(20))
+            try harness.seedHistory([secondMatch, firstMatch, unrelated])
+
+            let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            _ = controller.view
+            let toolbar = HistoryToolbar()
+            toolbar.delegate = controller
+            controller.attachToolbar(toolbar)
+            controller.selectFirstHistoryItem()
+            #expect(harness.model.selectedItemID == unrelated.id)
+
+            controller.historyToolbar(toolbar, didChangeSearchQuery: "needle")
+            let settled = await TestSupport.waitUntil {
+                harness.model.searchQuery == "needle"
+                    && harness.model.searchResult?.terms == HistorySearchTerms(query: "needle")
+            }
+            #expect(settled)
+            #expect(harness.model.selectedItemID == firstMatch.id)
+
+            // Move selection to the second match, then type trailing whitespace (unchanged parsed terms).
+            controller.historyToolbar(toolbar, didRequestMoveSelection: .down)
+            #expect(harness.model.selectedItemID == secondMatch.id)
+
+            controller.historyToolbar(toolbar, didChangeSearchQuery: "needle   ")
+            #expect(harness.model.searchQuery == "needle   ")
+            #expect(harness.model.selectedItemID == secondMatch.id)
         }
 
         @Test
@@ -986,6 +1059,110 @@ extension SharedProcessStateTests {
             #expect(harness.model.searchQuery.isEmpty)
             #expect(harness.model.searchResult == nil)
             #expect(harness.model.filteredItems.count == 4)
+        }
+
+        @Test
+        @MainActor
+        func rowTextCacheSkipsRevealedSecretsAndEmptiesOnPermanentDeleteAndClearHistory() throws {
+            TestSupport.ensureAppKitInitialized()
+
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            harness.model.preferences.trashRetentionDays = 0
+
+            let uniqueSuffix = UUID().uuidString
+            let token = ["sk", "-", String(repeating: "z9Y8x7W6", count: 4)].joined()
+            let secretText = "Revealed token \(token) \(uniqueSuffix)"
+            let ordinaryText = "Ordinary cached row text \(uniqueSuffix)"
+            let secondText = "Second cached row text \(uniqueSuffix)"
+
+            let secretItem = ClipboardItem.fixture(kind: .text, text: secretText)
+            let ordinaryItem = ClipboardItem.fixture(kind: .text, text: ordinaryText)
+            let secondItem = ClipboardItem.fixture(kind: .text, text: secondText)
+            try harness.seedHistory([secretItem, ordinaryItem, secondItem])
+
+            let row = HistoryItemRowTextView(frame: NSRect(x: 0, y: 0, width: 480, height: 48))
+
+            // Revealed sensitive content is never placed into the shared row text cache.
+            row.configure(
+                item: secretItem,
+                quickPasteIndex: 1,
+                tableWidth: 480,
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: true
+            )
+            #expect(!row.hidesSensitiveContent)
+            #expect(HistoryRowTextCache.preview(for: secretText) == nil)
+
+            // Ordinary row text is cached, and permanent deletion (`isTrashEnabled == false`) empties the cache.
+            row.configure(
+                item: ordinaryItem,
+                quickPasteIndex: 1,
+                tableWidth: 480,
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false
+            )
+            #expect(HistoryRowTextCache.preview(for: ordinaryText) != nil)
+            harness.coordinator.delete([ordinaryItem])
+            #expect(HistoryRowTextCache.preview(for: ordinaryText) == nil)
+
+            // Clearing history also empties the row text cache.
+            row.configure(
+                item: secondItem,
+                quickPasteIndex: 1,
+                tableWidth: 480,
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false
+            )
+            #expect(HistoryRowTextCache.preview(for: secondText) != nil)
+            harness.coordinator.clearHistory()
+            #expect(HistoryRowTextCache.preview(for: secondText) == nil)
+        }
+
+        @Test
+        @MainActor
+        func imageRowTitleCacheRetriesUnreadableAssetUntilFileIsReadable() throws {
+            TestSupport.ensureAppKitInitialized()
+
+            func visibleLabels(in root: NSView) -> [String] {
+                var strings: [String] = []
+                if let label = root as? HistoryFixedTextColorLabel, !label.isHidden, label.superview != nil {
+                    strings.append(label.text)
+                }
+                for subview in root.subviews where !subview.isHidden {
+                    strings.append(contentsOf: visibleLabels(in: subview))
+                }
+                return strings
+            }
+
+            try TestSupport.withTemporaryDirectory { tempDir in
+                let assetURL = tempDir.appendingPathComponent("\(UUID().uuidString).png")
+                let item = ClipboardItem.fixture(
+                    kind: .image,
+                    title: nil,
+                    text: nil,
+                    assetPath: assetURL.path,
+                    byteSize: 2_048
+                )
+
+                let row = HistoryItemRowImageView(frame: NSRect(x: 0, y: 0, width: 480, height: 48))
+
+                // Before the file exists on disk, the row shows "Image" without caching that fallback title.
+                row.configure(item: item, quickPasteIndex: 1, tableWidth: 480)
+                #expect(visibleLabels(in: row).contains("Image"))
+
+                // Once the PNG exists at the same `assetPath`, reconfiguring reads and caches its pixel dimensions.
+                let pngData = try TestSupport.makePNGData(
+                    pixelWidth: 288,
+                    pixelHeight: 144,
+                    dpi: 72.0,
+                    color: .systemBlue
+                )
+                try pngData.write(to: assetURL)
+
+                row.configure(item: item, quickPasteIndex: 1, tableWidth: 480)
+                #expect(visibleLabels(in: row).contains("Image (288x144)"))
+            }
         }
 
         @Test
@@ -1206,7 +1383,8 @@ extension SharedProcessStateTests {
             let todayItems = (0..<3).map { index in
                 ClipboardItem.fixture(
                     text: "Today item \(index)",
-                    copiedAt: todayDate.addingTimeInterval(Double(50 - index))
+                    copiedAt: todayDate.addingTimeInterval(Double(50 - index)),
+                    isFavorite: false
                 )
             }
 

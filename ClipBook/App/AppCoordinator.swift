@@ -121,8 +121,17 @@ final class AppCoordinator: ObservableObject {
       .store(in: &cancellables)
   }
   
-  func start() {
+  func loadAndReconcilePreferences() {
     model.preferences = preferencesStore.load()
+    model.forkPreferences = preferencesStore.loadForkPreferences()
+  }
+
+  func applyUpdatePreferences() {
+    updateService.setAutomaticallyChecksForUpdates(model.preferences.checkForUpdatesAutomatically)
+  }
+
+  func start() {
+    loadAndReconcilePreferences()
     #if DEBUG
     applyDebugTrialDates()
     #endif
@@ -133,7 +142,7 @@ final class AppCoordinator: ObservableObject {
     model.historySortOption = HistorySortOption(preferenceValue: model.preferences.historySortOption)
     model.isHistorySortReversed = model.preferences.isHistorySortReversed
     applyLanguage()
-    updateService.setAutomaticallyChecksForUpdates(model.preferences.checkForUpdatesAutomatically)
+    applyUpdatePreferences()
     var shouldSavePreferences = false
     if model.preferences.deleteItemShortcut == "delete" {
       model.preferences.deleteItemShortcut = AppPreferences.defaultDeleteItemShortcut
@@ -537,6 +546,7 @@ final class AppCoordinator: ObservableObject {
     let changes = Self.preferenceChanges(from: lastAppliedPreferences, to: current)
 
     preferencesStore.save(current)
+    preferencesStore.saveForkPreferences(model.forkPreferences)
     if changes.appearance {
       applyAppearance()
     }
@@ -551,7 +561,7 @@ final class AppCoordinator: ObservableObject {
       LaunchAtLoginService.setEnabled(current.launchAtLogin)
     }
     if changes.automaticUpdateChecks {
-      updateService.setAutomaticallyChecksForUpdates(current.checkForUpdatesAutomatically)
+      applyUpdatePreferences()
     }
     if changes.globalShortcuts {
       configureShortcuts()
@@ -562,6 +572,7 @@ final class AppCoordinator: ObservableObject {
 
   func persistPreferences() {
     preferencesStore.save(model.preferences)
+    preferencesStore.saveForkPreferences(model.forkPreferences)
   }
 
   func refreshLicensingState() {
@@ -702,6 +713,7 @@ final class AppCoordinator: ObservableObject {
       }
       removeAssetFiles(for: deletedItems, remainingItems: model.items.filter { keepingItems && shouldKeepWhenClearingHistory($0) })
       model.remove(Set(deletedItems.map(\.id)))
+      HistoryRowTextCache.removeAll()
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -1199,6 +1211,7 @@ final class AppCoordinator: ObservableObject {
       removeAssetFiles(for: items, remainingItems: remainingItems)
     }
     model.remove(deletedItemIDs)
+    HistoryRowTextCache.removeAll()
   }
 
   // MARK: - Trash
@@ -1350,6 +1363,15 @@ final class AppCoordinator: ObservableObject {
       return
     }
     guard !items.isEmpty else {
+      // The history shows that the Trash is empty, but Settings does not,
+      // so the button would otherwise seem to do nothing.
+      if fromSettings {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L10n.string("Trash is empty")
+        alert.informativeText = L10n.string("There are no items to delete.")
+        present(alert) { _ in }
+      }
       return
     }
 
@@ -2938,7 +2960,12 @@ final class AppCoordinator: ObservableObject {
     kernelBootTime: TimeInterval = AppCoordinator.systemBootTime().timeIntervalSince1970,
     uptimeRelativeBootTime: TimeInterval = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime).timeIntervalSince1970
   ) {
+    // The first launch after updating from a build that stored only the uptime
+    // estimate falls back to it. The estimate is never earlier than the real
+    // boot time, so the one-sided check below still ignores time spent asleep,
+    // and a restart since that launch still counts as a reboot.
     let previousBootTime = preferencesStore.lastKnownKernelBootTime()
+      ?? preferencesStore.lastKnownUptimeRelativeBootTime()
     preferencesStore.recordBootTimes(
       kernelBootTime: kernelBootTime,
       uptimeRelativeBootTime: uptimeRelativeBootTime

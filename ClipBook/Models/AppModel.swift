@@ -176,6 +176,7 @@ final class AppModel: ObservableObject {
             }
         }
     }
+    @Published var forkPreferences = ForkPreferences()
     @Published var historySortOption: HistorySortOption = .lastCopyTime {
         didSet {
             invalidateSortedListedItems()
