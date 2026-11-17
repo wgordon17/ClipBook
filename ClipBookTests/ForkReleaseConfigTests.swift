@@ -660,8 +660,14 @@ import Testing
         end
 
         ci = workflows["ci.yml"]
+        ci_triggers = ci["on"] || ci[true]
         abort "ci.yml: permissions must be contents: read" unless ci["permissions"] == { "contents" => "read" }
-        abort "ci.yml: build-and-test must not reference an environment" if ci.dig("jobs", "build-and-test")&.key?("environment")
+        abort "ci.yml: must not duplicate fork push trigger covered by release.yml" if ci_triggers.key?("push")
+        abort "ci.yml: pull_request types must include ready_for_review" unless Array(ci_triggers.dig("pull_request", "types")).include?("ready_for_review")
+        abort "ci.yml: jobs must not reference an environment" if ci["jobs"].each_value.any? { |j| j.key?("environment") }
+        abort "ci.yml: macos-test must skip draft pull requests" unless ci.dig("jobs", "macos-test", "if") == "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
+        abort "ci.yml: build-and-test must run always() to prevent skipped-check bypass" unless ci.dig("jobs", "build-and-test", "if") == "always()"
+        abort "ci.yml: build-and-test must depend on macos-test" unless Array(ci.dig("jobs", "build-and-test", "needs")) == ["macos-test"]
         abort "ci.yml: must not reference secrets" if YAML.dump(ci).include?("secrets.")
 
         rel = workflows["release.yml"]

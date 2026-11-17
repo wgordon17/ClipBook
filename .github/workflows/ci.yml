@@ -1,9 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - fork
   pull_request:
     branches:
       - fork
@@ -13,12 +10,18 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-test:
+  macos-test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -122,3 +125,27 @@ jobs:
           path: ${{ runner.temp }}/exported-snapshots
           if-no-files-found: ignore
           retention-days: 7
+
+  build-and-test:
+    if: always()
+    needs:
+      - macos-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require non-draft macOS CI success
+        env:
+          MACOS_RESULT: ${{ needs.macos-test.result }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [[ "$MACOS_RESULT" == "success" ]]; then
+            printf 'macOS CI succeeded.\n'
+            exit 0
+          fi
+          if [[ "$IS_DRAFT" == "true" ]]; then
+            printf 'Draft PR: macOS CI is deferred until marked Ready for review (macos-test=%s).\n' "$MACOS_RESULT" >&2
+            exit 1
+          fi
+          printf 'macOS CI did not succeed (macos-test=%s).\n' "$MACOS_RESULT" >&2
+          exit 1
