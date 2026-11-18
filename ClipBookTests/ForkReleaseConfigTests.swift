@@ -692,6 +692,10 @@ import Testing
 
         rel_runs = rel_job["steps"].map { |s| s["run"] }.compact.join("\n")
         abort "release.yml: untrusted inputs must not be interpolated in run scripts" if rel_runs.include?("${{ inputs.")
+        if rel_runs.match?(/\bRCODESIGN_[A-Z0-9_]*=/) ||
+           rel_job["steps"].any? { |s| s.key?("env") && s["env"].keys.any? { |k| k.start_with?("RCODESIGN_") } }
+          abort "release.yml: must not assign or export RCODESIGN_* env vars (parsed by rcodesign figment config)"
+        end
         cleanup_step = rel_job["steps"].find { |s| s["name"] == "Remove ephemeral signing files" }
         abort "release.yml: missing always() signing cleanup step" unless cleanup_step && cleanup_step["if"] == "always()"
 
@@ -1176,6 +1180,71 @@ import Testing
             )
             #expect(prefixFail.status != 0)
             #expect(prefixFail.stderr.contains("Designated requirement missing identifier"))
+        }
+    }
+
+    @Test
+    func releaseForkScrubsInheritedRcodesignEnvironmentAcrossSignAndVerify() throws {
+        let scriptURL = Self.repoRootURL.appendingPathComponent("scripts/release-fork.sh")
+        let scriptText = try String(contentsOf: scriptURL, encoding: .utf8)
+
+        let assignmentRegex = try NSRegularExpression(pattern: #"\bRCODESIGN_[A-Z0-9_]*="#)
+        let fullRange = NSRange(scriptText.startIndex..<scriptText.endIndex, in: scriptText)
+        #expect(
+            assignmentRegex.firstMatch(in: scriptText, range: fullRange) == nil,
+            "release-fork.sh must not define RCODESIGN_* variables that rcodesign parses via figment"
+        )
+        #expect(scriptText.contains("run_rcodesign -C \"$SIGNER_TOML\" sign"))
+        #expect(scriptText.contains("run_rcodesign verify \"$STAGED_APP/$macho_rel\""))
+
+        let helperStart = try #require(scriptText.range(of: "run_rcodesign() {")?.lowerBound)
+        let helperEnd = try #require(
+            scriptText.range(of: "\n# Normalize paths,")?.lowerBound
+        )
+        let runRcodesignFn = String(scriptText[helperStart..<helperEnd])
+
+        try TestSupport.withTemporaryDirectory { tempDir in
+            let stubURL = tempDir.appendingPathComponent("rcodesign-stub")
+            let stubScript = """
+            #!/bin/bash
+            set -euo pipefail
+            if env | grep -q '^RCODESIGN_'; then
+              printf 'Error: leaked RCODESIGN_* environment into rcodesign: %s\\n' "$(env | grep '^RCODESIGN_')" >&2
+              exit 1
+            fi
+            printf 'ok:%s\\n' "$*"
+            """
+            try Data(stubScript.utf8).write(to: stubURL)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubURL.path)
+
+            let harnessURL = tempDir.appendingPathComponent("rcodesign-env-harness.sh")
+            let harnessScript = """
+            #!/bin/bash
+            set -euo pipefail
+            for rc_var in $(compgen -v RCODESIGN_ || true); do
+              unset "$rc_var"
+            done
+            unset rc_var
+            SIGNER_BIN="\(stubURL.path)"
+            \(runRcodesignFn)
+            run_rcodesign -C /stub/rcodesign.toml sign --timestamp-url none /stub/ClipBook.app
+            export RCODESIGN_LATE_INJECTION="poison"
+            run_rcodesign verify /stub/ClipBook.app/Contents/MacOS/ClipBook
+            """
+            try Data(harnessScript.utf8).write(to: harnessURL)
+
+            var env = ProcessInfo.processInfo.environment
+            env["RCODESIGN_BIN"] = stubURL.path
+            env["RCODESIGN_PROFILE"] = "poison"
+
+            let result = try Self.runProcess(
+                executablePath: "/bin/bash",
+                arguments: [harnessURL.path],
+                environment: env
+            )
+            #expect(result.status == 0, "\(result.stderr)")
+            #expect(result.stdout.contains("ok:-C /stub/rcodesign.toml sign"))
+            #expect(result.stdout.contains("ok:verify /stub/ClipBook.app/Contents/MacOS/ClipBook"))
         }
     }
 }

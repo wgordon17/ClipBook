@@ -98,6 +98,8 @@ jobs:
             -out "$SMOKE_TMP/smoke.p12" <<< "$SMOKE_P12_PASS"
           unset SMOKE_P12_PASS
 
+          RCODESIGN_BIN="$SMOKE_TMP/rcodesign-bin/rcodesign" \
+          RCODESIGN_POISON_PROBE="1" \
           ./scripts/release-fork.sh \
             --run-number 1 \
             --smoke-test \
