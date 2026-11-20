@@ -47,11 +47,8 @@ nonisolated protocol HistoryStore: Sendable {
     @discardableResult
     func saveAndReconcileItem(_ item: ClipboardItem, convertingExternalAssets: Bool) throws -> ClipboardItem
     func setSensitivity(_ sensitivity: ItemSensitivity?, for id: UUID) throws -> ClipboardItem?
+    /// Reads the item's stored body and/or formatting for the requested scope.
     func loadingContent(of item: ClipboardItem, scope: ClipboardContentScope) throws -> ClipboardItem
-    /// The item with its formatting read from the store. Items read from the
-    /// store come without it, and only pasting, dragging, previewing and
-    /// export need it. An item without formatting comes back as it is.
-    func loadingFormatting(of item: ClipboardItem) throws -> ClipboardItem
     func createTag(name: String, color: String) throws -> Tag
     func updateTag(id: Tag.ID, name: String, color: String) throws -> Tag
     func deleteTag(id: Tag.ID) throws
@@ -122,9 +119,5 @@ nonisolated extension HistoryStore {
     @discardableResult
     func saveAndReconcileItem(_ item: ClipboardItem) throws -> ClipboardItem {
         try saveAndReconcileItem(item, convertingExternalAssets: true)
-    }
-
-    func loadingFormatting(of item: ClipboardItem) throws -> ClipboardItem {
-        try loadingContent(of: item, scope: .full)
     }
 }

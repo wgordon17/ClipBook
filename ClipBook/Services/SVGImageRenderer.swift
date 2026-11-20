@@ -1,4 +1,6 @@
 import AppKit
+import Foundation
+import os
 
 /// Renders text that holds an SVG document, such as markup copied from a design
 /// tool or a code editor, so the history and the preview can show the picture
@@ -80,22 +82,51 @@ final class SVGImageRenderer {
     cache.countLimit = 200
     return cache
   }()
+  private nonisolated static let loaders = OSAllocatedUnfairLock(
+    initialState: [UUID: @Sendable (UUID) -> String?]()
+  )
   // One document at a time: drawing SVG is quick once AppKit is set up, and
   // the rows ask for only the few in view.
   private let renderQueue = DispatchQueue(label: "com.clipbook.svg-rendering", qos: .userInitiated)
   private var pendingCompletions: [String: [(Rendering?) -> Void]] = [:]
+
+  nonisolated static func registerTextLoader(
+    _ loader: @escaping @Sendable (UUID) -> String?,
+    ownerID: UUID
+  ) {
+    loaders.withLock { $0[ownerID] = loader }
+  }
+
+  nonisolated static func unregisterTextLoader(ownerID: UUID) {
+    loaders.withLock { _ = $0.removeValue(forKey: ownerID) }
+  }
+
+  private nonisolated static func loadRegisteredSVGText(for id: UUID) -> String? {
+    let activeLoaders = loaders.withLock { Array($0.values) }
+    for loader in activeLoaders {
+      if let text = loader(id) {
+        return text
+      }
+    }
+    return nil
+  }
 
   /// The picture the item's text describes, or nil when the text is not an SVG
   /// document or it cannot be drawn. A picture not drawn yet is drawn right
   /// away, so this is for the preview, which the user opens; the history rows
   /// use `rendering(for:completion:)`.
   func rendering(for item: ClipboardItem) -> Rendering? {
-    guard let (key, text) = Self.cacheKey(for: item) else {
+    guard let key = Self.cacheKey(for: item) else {
       return nil
     }
 
     if let entry = cache.object(forKey: key as NSString) {
       return entry.rendering
+    }
+
+    let inlineText = item.isContentLoaded ? item.text : nil
+    guard let text = inlineText ?? Self.loadRegisteredSVGText(for: item.id) else {
+      return nil
     }
 
     let rendering = Self.render(text)
@@ -108,7 +139,7 @@ final class SVGImageRenderer {
   /// background, returns nil, and calls `completion` on the main thread with
   /// the result, nil when the markup cannot be drawn.
   func rendering(for item: ClipboardItem, completion: @escaping (Rendering?) -> Void) -> Rendering? {
-    guard let (key, text) = Self.cacheKey(for: item) else {
+    guard let key = Self.cacheKey(for: item) else {
       return nil
     }
 
@@ -121,12 +152,18 @@ final class SVGImageRenderer {
       return nil
     }
 
+    let itemID = item.id
+    let inlineText = item.isContentLoaded ? item.text : nil
     pendingCompletions[key] = [completion]
     renderQueue.async {
-      let rendering = Self.render(text)
+      let resolvedText = inlineText ?? Self.loadRegisteredSVGText(for: itemID)
+      let rendering = resolvedText.flatMap(Self.render)
+      let didObtainText = resolvedText != nil
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
-          self.cache.setObject(CacheEntry(rendering), forKey: key as NSString)
+          if didObtainText {
+            self.cache.setObject(CacheEntry(rendering), forKey: key as NSString)
+          }
           let completions = self.pendingCompletions.removeValue(forKey: key) ?? []
           completions.forEach { $0(rendering) }
         }
@@ -135,16 +172,15 @@ final class SVGImageRenderer {
     return nil
   }
 
-  // Text that is an SVG document, keyed by the item and its text, so an edited
-  // item is drawn again.
-  private static func cacheKey(for item: ClipboardItem) -> (String, String)? {
-    guard item.kind == .text || item.kind == .richText,
-          let text = item.text,
-          isSVGMarkup(text) else {
+  // Keyed by item ID and monotonic searchRevision so unloaded rows and hydrated
+  // previews share the same cache entry and edited items are drawn again.
+  private static func cacheKey(for item: ClipboardItem) -> String? {
+    guard (item.kind == .text || item.kind == .richText),
+          item.isSVGText else {
       return nil
     }
 
-    return ("\(item.id.uuidString)-\(text.hashValue)", text)
+    return "\(item.id.uuidString)-\(item.searchRevision)"
   }
 
   /// Whether the text is a whole SVG document: an `svg` root element, after at
@@ -168,7 +204,8 @@ final class SVGImageRenderer {
   }
 
   private nonisolated static func render(_ text: String) -> Rendering? {
-    guard let image = NSImage(data: Data(text.utf8)),
+    guard isSVGMarkup(text),
+          let image = NSImage(data: Data(text.utf8)),
           image.size.width > 0,
           image.size.height > 0,
           let (thumbnail, tone) = makeThumbnail(of: image) else {

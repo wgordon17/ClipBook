@@ -1,6 +1,7 @@
 @testable import ClipBook
 import AppKit
 import Foundation
+import os
 import SwiftUI
 import Testing
 
@@ -591,13 +592,18 @@ enum ViewsAndWindowsTests {
                 let title = try #require(fullMenuItems.first { $0.action == action }).title
                 return try #require(previewMenuItems.first { $0.title == title })
             }
+
+            func cleanup() {
+                TestSupport.drainDelayedPerforms([viewController] + viewController.children)
+                harness.cleanup()
+            }
         }
 
         @Test
         @MainActor
         func previewActionsMenuDropsPasteAndCopyActionsAndKeepsTheRest() throws {
             let fixture = try PreviewMenuFixture()
-            defer { fixture.harness.cleanup() }
+            defer { fixture.cleanup() }
 
             let droppedActions = [
                 #selector(HistoryContentViewController.pasteMenuItem(_:)),
@@ -619,7 +625,7 @@ enum ViewsAndWindowsTests {
         @MainActor
         func previewActionsThatOpenASheetDismissThePreviewAndInPlaceActionsDoNot() throws {
             let fixture = try PreviewMenuFixture()
-            defer { fixture.harness.cleanup() }
+            defer { fixture.cleanup() }
 
             let sheetAction = try fixture.previewItem(forFullMenuAction: #selector(HistoryContentViewController.deleteMenuItem(_:)))
             let inPlaceAction = try fixture.previewItem(forFullMenuAction: #selector(HistoryContentViewController.sensitiveMenuItem(_:)))
@@ -643,8 +649,9 @@ enum ViewsAndWindowsTests {
                 maximumContentSize: NSSize(width: 800, height: 600),
                 detectsSensitiveContent: true,
                 revealsSensitiveContent: false,
-                loadFormatting: { $0 }
+                loadContent: { item, _ in item }
             )
+            defer { TestSupport.drainDelayedPerforms([controller]) }
             _ = controller.view
 
             func textViews(in view: NSView) -> [NSTextView] {
@@ -667,8 +674,9 @@ enum ViewsAndWindowsTests {
                 maximumContentSize: NSSize(width: 800, height: 600),
                 detectsSensitiveContent: true,
                 revealsSensitiveContent: false,
-                loadFormatting: { $0 }
+                loadContent: { item, _ in item }
             )
+            defer { TestSupport.drainDelayedPerforms([controller]) }
             controller.onSave = { saved.append(($0, $1)) }
             _ = controller.view
 
@@ -877,15 +885,7 @@ enum ViewsAndWindowsTests {
 
         @MainActor
         private static func drainDelayedPerforms(_ targets: [AnyObject]) {
-            withExtendedLifetime(targets) {
-                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
-                for target in targets {
-                    NSObject.cancelPreviousPerformRequests(withTarget: target)
-                    if let controller = target as? NSViewController, controller.isViewLoaded {
-                        NSObject.cancelPreviousPerformRequests(withTarget: controller.view)
-                    }
-                }
-            }
+            TestSupport.drainDelayedPerforms(targets)
         }
 
         @Test
@@ -1165,7 +1165,7 @@ enum ViewsAndWindowsTests {
                     maximumContentSize: NSSize(width: 800, height: 600),
                     detectsSensitiveContent: true,
                     revealsSensitiveContent: false,
-                    loadFormatting: { $0 }
+                    loadContent: { item, _ in item }
                 )
                 defer { Self.drainDelayedPerforms([controller]) }
                 return withExtendedLifetime(controller) {
@@ -1244,7 +1244,7 @@ enum ViewsAndWindowsTests {
                     maximumContentSize: NSSize(width: 800, height: 600),
                     detectsSensitiveContent: true,
                     revealsSensitiveContent: false,
-                    loadFormatting: { $0 }
+                    loadContent: { item, _ in item }
                 )
                 defer { Self.drainDelayedPerforms([imageDialog]) }
                 _ = imageDialog.view
@@ -1281,7 +1281,7 @@ enum ViewsAndWindowsTests {
                     maximumContentSize: NSSize(width: 800, height: 600),
                     detectsSensitiveContent: true,
                     revealsSensitiveContent: false,
-                    loadFormatting: { $0 }
+                    loadContent: { item, _ in item }
                 )
                 let closeAccessory = fileDialog.makeCloseAccessory()
                 defer { Self.drainDelayedPerforms([fileDialog, closeAccessory]) }
@@ -1364,10 +1364,7 @@ extension SharedProcessStateTests {
             historyWindow.window.alphaValue = 0
             historyWindow.show()
             defer {
-                if let sheet = historyWindow.window.attachedSheet {
-                    historyWindow.window.endSheet(sheet)
-                }
-                historyWindow.window.orderOut(nil)
+                TestSupport.tearDownHistoryWindow(historyWindow)
             }
 
             // ⌘K opens the command palette sheet.
@@ -1397,6 +1394,9 @@ extension SharedProcessStateTests {
             }
             #expect(editorOpened)
             if let editSheet = historyWindow.window.attachedSheet {
+                if let vc = editSheet.contentViewController {
+                    TestSupport.drainDelayedPerforms([vc])
+                }
                 historyWindow.window.endSheet(editSheet)
             }
 
@@ -1425,18 +1425,20 @@ extension SharedProcessStateTests {
             let item = ClipboardItem.fixture(kind: .text, text: "Deletable clip")
             try harness.seedHistory([item])
 
+            var transientTargets: [AnyObject] = []
             let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
             historyWindow.window.alphaValue = 0
             historyWindow.show()
             defer {
-                if let sheet = historyWindow.window.attachedSheet {
-                    historyWindow.window.endSheet(sheet)
-                }
-                historyWindow.window.orderOut(nil)
+                TestSupport.tearDownHistoryWindow(historyWindow, keepingAlive: transientTargets)
             }
 
             historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 40, modifiers: [.command]))
             let paletteSheet = try #require(historyWindow.window.attachedSheet as? CommandPaletteSheetWindow)
+            transientTargets.append(paletteSheet)
+            if let vc = paletteSheet.contentViewController {
+                transientTargets.append(vc)
+            }
             let contentView = try #require(paletteSheet.contentView)
             let searchField = try #require(findEditableTextField(in: contentView))
             let commandDelete = try TestSupport.keyDownEvent(keyCode: 51, modifiers: [.command])
@@ -1463,7 +1465,7 @@ extension SharedProcessStateTests {
 
             let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
             historyWindow.window.alphaValue = 0
-            defer { historyWindow.window.orderOut(nil) }
+            defer { TestSupport.tearDownHistoryWindow(historyWindow) }
 
             historyWindow.show()
             historyWindow.saveWindowFrame()
@@ -1495,6 +1497,7 @@ extension SharedProcessStateTests {
             harness.preferencesStore.save(initialPrefs)
 
             let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.tearDownHistoryWindow(historyWindow) }
             historyWindow.saveWindowFrame()
             #expect(harness.model.preferences.historyWindowX == 222)
             #expect(harness.model.preferences.historyWindowY == 333)
@@ -1559,14 +1562,12 @@ extension SharedProcessStateTests {
 
             try harness.seedHistory([plainImg, encImg, singleFile, missingFile, multiFile])
 
+            var transientTargets: [AnyObject] = []
             let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
             historyWindow.window.alphaValue = 0
             historyWindow.show()
             defer {
-                if let sheet = historyWindow.window.attachedSheet {
-                    historyWindow.window.endSheet(sheet)
-                }
-                historyWindow.window.orderOut(nil)
+                TestSupport.tearDownHistoryWindow(historyWindow, keepingAlive: transientTargets)
             }
 
             func findTableView(in root: NSView) -> NSTableView? {
@@ -1599,7 +1600,17 @@ extension SharedProcessStateTests {
 
                 historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 40, modifiers: [.command]))
                 let sheet = try #require(historyWindow.window.attachedSheet as? CommandPaletteSheetWindow)
-                defer { historyWindow.window.endSheet(sheet) }
+                let sheetVC = sheet.contentViewController
+                transientTargets.append(sheet)
+                if let sheetVC {
+                    transientTargets.append(sheetVC)
+                }
+                defer {
+                    let sheetTargets: [AnyObject] = [sheet] + (sheetVC.map { [$0] } ?? [])
+                    TestSupport.drainDelayedPerforms(sheetTargets)
+                    historyWindow.window.endSheet(sheet)
+                    TestSupport.drainDelayedPerforms(sheetTargets)
+                }
 
                 let contentView = try #require(sheet.contentView)
                 contentView.layoutSubtreeIfNeeded()
@@ -1665,7 +1676,12 @@ extension SharedProcessStateTests {
             window.alphaValue = 0
             window.contentView = hostingView
             window.orderFront(nil)
-            defer { window.orderOut(nil) }
+            defer {
+                TestSupport.drainDelayedPerforms([window, hostingView])
+                window.orderOut(nil)
+                window.contentView = nil
+                TestSupport.drainDelayedPerforms([window, hostingView])
+            }
             hostingView.layoutSubtreeIfNeeded()
 
             let original = harness.model.preferences.warnOnClearHistory
@@ -1676,6 +1692,458 @@ extension SharedProcessStateTests {
                 harness.preferencesStore.load().warnOnClearHistory != original
             }
             #expect(saved, "The view did not save the changed preference")
+        }
+    }
+
+    @Suite
+    struct LazyPreviewDragAndSVGHydrationTests {
+        private static let sentinel = "TAIL_SENTINEL_AT_40KB"
+
+        private static func make40KBBody(prefix: String = "") -> String {
+            let padCount = max(0, 40_020 - prefix.count - sentinel.count)
+            return prefix + String(repeating: "a", count: padCount) + sentinel
+        }
+
+        @MainActor
+        private static func allDescendants(in root: NSView) -> [NSView] {
+            var visited = Set<ObjectIdentifier>()
+            var ordered: [NSView] = []
+            func walk(_ view: NSView) {
+                guard visited.insert(ObjectIdentifier(view)).inserted else { return }
+                ordered.append(view)
+                for subview in view.subviews {
+                    walk(subview)
+                }
+            }
+            walk(root)
+            return ordered
+        }
+
+        @MainActor
+        private static func allTextStrings(in root: NSView) -> String {
+            var parts: [String] = []
+            for view in allDescendants(in: root) {
+                if let tv = view as? NSTextView {
+                    parts.append(tv.string)
+                } else if let tf = view as? NSTextField, !tf.isHidden {
+                    parts.append(tf.stringValue)
+                }
+            }
+            return parts.joined(separator: "\n")
+        }
+
+        @MainActor
+        private static func findEditableTextView(in root: NSView) -> NSTextView? {
+            allDescendants(in: root).compactMap { $0 as? NSTextView }.first { $0.isEditable }
+        }
+
+        @Test
+        @MainActor
+        func rowDragPreviewDialogDetailsOnlyPaneAndLivePaneEditingHydrateMinimalScopes() async throws {
+            TestSupport.ensureAppKitInitialized()
+
+            let (harness, spyStore, _) = try TestSupport.makeSpiedTestCoordinator()
+            defer { harness.cleanup() }
+
+            let baseTime = Date(timeIntervalSince1970: 1_710_200_000)
+            let text40KB = Self.make40KBBody()
+            #expect(text40KB.count == 40_020)
+
+            let richPlain40KB = Self.make40KBBody(prefix: "RichPlain ")
+            let richRTF40KB = try TestSupport.makeRTFData(text: "RTFOnly_" + richPlain40KB)
+            let richHTML40KB = "<section>HTMLOnly_\(richPlain40KB)</section>"
+
+            let pngBytes = try TestSupport.makePNGData(pixelWidth: 64, pixelHeight: 48, color: .systemBlue)
+            let imageID = UUID()
+            let imageURL = try spyStore.writeManagedAsset(pngData: pngBytes, role: .image, clipID: imageID, encrypted: false)
+            let sampleFileURL = harness.supportDirectory.appendingPathComponent("preview-doc.txt")
+            try Data("preview-file".utf8).write(to: sampleFileURL)
+
+            let seededText = ClipboardItem.fixture(kind: .text, text: text40KB, copiedAt: baseTime.addingTimeInterval(40))
+            let seededRich = ClipboardItem.fixture(
+                kind: .richText,
+                text: richPlain40KB,
+                rtfData: richRTF40KB,
+                html: richHTML40KB,
+                copiedAt: baseTime.addingTimeInterval(30)
+            )
+            var seededImage = ClipboardItem.fixture(
+                id: imageID,
+                kind: .image,
+                text: "Image OCR",
+                assetPath: imageURL.path,
+                copiedAt: baseTime.addingTimeInterval(20)
+            )
+            seededImage.imageWidth = 64
+            seededImage.imageHeight = 48
+            let seededFile = ClipboardItem.fixture(
+                kind: .file,
+                text: nil,
+                filePaths: [sampleFileURL.path],
+                copiedAt: baseTime.addingTimeInterval(10)
+            )
+
+            try harness.seedHistory([seededText, seededRich, seededImage, seededFile])
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded && $0.searchText.isEmpty })
+
+            let textHeader = try #require(harness.currentItem(seededText.id))
+            let richHeader = try #require(harness.currentItem(seededRich.id))
+            let imageHeader = try #require(harness.currentItem(seededImage.id))
+            let fileHeader = try #require(harness.currentItem(seededFile.id))
+
+            // 1. History row drag minimal scope verification (.body for plain-text drag, .full for rich drag, 0 for image/file).
+            let historyView = History(frame: NSRect(x: 0, y: 0, width: 520, height: 360))
+            historyView.preferDraggingAsPlainText = true
+            historyView.loadContent = { [weak coordinator = harness.coordinator] item, scope in
+                coordinator?.loadingContent(of: item, scope: scope) ?? item
+            }
+            historyView.reload(
+                items: [textHeader, richHeader, imageHeader, fileHeader],
+                availableTags: [],
+                selectedItemID: textHeader.id,
+                selectedItemIDs: [textHeader.id],
+                searchQuery: "",
+                showCommandNumberShortcut: true,
+                showPreviewForLinks: false,
+                detectSensitiveContent: true,
+                showDividers: false,
+                preferPastingAsPlainText: true,
+                groupPinnedFavorites: false,
+                sectionDate: nil,
+                showsTiles: false,
+                showsCompactRows: false,
+                onSelectFirstItem: { _ in }
+            )
+
+            // Row 1 is richHeader: plain-text drag (no Option key) requests .body, skipping html/rtf!
+            spyStore.resetRecordedCalls()
+            let plainRichDragPayload = try #require(historyView.tableView.dragPayloadForRow?(1, []))
+            #expect(spyStore.loadingContentCalls == [.init(id: richHeader.id, scope: .body)])
+            TestSupport.withUniquePasteboard { pb in
+                pb.clearContents()
+                #expect(pb.writeObjects(plainRichDragPayload.entries.map(\.writer)))
+                #expect(pb.string(forType: .string) == richPlain40KB)
+                #expect(pb.data(forType: .rtf) == nil)
+                #expect(pb.string(forType: .html) == nil)
+            }
+
+            // Option-drag on richHeader requests .full and writes RTF + HTML!
+            spyStore.resetRecordedCalls()
+            let fullRichDragPayload = try #require(historyView.tableView.dragPayloadForRow?(1, [.option]))
+            #expect(spyStore.loadingContentCalls == [.init(id: richHeader.id, scope: .full)])
+            TestSupport.withUniquePasteboard { pb in
+                pb.clearContents()
+                #expect(pb.writeObjects(fullRichDragPayload.entries.map(\.writer)))
+                #expect(pb.string(forType: .string) == richPlain40KB)
+                #expect(pb.data(forType: .rtf) == richRTF40KB)
+                #expect(pb.string(forType: .html) == richHTML40KB)
+            }
+
+            // Image (row 2) and File (row 3) drags perform 0 loadContent calls!
+            spyStore.resetRecordedCalls()
+            _ = try #require(historyView.tableView.dragPayloadForRow?(2, []))
+            _ = try #require(historyView.tableView.dragPayloadForRow?(3, []))
+            #expect(spyStore.loadingContentCalls.isEmpty)
+
+            // 2. ItemPreviewDialogController requests .preview on .richText (leaving html == nil) and 0 calls on .image/.file!
+            var observedRichHydrated: ClipboardItem?
+            spyStore.resetRecordedCalls()
+            let richSheetPreview = ItemPreviewDialogController(
+                item: richHeader,
+                maximumContentSize: NSSize(width: 800, height: 600),
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false,
+                presentation: .sheet,
+                showsPreview: true,
+                loadContent: { [weak coordinator = harness.coordinator] item, scope in
+                    let loaded = coordinator?.loadingContent(of: item, scope: scope) ?? item
+                    observedRichHydrated = loaded
+                    return loaded
+                }
+            )
+            defer { TestSupport.drainDelayedPerforms([richSheetPreview]) }
+            _ = richSheetPreview.view
+            richSheetPreview.view.layoutSubtreeIfNeeded()
+            #expect(spyStore.loadingContentCalls == [.init(id: richHeader.id, scope: .preview)])
+            let capturedRichHydrated = try #require(observedRichHydrated)
+            #expect(capturedRichHydrated.isContentLoaded)
+            #expect(capturedRichHydrated.isPreviewFormattingLoaded)
+            #expect(!capturedRichHydrated.isFormattingLoaded)
+            #expect(capturedRichHydrated.rtfData == richRTF40KB)
+            #expect(capturedRichHydrated.html == nil)
+            let renderedRichString = Self.allTextStrings(in: richSheetPreview.view)
+            #expect(renderedRichString.contains("RTFOnly_"))
+            #expect(renderedRichString.contains(Self.sentinel))
+
+            spyStore.resetRecordedCalls()
+            let imagePreview = ItemPreviewDialogController(
+                item: imageHeader,
+                maximumContentSize: NSSize(width: 800, height: 600),
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false,
+                loadContent: { [weak coordinator = harness.coordinator] item, scope in
+                    coordinator?.loadingContent(of: item, scope: scope) ?? item
+                }
+            )
+            defer { TestSupport.drainDelayedPerforms([imagePreview]) }
+            let filePreview = ItemPreviewDialogController(
+                item: fileHeader,
+                maximumContentSize: NSSize(width: 800, height: 600),
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false,
+                loadContent: { [weak coordinator = harness.coordinator] item, scope in
+                    coordinator?.loadingContent(of: item, scope: scope) ?? item
+                }
+            )
+            defer { TestSupport.drainDelayedPerforms([filePreview]) }
+            _ = imagePreview.view
+            _ = filePreview.view
+            #expect(spyStore.loadingContentCalls.isEmpty)
+
+            // 3. Details-only .pane (presentation == .pane && showsPreview == false && showsDetails == true):
+            //    0 loadContent calls across init, loadView, and update, with exact 40,020 characterCount!
+            spyStore.resetRecordedCalls()
+            let detailsOnlyPane = ItemPreviewDialogController(
+                item: textHeader,
+                maximumContentSize: NSSize(width: 600, height: 480),
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false,
+                presentation: .pane,
+                showsPreview: false,
+                loadContent: { [weak coordinator = harness.coordinator] item, scope in
+                    coordinator?.loadingContent(of: item, scope: scope) ?? item
+                }
+            )
+            defer { TestSupport.drainDelayedPerforms([detailsOnlyPane]) }
+            _ = detailsOnlyPane.view
+            detailsOnlyPane.showsDetails = true
+            detailsOnlyPane.view.layoutSubtreeIfNeeded()
+            #expect(spyStore.loadingContentCalls.isEmpty, "init + loadView with showsPreview == false must perform 0 loadContent calls")
+
+            let expectedCharCountText = NumberFormatter.localizedString(from: NSNumber(value: 40_020), number: .decimal)
+            #expect(Self.allTextStrings(in: detailsOnlyPane.view).contains(expectedCharCountText))
+
+            detailsOnlyPane.update(item: richHeader, revealsSensitiveContent: false)
+            detailsOnlyPane.update(item: textHeader, revealsSensitiveContent: false)
+            #expect(spyStore.loadingContentCalls.isEmpty, "Navigating items while showsPreview == false must perform 0 loadContent calls")
+
+            // Toggling showsPreview false -> true hydrates once on demand (.body for .text), and CachedBody serves metadata updates!
+            detailsOnlyPane.showsPreview = true
+            detailsOnlyPane.view.layoutSubtreeIfNeeded()
+            #expect(spyStore.loadingContentCalls == [.init(id: textHeader.id, scope: .body)])
+            #expect(Self.allTextStrings(in: detailsOnlyPane.view).contains(Self.sentinel))
+
+            spyStore.resetRecordedCalls()
+            var favoritedTextHeader = textHeader
+            favoritedTextHeader.isFavorite = true
+            detailsOnlyPane.update(item: favoritedTextHeader, revealsSensitiveContent: false)
+            #expect(spyStore.loadingContentCalls.isEmpty, "Metadata-only update must reuse CachedBody with 0 extra DB reads")
+
+            // 4. Editing >8 KB text while the live HistoryContentViewController preview pane is open updates preview & characterCount immediately!
+            var panePrefs = harness.model.preferences
+            panePrefs.showPreviewPane = true
+            panePrefs.showPreviewPaneDetails = true
+            harness.model.preferences = panePrefs
+            harness.model.selectedItemID = textHeader.id
+            harness.model.selectedItemIDs = [textHeader.id]
+            harness.model.selectedItemIDsInSelectionOrder = [textHeader.id]
+
+            var livePaneRef: ItemPreviewDialogController?
+            let hostWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 820, height: 540),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            hostWindow.isReleasedWhenClosed = false
+            hostWindow.alphaValue = 0
+            let contentVC = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            hostWindow.contentViewController = contentVC
+            defer {
+                TestSupport.drainDelayedPerforms([hostWindow, contentVC] + contentVC.children + [livePaneRef].compactMap { $0 })
+                hostWindow.orderOut(nil)
+                hostWindow.contentViewController = nil
+                TestSupport.drainDelayedPerforms([contentVC] + [livePaneRef].compactMap { $0 })
+            }
+            contentVC.view.layoutSubtreeIfNeeded()
+
+            let mountedPaneLoaded = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                contentVC.children.contains { $0 is ItemPreviewDialogController }
+            }
+            #expect(mountedPaneLoaded)
+            let livePane = try #require(contentVC.children.compactMap { $0 as? ItemPreviewDialogController }.first)
+            livePaneRef = livePane
+            livePane.view.layoutSubtreeIfNeeded()
+            #expect(Self.allTextStrings(in: livePane.view).contains(Self.sentinel))
+
+            livePane.beginEditing()
+            #expect(livePane.isEditing)
+            let editor = try #require(Self.findEditableTextView(in: livePane.view))
+            #expect(editor.string == text40KB)
+
+            let edited42KB = String(repeating: "e", count: 42_000) + "LIVE_PANE_EDITED_SENTINEL"
+            editor.string = edited42KB
+            livePane.textDidChange(Notification(name: NSText.didChangeNotification, object: editor))
+            livePane.saveEditing()
+            #expect(!livePane.isEditing)
+
+            let updatedModelHeader = try #require(harness.currentItem(textHeader.id))
+            #expect(!updatedModelHeader.isContentLoaded)
+            #expect(updatedModelHeader.characterCount == edited42KB.count)
+            let livePaneRendered = Self.allTextStrings(in: livePane.view)
+            #expect(livePaneRendered.contains("LIVE_PANE_EDITED_SENTINEL"))
+            let expectedEditedCountText = NumberFormatter.localizedString(from: NSNumber(value: edited42KB.count), number: .decimal)
+            #expect(livePaneRendered.contains(expectedEditedCountText))
+        }
+
+        @Test
+        @MainActor
+        func concealedImageTileAndRowCmdUToggleAnd12KBUnloadedSVGSharedCacheHit() async throws {
+            TestSupport.ensureAppKitInitialized()
+
+            // 1. Unregistered SVG ID does NOT poison cache with nil; GRDBHistoryStore [weak self] loader shares cache between unloaded row & hydrated preview and unregisters on close().
+            let transientUnregisteredSVGText = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><!-- "
+                + String(repeating: "u", count: 12_000)
+                + " --><circle cx=\"20\" cy=\"20\" r=\"18\" fill=\"#22AA66\"/></svg>"
+            let unregisteredHeader = ClipboardItem.fixture(
+                kind: .text,
+                text: transientUnregisteredSVGText
+            ).unloadingContent()
+            #expect(!unregisteredHeader.isContentLoaded)
+            #expect(unregisteredHeader.isSVGText)
+
+            // With no store holding unregisteredHeader.id, sync & async rendering return nil without caching nil.
+            #expect(SVGImageRenderer.shared.rendering(for: unregisteredHeader) == nil)
+            var asyncMissCompleted = false
+            var asyncMissResult: SVGImageRenderer.Rendering?
+            _ = SVGImageRenderer.shared.rendering(for: unregisteredHeader) { result in
+                asyncMissResult = result
+                asyncMissCompleted = true
+            }
+            #expect(await TestSupport.waitUntil { asyncMissCompleted })
+            #expect(asyncMissResult == nil)
+
+            let manualLoaderOwner = UUID()
+            let loaderCallCount = OSAllocatedUnfairLock(initialState: 0)
+            SVGImageRenderer.registerTextLoader(
+                { id in
+                    guard id == unregisteredHeader.id else { return nil }
+                    loaderCallCount.withLock { $0 += 1 }
+                    return transientUnregisteredSVGText
+                },
+                ownerID: manualLoaderOwner
+            )
+            defer { SVGImageRenderer.unregisterTextLoader(ownerID: manualLoaderOwner) }
+
+            let recoveredRendering = SVGImageRenderer.shared.rendering(for: unregisteredHeader)
+            #expect(recoveredRendering != nil, "Previous unavailable-text nil must not have poisoned SVGImageRenderer cache")
+            #expect(loaderCallCount.withLock { $0 } == 1)
+
+            // Verify GRDBHistoryStore [weak self] registration does not leak store instances and shares 1 cache entry across unloaded row & hydrated preview.
+            weak var weakStoreRef: GRDBHistoryStore?
+            try await TestSupport.withTemporaryDirectory { svgSupportDir in
+                let svg12KB = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"48\"><!-- "
+                    + String(repeating: "v", count: 12_200)
+                    + " --><rect width=\"64\" height=\"48\" fill=\"#CC3366\"/></svg>"
+                let svgClipID = UUID()
+                do {
+                    let store = GRDBHistoryStore(directory: svgSupportDir, keyProvider: InMemoryDatabaseKeyProvider())
+                    weakStoreRef = store
+                    let spy = SpyHistoryStore(base: store)
+                    _ = try spy.saveAndReconcileItem(
+                        ClipboardItem.fixture(id: svgClipID, kind: .text, text: svg12KB),
+                        convertingExternalAssets: true
+                    )
+                    let unloadedSVGHeader = try #require(try spy.fetchAll().first { $0.id == svgClipID })
+                    #expect(!unloadedSVGHeader.isContentLoaded)
+                    #expect(unloadedSVGHeader.isSVGText)
+                    #expect(!(unloadedSVGHeader.textPreview?.hasSuffix("</svg>") ?? true))
+
+                    spy.resetRecordedCalls()
+                    var rowRendered: SVGImageRenderer.Rendering?
+                    var rowDone = false
+                    if let immediate = SVGImageRenderer.shared.rendering(for: unloadedSVGHeader, completion: { res in
+                        rowRendered = res
+                        rowDone = true
+                    }) {
+                        rowRendered = immediate
+                        rowDone = true
+                    }
+                    #expect(await TestSupport.waitUntil { rowDone })
+                    let firstRendering = try #require(rowRendered)
+                    #expect(spy.loadingContentCalls.isEmpty, "SVGImageRenderer must project only clip_contents.text without full loadingContent")
+
+                    // Hydrating the item preserves (id, searchRevision) and hits the exact same cached NSImage in preview!
+                    let hydratedSVG = try spy.base.loadingContent(of: unloadedSVGHeader, scope: .body)
+                    #expect(hydratedSVG.searchRevision == unloadedSVGHeader.searchRevision)
+                    let previewRendering = try #require(SVGImageRenderer.shared.rendering(for: hydratedSVG))
+                    #expect(previewRendering.image === firstRendering.image)
+
+                    store.close()
+                }
+                #expect(weakStoreRef == nil, "SVGImageRenderer static registry must hold [weak self] so GRDBHistoryStore deallocates")
+            }
+
+            // 2. Concealed image row & HistoryTileView hide screenshot while hidden, reveal on Cmd+U, and re-hide on second Cmd+U!
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            harness.model.preferences.hideOnFocusLoss = false
+            harness.model.preferences.showImagesAsTiles = true
+            harness.model.selectedHistoryFilterContentTypes = [.images]
+
+            let pngData = try TestSupport.makePNGData(pixelWidth: 72, pixelHeight: 54, color: .systemPurple)
+            let concealedImgID = UUID()
+            let concealedImgURL = try harness.historyStore.writeManagedAsset(
+                pngData: pngData,
+                role: .image,
+                clipID: concealedImgID,
+                encrypted: true
+            )
+            var concealedImg = ClipboardItem.fixture(
+                id: concealedImgID,
+                kind: .image,
+                text: "Concealed badge text",
+                assetPath: concealedImgURL.path,
+                sensitivity: .sensitive
+            )
+            concealedImg.imageWidth = 72
+            concealedImg.imageHeight = 54
+            try harness.seedHistory([concealedImg])
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+
+            let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
+            historyWindow.window.alphaValue = 0
+            historyWindow.show()
+            defer { TestSupport.tearDownHistoryWindow(historyWindow) }
+
+            func findTileView(in root: NSView) -> HistoryTileView? {
+                Self.allDescendants(in: root).compactMap { $0 as? HistoryTileView }.first { !$0.isHidden }
+            }
+            func hasDecodedTileScreenshot(in tile: HistoryTileView) -> Bool {
+                Self.allDescendants(in: tile)
+                    .compactMap { $0 as? NSImageView }
+                    .contains { !$0.isHidden && $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) >= 40 }
+            }
+
+            let contentRoot = try #require(historyWindow.window.contentView)
+            contentRoot.layoutSubtreeIfNeeded()
+            let tile = try #require(findTileView(in: contentRoot))
+            #expect(!hasDecodedTileScreenshot(in: tile), "Hidden concealed tile must show placeholder rather than screenshot")
+
+            // Press Cmd+U -> reveals tile screenshot!
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let revealed = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                guard let currentTile = findTileView(in: contentRoot) else { return false }
+                return hasDecodedTileScreenshot(in: currentTile)
+            }
+            #expect(revealed)
+
+            // Press Cmd+U again -> re-hides tile back to placeholder while model.items stays unloaded!
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            contentRoot.layoutSubtreeIfNeeded()
+            let rehiddenTile = try #require(findTileView(in: contentRoot))
+            #expect(!hasDecodedTileScreenshot(in: rehiddenTile), "Re-hiding concealed tile via Cmd+U must clear screenshot back to placeholder")
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
         }
     }
 }

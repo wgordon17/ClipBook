@@ -788,7 +788,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             resolvedSearchText = Self.makeSearchText(
                 title: title,
                 text: text,
-                filePaths: filePaths,
+                filePaths: kind == .image ? [] : filePaths,
                 tagNames: tagNames,
                 sourceAppName: sourceAppName,
                 linkPreviewDetails: linkPreviewDetails,
@@ -983,20 +983,6 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
 
     mutating func removeFormatting() {
         setFormatting(html: nil, rtfData: nil)
-    }
-
-    /// The item without its formatting in memory. It still knows it has some,
-    /// so saving it leaves the stored formatting as it is.
-    func unloadingFormatting() -> ClipboardItem {
-        guard rtfData != nil || html != nil || formattingLoadState != .unloaded else {
-            return self
-        }
-
-        var item = self
-        item.html = nil
-        item.rtfData = nil
-        item.formattingLoadState = .unloaded
-        return item
     }
 
     private static func digest(ofHTML html: String?) -> String? {
@@ -1360,7 +1346,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             updated.searchText = Self.makeSearchText(
                 title: title,
                 text: text,
-                filePaths: filePaths,
+                filePaths: kind == .image ? [] : filePaths,
                 tagNames: tagNames,
                 sourceAppName: sourceAppName,
                 linkPreviewDetails: linkPreviewDetails,
@@ -1370,6 +1356,17 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             updated.searchText = ""
         }
         return updated
+    }
+
+    nonisolated func headerFallbackSearchText(tagNamesByID: [Tag.ID: String]) -> String {
+        Self.makeSearchText(
+            title: title,
+            text: textPreview,
+            filePaths: kind == .image ? [] : filePaths,
+            tagNames: tags.compactMap { tagNamesByID[$0] },
+            sourceAppName: sourceAppName,
+            linkPreviewDetails: linkPreviewDetails
+        )
     }
 
     /// Only the plain text of an item is searchable. The HTML of a rich text

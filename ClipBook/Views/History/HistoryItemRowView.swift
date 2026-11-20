@@ -1315,7 +1315,7 @@ class HistoryItemRowView: NSTableCellView {
             let rendering,
             let configuredItem = self.configuredItem,
             configuredItem.id == item.id,
-            configuredItem.text == item.text,
+            configuredItem.searchRevision == item.searchRevision,
             !self.hidesSensitiveContent else {
         return
       }

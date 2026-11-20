@@ -147,7 +147,12 @@ final class AppModel: ObservableObject {
             cachedHistorySourceApplications = nil
         }
     }
-    @Published var tags: [Tag] = []
+    @Published var tags: [Tag] = [] {
+        didSet {
+            invalidateSortedListedItems()
+            invalidateFilteredItems()
+        }
+    }
     @Published var selectedItemID: ClipboardItem.ID?
     @Published var selectedItemIDs: Set<ClipboardItem.ID> = []
     @Published var selectedItemIDsInSelectionOrder: [ClipboardItem.ID] = []
@@ -276,45 +281,151 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func makeSearchCorpus() -> HistorySearchCorpus {
-        if let cachedSearchCorpus, cachedSearchCorpus.revision == sortedListRevision {
+    struct SearchCorpusDescriptor: Sendable {
+        let revision: Int
+        let headers: [ClipboardItem]
+        let isTrashed: Bool
+        let tagNamesByID: [Tag.ID: String]
+        let cachedCorpus: HistorySearchCorpus?
+        let donorCorpus: HistorySearchCorpus?
+    }
+
+    func prepareSearchCorpusDescriptor() -> SearchCorpusDescriptor {
+        if let cachedSearchCorpus,
+           cachedSearchCorpus.revision == sortedListRevision,
+           cachedSearchCorpus.hasCompleteTexts {
+            return SearchCorpusDescriptor(
+                revision: sortedListRevision,
+                headers: [],
+                isTrashed: isShowingTrash,
+                tagNamesByID: [:],
+                cachedCorpus: cachedSearchCorpus,
+                donorCorpus: cachedSearchCorpus
+            )
+        }
+
+        let items = listedItems
+        let sortedIndexes = sortedListedIndexes(for: items)
+        let count = sortedIndexes.count
+        let headers = [ClipboardItem](unsafeUninitializedCapacity: count) { headersBuffer, initializedCount in
+            items.withUnsafeBufferPointer { itemsBuffer in
+                sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
+                    for i in 0..<count {
+                        headersBuffer.baseAddress!.advanced(by: i).initialize(to: itemsBuffer[indexesBuffer[i]])
+                    }
+                }
+            }
+            initializedCount = count
+        }
+        let tagNamesByID = Dictionary(uniqueKeysWithValues: tags.map { ($0.id, $0.name) })
+
+        return SearchCorpusDescriptor(
+            revision: sortedListRevision,
+            headers: headers,
+            isTrashed: isShowingTrash,
+            tagNamesByID: tagNamesByID,
+            cachedCorpus: nil,
+            donorCorpus: cachedSearchCorpus ?? searchResult?.corpus
+        )
+    }
+
+    func makeSearchCorpus(using store: (any HistoryStore)? = nil) -> HistorySearchCorpus {
+        if let cachedSearchCorpus,
+           cachedSearchCorpus.revision == sortedListRevision,
+           cachedSearchCorpus.hasCompleteTexts {
             return cachedSearchCorpus
         }
 
         let items = listedItems
         let sortedIndexes = sortedListedIndexes(for: items)
         let count = sortedIndexes.count
-        let ids = [UUID](unsafeUninitializedCapacity: count) { idsBuffer, initializedCount in
-            items.withUnsafeBufferPointer { itemsBuffer in
-                sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
-                    for i in 0..<count {
-                        idsBuffer.baseAddress!.advanced(by: i).initialize(to: itemsBuffer[indexesBuffer[i]].id)
+        let tagNamesByID = Dictionary(uniqueKeysWithValues: tags.map { ($0.id, $0.name) })
+        let donor = cachedSearchCorpus ?? searchResult?.corpus
+
+        var ids = [UUID](repeating: UUID(), count: count)
+        var revisions = [UInt64](repeating: 0, count: count)
+        var texts = [String](repeating: "", count: count)
+        var missingSlots: [(slotIndex: Int, id: UUID)] = []
+
+        items.withUnsafeBufferPointer { itemsBuffer in
+            sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
+                for i in 0..<count {
+                    let header = itemsBuffer[indexesBuffer[i]]
+                    ids[i] = header.id
+                    if header.isContentLoaded {
+                        texts[i] = header.searchText
+                        revisions[i] = header.searchRevision
+                    } else if let reused = donor?.reusableText(for: header, tagNamesByID: tagNamesByID) {
+                        texts[i] = reused
+                        revisions[i] = header.searchRevision
+                    } else {
+                        missingSlots.append((slotIndex: i, id: header.id))
                     }
                 }
             }
-            initializedCount = count
-        }
-        let texts = [String](unsafeUninitializedCapacity: count) { textsBuffer, initializedCount in
-            items.withUnsafeBufferPointer { itemsBuffer in
-                sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
-                    for i in 0..<count {
-                        textsBuffer.baseAddress!.advanced(by: i).initialize(to: itemsBuffer[indexesBuffer[i]].searchText)
-                    }
-                }
-            }
-            initializedCount = count
         }
 
-        let corpus = HistorySearchCorpus(revision: sortedListRevision, ids: ids, texts: texts)
-        cachedSearchCorpus = corpus
+        let didFetchSucceed: Bool
+        var usedFallback = false
+        if !missingSlots.isEmpty {
+            let fetchedTexts: [String?]? = store.flatMap {
+                try? $0.fetchSearchTexts(
+                    for: missingSlots.map(\.id),
+                    trashed: isShowingTrash,
+                    tagNamesByID: tagNamesByID,
+                    isCancelled: { false }
+                )
+            }
+            didFetchSucceed = fetchedTexts != nil
+            items.withUnsafeBufferPointer { itemsBuffer in
+                sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
+                    for (offset, slot) in missingSlots.enumerated() {
+                        let header = itemsBuffer[indexesBuffer[slot.slotIndex]]
+                        if let fetchedTexts, offset < fetchedTexts.count, let fetchedSlot = fetchedTexts[offset] {
+                            texts[slot.slotIndex] = fetchedSlot
+                            revisions[slot.slotIndex] = header.searchRevision
+                        } else {
+                            usedFallback = true
+                            texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                            revisions[slot.slotIndex] = 0
+                        }
+                    }
+                }
+            }
+        } else {
+            didFetchSucceed = true
+        }
+
+        let corpus = HistorySearchCorpus(
+            revision: sortedListRevision,
+            ids: ids,
+            revisions: revisions,
+            texts: texts,
+            tagNamesByID: tagNamesByID,
+            hasCompleteTexts: didFetchSucceed && !usedFallback
+        )
+        if corpus.hasCompleteTexts {
+            let oldCorpus = cachedSearchCorpus
+            cachedSearchCorpus = corpus
+            if oldCorpus !== corpus {
+                dropSearchStateOffMainThread(result: nil, corpus: oldCorpus)
+            }
+        }
         return corpus
     }
 
     func installSearchResult(_ result: HistorySearchResult) {
         let oldResult = searchResult
+        let oldCorpus: HistorySearchCorpus?
+        if result.revision == sortedListRevision && result.corpus.hasCompleteTexts {
+            oldCorpus = cachedSearchCorpus === result.corpus ? nil : cachedSearchCorpus
+            cachedSearchCorpus = result.corpus
+        } else {
+            oldCorpus = nil
+        }
         searchResult = result
         invalidateFilteredItems()
-        dropSearchStateOffMainThread(result: oldResult, corpus: nil)
+        dropSearchStateOffMainThread(result: oldResult, corpus: oldCorpus)
     }
 
     private func sortedListedIndexes(for items: [ClipboardItem]) -> [Int] {
@@ -417,6 +528,9 @@ final class AppModel: ObservableObject {
         }
 
         let allowsPrefilter = hasSearch ? HistorySearchMatcher.allowsASCIIPrefilter(for: locale) : false
+        let tagNamesByID = (hasSearch && !isPositionalMatch)
+            ? Dictionary(uniqueKeysWithValues: tags.map { ($0.id, $0.name) })
+            : [:]
         items.withUnsafeBufferPointer { buffer in
             for (position, itemIndex) in sortedIndexes.enumerated() {
                 if hasSearch {
@@ -424,24 +538,18 @@ final class AppModel: ObservableObject {
                         if !installedResult.matches[position] {
                             continue
                         }
-                    } else if let installedResult {
-                        let id = buffer[itemIndex].id
-                        let searchText = buffer[itemIndex].searchText
-                        if let corpusIndex = installedResult.indexByID[id],
-                           installedResult.corpus.texts[corpusIndex] == searchText {
-                            if !installedResult.matches[corpusIndex] {
-                                continue
-                            }
-                        } else if !HistorySearchMatcher.matches(
-                            searchText,
-                            terms,
-                            locale: locale,
-                            allowsPrefilter: allowsPrefilter
-                        ) {
+                    } else if let installedResult,
+                              installedResult.locale == locale,
+                              let corpusIndex = installedResult.indexByID[buffer[itemIndex].id],
+                              installedResult.corpus.reusableText(for: buffer[itemIndex], tagNamesByID: tagNamesByID) != nil {
+                        if !installedResult.matches[corpusIndex] {
                             continue
                         }
                     } else {
-                        let searchText = buffer[itemIndex].searchText
+                        let candidate = buffer[itemIndex]
+                        let searchText = candidate.isContentLoaded
+                            ? candidate.searchText
+                            : candidate.headerFallbackSearchText(tagNamesByID: tagNamesByID)
                         if !HistorySearchMatcher.matches(
                             searchText,
                             terms,
@@ -507,8 +615,24 @@ final class AppModel: ObservableObject {
         if !terms.isEmpty {
             let locale = Locale.current
             let allowsPrefilter = HistorySearchMatcher.allowsASCIIPrefilter(for: locale)
-            result = result.filter {
-                HistorySearchMatcher.matches($0.searchText, terms, locale: locale, allowsPrefilter: allowsPrefilter)
+            let tagNamesByID = Dictionary(uniqueKeysWithValues: tags.map { ($0.id, $0.name) })
+            let installedResult = (searchResult?.terms == terms && searchResult?.locale == locale) ? searchResult : nil
+            result = result.filter { item in
+                if let installedResult,
+                   installedResult.locale == locale,
+                   let corpusIndex = installedResult.indexByID[item.id],
+                   installedResult.corpus.reusableText(for: item, tagNamesByID: tagNamesByID) != nil {
+                    return installedResult.matches[corpusIndex]
+                }
+                let searchText = item.isContentLoaded
+                    ? item.searchText
+                    : item.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                return HistorySearchMatcher.matches(
+                    searchText,
+                    terms,
+                    locale: locale,
+                    allowsPrefilter: allowsPrefilter
+                )
             }
         }
 
@@ -705,10 +829,13 @@ final class AppModel: ObservableObject {
 
     func insert(_ item: ClipboardItem) {
         // The list is published once, so the history reloads once per item.
-        // Its items never hold their formatting; the store reads it when needed.
-        let item = item.unloadingFormatting()
+        // Its items never hold their body or formatting; the store reads them when needed.
+        let item = item.unloadingContent()
         var updatedItems = items
-        updatedItems.removeAll { $0.id == item.id || $0.hasSameContent(as: item) }
+        updatedItems.removeAll {
+            $0.id == item.id
+                || (!$0.isKeptByUser && $0.title == nil && $0.linkPreviewDetails == nil && $0.hasSameContent(as: item))
+        }
         updatedItems.insert(item, at: 0)
         items = updatedItems
         clearUnavailableHistorySourceApplicationFilter()
@@ -842,7 +969,7 @@ final class AppModel: ObservableObject {
         }
 
         let ids = Set(trashedItems.map(\.id))
-        self.trashedItems = trashedItems.map { $0.unloadingFormatting() }
+        self.trashedItems = trashedItems.map { $0.unloadingContent() }
             + self.trashedItems.filter { !ids.contains($0.id) }
     }
 
@@ -865,7 +992,7 @@ final class AppModel: ObservableObject {
         let ids = Set(restoredItems.map(\.id))
         trashedItems.removeAll { ids.contains($0.id) }
         let restoredItems = restoredItems.map { item -> ClipboardItem in
-            var item = item.unloadingFormatting()
+            var item = item.unloadingContent()
             item.deletedAt = nil
             return item
         }
@@ -896,7 +1023,7 @@ final class AppModel: ObservableObject {
     }
 
     func replace(_ item: ClipboardItem) {
-        let item = item.unloadingFormatting()
+        let item = item.unloadingContent()
         // Background OCR or link preview updates finishing after an item was
         // deleted update it in the Trash rather than putting it back in the history.
         if let trashedIndex = trashedItems.firstIndex(where: { $0.id == item.id }) {
@@ -931,7 +1058,7 @@ final class AppModel: ObservableObject {
 
         let trashedIDs = Set(trashedItems.map(\.id))
         let trashedReplacementsByID = Dictionary(
-            updatedItems.filter { trashedIDs.contains($0.id) }.map { ($0.id, $0.unloadingFormatting()) },
+            updatedItems.filter { trashedIDs.contains($0.id) }.map { ($0.id, $0.unloadingContent()) },
             uniquingKeysWith: { _, latest in latest }
         )
         if !trashedReplacementsByID.isEmpty {
@@ -944,7 +1071,7 @@ final class AppModel: ObservableObject {
         }
 
         let replacementsByID = Dictionary(
-            activeUpdates.map { ($0.id, $0.unloadingFormatting()) },
+            activeUpdates.map { ($0.id, $0.unloadingContent()) },
             uniquingKeysWith: { _, latest in latest }
         )
         var replacedIDs = Set<ClipboardItem.ID>()

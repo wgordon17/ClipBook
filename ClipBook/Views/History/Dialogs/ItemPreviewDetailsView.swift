@@ -626,7 +626,7 @@ final class ItemPreviewDetailsView: NSView {
       return [
         Field(
           title: L10n.string("Characters"),
-          value: numberString(item.previewText.count),
+          value: numberString(item.characterCount),
           key: .characters
         )
       ]

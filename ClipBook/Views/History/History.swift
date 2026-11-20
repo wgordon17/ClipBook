@@ -32,9 +32,9 @@ enum HistoryKeyboardMultipleSelectionCommand {
 final class History: NSView {
   weak var delegate: HistoryDelegate?
   var filePreviewCache: FilePreviewCache?
-  /// Reads the formatting of a rich text item, which the history's items come
-  /// without, for dragging it out with its formatting.
-  var loadFormatting: ((ClipboardItem) -> ClipboardItem)?
+  /// Reads the stored content of an item for the requested scope when dragging
+  /// a row out of the history.
+  var loadContent: ((ClipboardItem, ClipboardContentScope) -> ClipboardItem)?
 
   var items: [ClipboardItem] = []
   var availableTags: [Tag] = [] {
@@ -316,7 +316,8 @@ final class History: NSView {
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? HistoryItemRowView else {
           return
         }
-        if case .item(let item, _) = tableRows[safe: row], cell.configuredItem != item {
+        if case .item(let item, _) = tableRows[safe: row],
+           cell.configuredItem != item || cell.configuredItem?.searchRevision != item.searchRevision {
           staleRows.insert(row)
         } else if changesSearchTerms {
           cell.updateSearchQuery(searchQuery)
@@ -1550,7 +1551,16 @@ final class History: NSView {
     }
 
     let asPlainText = preferDraggingAsPlainText != modifierFlags.contains(.option)
-    let draggedItem = !asPlainText && item.kind == .richText ? loadFormatting?(item) ?? item : item
+    let draggedItem: ClipboardItem
+    switch item.kind {
+    case .file, .image:
+      draggedItem = item
+    case .richText where !asPlainText:
+      draggedItem = loadContent?(item, .full) ?? item
+    default:
+      let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
+      draggedItem = loadContent?(item, scope) ?? item
+    }
     return HistoryItemDragging.payload(for: draggedItem, asPlainText: asPlainText)
   }
 

@@ -37,7 +37,9 @@ enum AppCoordinatorTests {
 
             let merged = try #require(harness.model.items.first)
             #expect(merged.kind == .link)
-            #expect(harness.model.items.filter { $0.kind == .link && $0.contentKey == merged.contentKey }.count == 1)
+            #expect(!merged.isContentLoaded)
+            #expect(merged.storedContentKey != nil)
+            #expect(harness.model.items.filter { $0.kind == .link && $0.hasSameContent(as: merged) }.count == 1)
         }
 
         @Test
@@ -66,10 +68,12 @@ enum AppCoordinatorTests {
 
             let items = harness.model.items
             #expect(items.count == 4)
-            #expect(items[0].text == "alpha")
-            #expect(items[1].text == "beta")
+            #expect(items.allSatisfy { !$0.isContentLoaded })
+            #expect(items[0].previewText == "alpha")
+            #expect(items[1].previewText == "beta")
             #expect(items[2].kind == .link)
-            #expect(items[2].text == "https://example.com")
+            #expect(items[2].previewText == "https://example.com")
+            #expect(try harness.historyStore.loadingContent(of: items[0], scope: .body).text == "alpha")
         }
 
         @Test
@@ -91,7 +95,9 @@ enum AppCoordinatorTests {
             harness.coordinator.transform(try #require(harness.currentItem(formatted.id)), using: .upperCase)
 
             let transformed = try #require(harness.currentItem(formatted.id))
-            #expect(transformed.text == "HELLO WORLD")
+            #expect(!transformed.isContentLoaded)
+            #expect(transformed.previewText == "HELLO WORLD")
+            #expect(try harness.historyStore.loadingContent(of: transformed, scope: .body).text == "HELLO WORLD")
             #expect(transformed.kind == .text)
             #expect(!transformed.hasFormatting)
         }
@@ -535,8 +541,8 @@ enum AppCoordinatorTests {
 
             let pasteService = PasteService(
                 pasteboard: pasteboard,
-                loadFormatting: { [historyStore] item in
-                    (try? historyStore.loadingFormatting(of: item)) ?? item
+                loadContent: { [historyStore] item, scope in
+                    (try? historyStore.loadingContent(of: item, scope: scope)) ?? item
                 }
             )
             let coordinator = AppCoordinator(
@@ -626,9 +632,10 @@ enum AppCoordinatorTests {
             let itemB = try #require(harness.model.items.first)
             let demotedB = await TestSupport.waitUntil {
                 harness.currentItem(itemB.id)?.assetPath?.hasSuffix(".png") == true
-                    && harness.currentItem(itemB.id)?.text == "Benign quarterly chart"
+                    && harness.currentItem(itemB.id)?.previewText == "Benign quarterly chart"
             }
             #expect(demotedB)
+            #expect(try harness.historyStore.loadingContent(of: try #require(harness.currentItem(itemB.id)), scope: .body).text == "Benign quarterly chart")
             #expect(!FileManager.default.fileExists(atPath: imagesDir.appendingPathComponent("\(itemB.id.uuidString).enc").path))
 
             // --- Outcome (c1): Active .image secret OCR/QR with sensitiveContentLifetime == .dontSave purges SQLite/WAL/.enc & scrubs ImageDragFiles ---
@@ -1191,6 +1198,7 @@ enum AppCoordinatorTests {
             try harness.seedHistory([concealedImgItem])
 
             let contentVC = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([contentVC] + contentVC.children) }
             let ocrMenuItem = NSMenuItem()
             ocrMenuItem.representedObject = concealedImgItem
             contentVC.copyTextFromImageMenuItem(ocrMenuItem)
@@ -1202,7 +1210,7 @@ enum AppCoordinatorTests {
             harness.model.preferences.confidentialContentLifetime = ContentLifetime.dontSave
             harness.clipboardMonitor.updatePreferences(harness.model.preferences)
             await harness.clipboardMonitor.pollAndWaitForDelivery()
-            #expect(!harness.model.items.contains { $0.kind == .text && $0.text == concealedOCRText })
+            #expect(!harness.model.items.contains { $0.kind == .text && $0.previewText == concealedOCRText })
 
             // With confidentialContentLifetime == 120, copying QR text from the .sensitive image re-captures it with sensitivity == .sensitive, expiresAt, and isEncrypted == 1!
             harness.model.preferences.confidentialContentLifetime = 120
@@ -1214,7 +1222,9 @@ enum AppCoordinatorTests {
             #expect((harness.pasteboard.types ?? []).contains(PasteboardReader.concealedType))
 
             await harness.clipboardMonitor.pollAndWaitForDelivery()
-            let recapturedQR = try #require(harness.model.items.first { $0.kind == .text && $0.text == concealedQRText })
+            let recapturedQR = try #require(harness.model.items.first { $0.kind == .text && $0.previewText == concealedQRText })
+            #expect(!recapturedQR.isContentLoaded)
+            #expect(try harness.historyStore.loadingContent(of: recapturedQR, scope: .body).text == concealedQRText)
             #expect(recapturedQR.sensitivity == .sensitive)
             #expect(recapturedQR.expiresAt != nil)
             harness.historyStore.flushPendingFreePageRelease()
@@ -1552,8 +1562,483 @@ enum AppCoordinatorTests {
     }
 }
 
-// Saving applies appearance and language, which are process-wide.
+// Saving applies appearance and language, which are process-wide, and confirming
+// the sensitive-content deletion alert runs NSApp's modal window loop.
 extension SharedProcessStateTests {
+    @Suite(.serialized)
+    struct LazyConsumerHydrationMatrixTests {
+        private static let sentinel = "TAIL_SENTINEL_AT_40KB"
+
+        private static func make40KBBody(prefix: String = "") -> String {
+            let padCount = max(0, 40_020 - prefix.count - sentinel.count)
+            return prefix + String(repeating: "a", count: padCount) + sentinel
+        }
+
+        @Test
+        @MainActor
+        func pasteCoordinatorActionsMergeSplitLifetimeAndBatchTagUpdatesUseMinimalContentScopes() async throws {
+            let (harness, spyStore, pasteService) = try TestSupport.makeSpiedTestCoordinator()
+            defer { harness.cleanup() }
+
+            let baseTime = Date(timeIntervalSince1970: 1_710_100_000)
+            let text40KB = Self.make40KBBody()
+            #expect(text40KB.count == 40_020)
+
+            let richText40KB = Self.make40KBBody(prefix: "RichHead ")
+            let richRTF40KB = try TestSupport.makeRTFData(text: richText40KB)
+            let richHTML40KB = "<div class='rich'>\(richText40KB)</div>"
+
+            let longURLString = "https://example.com/resource?blob="
+                + String(repeating: "q", count: 40_000)
+                + "_"
+                + Self.sentinel
+
+            let ocrText40KB = Self.make40KBBody(prefix: "OCR ")
+            let qrText40KB = "https://qr.example.com/v?" + String(repeating: "z", count: 12_000) + Self.sentinel
+
+            let pngBytes = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 24)
+            let ocrImageID = UUID()
+            let ocrImageURL = try spyStore.writeManagedAsset(pngData: pngBytes, role: .image, clipID: ocrImageID, encrypted: false)
+            let plainImageID = UUID()
+            let plainImageURL = try spyStore.writeManagedAsset(pngData: pngBytes, role: .image, clipID: plainImageID, encrypted: false)
+
+            let sampleFileURL = harness.supportDirectory.appendingPathComponent("sample-doc.txt")
+            try Data("file-bytes".utf8).write(to: sampleFileURL)
+
+            let svgBody12KB = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"><!-- "
+                + String(repeating: "s", count: 12_000)
+                + " --><rect width=\"64\" height=\"64\" fill=\"#3366FF\"/></svg>"
+
+            let seededText = ClipboardItem.fixture(
+                kind: .text,
+                text: text40KB,
+                copiedAt: baseTime.addingTimeInterval(10)
+            )
+            let seededRich = ClipboardItem.fixture(
+                kind: .richText,
+                text: richText40KB,
+                rtfData: richRTF40KB,
+                html: richHTML40KB,
+                copiedAt: baseTime.addingTimeInterval(20)
+            )
+            let seededHTMLOnlyRich = ClipboardItem.fixture(
+                kind: .richText,
+                text: "",
+                rtfData: nil,
+                html: "<p>HTMLOnly_\(Self.sentinel)</p>",
+                copiedAt: baseTime.addingTimeInterval(25)
+            )
+            let seededLink = ClipboardItem.fixture(
+                kind: .link,
+                text: longURLString,
+                copiedAt: baseTime.addingTimeInterval(30)
+            )
+            let seededOCRImage = ClipboardItem.fixture(
+                id: ocrImageID,
+                kind: .image,
+                text: ocrText40KB,
+                qrCodeText: qrText40KB,
+                assetPath: ocrImageURL.path,
+                copiedAt: baseTime.addingTimeInterval(40)
+            )
+            let seededPlainImage = ClipboardItem.fixture(
+                id: plainImageID,
+                kind: .image,
+                text: nil,
+                qrCodeText: nil,
+                assetPath: plainImageURL.path,
+                copiedAt: baseTime.addingTimeInterval(45)
+            )
+            let seededFile = ClipboardItem.fixture(
+                kind: .file,
+                text: nil,
+                filePaths: [sampleFileURL.path],
+                copiedAt: baseTime.addingTimeInterval(50)
+            )
+            let seededSVG = ClipboardItem.fixture(
+                kind: .text,
+                text: svgBody12KB,
+                copiedAt: baseTime.addingTimeInterval(55)
+            )
+
+            try harness.seedHistory([
+                seededText,
+                seededRich,
+                seededHTMLOnlyRich,
+                seededLink,
+                seededOCRImage,
+                seededPlainImage,
+                seededFile,
+                seededSVG,
+            ])
+
+            // Every item in AppModel after loadHistory() is an unloaded header with empty searchText.
+            #expect(harness.model.items.count == 8)
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded && !$0.isFormattingLoaded && $0.searchText.isEmpty })
+
+            let textHeader = try #require(harness.currentItem(seededText.id))
+            let richHeader = try #require(harness.currentItem(seededRich.id))
+            let htmlOnlyHeader = try #require(harness.currentItem(seededHTMLOnlyRich.id))
+            let linkHeader = try #require(harness.currentItem(seededLink.id))
+            let ocrImageHeader = try #require(harness.currentItem(seededOCRImage.id))
+            let plainImageHeader = try #require(harness.currentItem(seededPlainImage.id))
+            let fileHeader = try #require(harness.currentItem(seededFile.id))
+            let svgHeader = try #require(harness.currentItem(seededSVG.id))
+            #expect(svgHeader.isSVGText)
+            #expect(textHeader.characterCount == 40_020)
+            #expect(!(textHeader.textPreview?.contains(Self.sentinel) ?? true))
+            #expect(linkHeader.browserURL == nil)
+
+            // 1. PasteService minimal scope verification (.plainText vs .standard vs .filePath).
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(textHeader, variant: .plainText)
+            #expect(spyStore.loadingContentCalls == [.init(id: textHeader.id, scope: .body)])
+            #expect(harness.pasteboard.string(forType: .string) == text40KB)
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(richHeader, variant: .plainText)
+            #expect(spyStore.loadingContentCalls == [.init(id: richHeader.id, scope: .body)])
+            #expect(harness.pasteboard.string(forType: .string) == richText40KB)
+            #expect(harness.pasteboard.data(forType: .rtf) == nil)
+            #expect(harness.pasteboard.string(forType: .html) == nil)
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(fileHeader, variant: .plainText)
+            try pasteService.copy(fileHeader, variant: .filePath)
+            try pasteService.copy(plainImageHeader, variant: .plainText)
+            #expect(spyStore.loadingContentCalls.isEmpty)
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(ocrImageHeader, variant: .plainText)
+            #expect(spyStore.loadingContentCalls == [.init(id: ocrImageHeader.id, scope: .body)])
+            #expect(harness.pasteboard.string(forType: .string) == ocrText40KB)
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(htmlOnlyHeader, variant: .plainText)
+            #expect(spyStore.loadingContentCalls == [.init(id: htmlOnlyHeader.id, scope: .full)])
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(richHeader, variant: .standard)
+            #expect(spyStore.loadingContentCalls == [.init(id: richHeader.id, scope: .full)])
+            #expect(harness.pasteboard.string(forType: .string) == richText40KB)
+            #expect(harness.pasteboard.data(forType: .rtf) == richRTF40KB)
+            #expect(harness.pasteboard.string(forType: .html) == richHTML40KB)
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(textHeader, variant: .standard)
+            #expect(spyStore.loadingContentCalls == [.init(id: textHeader.id, scope: .body)])
+
+            spyStore.resetRecordedCalls()
+            try pasteService.copy(plainImageHeader, variant: .standard)
+            try pasteService.copy(fileHeader, variant: .standard)
+            #expect(spyStore.loadingContentCalls.isEmpty)
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+
+            // 2. copyTextFromImage & copyTextFromQRCode hydrate with .body scope.
+            let contentVC = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            let toolbar = HistoryToolbar()
+            toolbar.delegate = contentVC
+            contentVC.attachToolbar(toolbar)
+            defer { TestSupport.drainDelayedPerforms([contentVC]) }
+            _ = contentVC.view
+
+            spyStore.resetRecordedCalls()
+            let copyOCRMenu = NSMenuItem()
+            copyOCRMenu.representedObject = ocrImageHeader
+            contentVC.copyTextFromImageMenuItem(copyOCRMenu)
+            #expect(spyStore.loadingContentCalls == [.init(id: ocrImageHeader.id, scope: .body)])
+            #expect(harness.pasteboard.string(forType: .string) == ocrText40KB)
+
+            spyStore.resetRecordedCalls()
+            let copyQRMenu = NSMenuItem()
+            copyQRMenu.representedObject = ocrImageHeader
+            contentVC.copyTextFromQRCodeMenuItem(copyQRMenu)
+            #expect(spyStore.loadingContentCalls == [.init(id: ocrImageHeader.id, scope: .body)])
+            #expect(harness.pasteboard.string(forType: .string) == qrText40KB)
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+
+            // 3. openInBrowser & openInAssociatedApplication on >8 KB URLs hydrate .body without launching any browser!
+            let contextMenuBuilder = HistoryItemContextMenu(
+                target: contentVC,
+                availableTags: [],
+                preferences: harness.model.preferences
+            )
+            spyStore.resetRecordedCalls()
+            let linkMenuTitles = contextMenuBuilder.makeMenu(for: linkHeader).items.map(\.title)
+            #expect(linkMenuTitles.contains(L10n.string("Open in Browser")))
+            #expect(linkMenuTitles.contains(L10n.string("Transform")))
+            #expect(spyStore.loadingContentCalls.isEmpty)
+
+            spyStore.suppressBrowserURLOnLoadingContent = true
+            defer { spyStore.suppressBrowserURLOnLoadingContent = false }
+
+            spyStore.resetRecordedCalls()
+            harness.coordinator.openInBrowser(linkHeader)
+            #expect(spyStore.loadingContentCalls == [.init(id: linkHeader.id, scope: .body)])
+            #expect(spyStore.resolvedBrowserURLsOnLoadingContent.map(\.absoluteString) == [longURLString])
+
+            spyStore.resetRecordedCalls()
+            harness.coordinator.openInAssociatedApplication(linkHeader)
+            #expect(spyStore.loadingContentCalls == [.init(id: linkHeader.id, scope: .body)])
+            #expect(spyStore.resolvedBrowserURLsOnLoadingContent.map(\.absoluteString) == [longURLString])
+            spyStore.suppressBrowserURLOnLoadingContent = false
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+
+            // 4. transform(..., using: .upperCase) hydrates .body (skipping html/rtf even on .richText) and keeps model unloaded.
+            spyStore.resetRecordedCalls()
+            harness.coordinator.transform(richHeader, using: .upperCase)
+            #expect(spyStore.loadingContentCalls == [.init(id: richHeader.id, scope: .body)])
+            let transformedRichHeader = try #require(harness.currentItem(richHeader.id))
+            #expect(!transformedRichHeader.isContentLoaded)
+            #expect(!transformedRichHeader.hasFormatting)
+            let hydratedTransformed = try spyStore.base.loadingContent(of: transformedRichHeader, scope: .full)
+            #expect(hydratedTransformed.text == richText40KB.uppercased())
+            #expect(hydratedTransformed.html == nil)
+            #expect(hydratedTransformed.rtfData == nil)
+
+            // 5. canMerge (0 reads) + merge (.body scope + deleteExistingMatches spares favorite/tagged/titled!) + Copy & Merge onto unloaded target.
+            spyStore.resetRecordedCalls()
+            #expect(harness.coordinator.canMerge([textHeader, transformedRichHeader]))
+            #expect(!harness.coordinator.canMerge([textHeader, ocrImageHeader]))
+            #expect(spyStore.loadingContentCalls.isEmpty)
+
+            let mergeTag = try spyStore.createTag(name: "KeepOnMerge", color: "#EE5522")
+            harness.model.tags = [mergeTag]
+            let mergePartA = ClipboardItem.fixture(
+                kind: .text,
+                text: String(repeating: "m", count: 20_000),
+                copiedAt: baseTime.addingTimeInterval(60)
+            )
+            let mergePartB = ClipboardItem.fixture(
+                kind: .text,
+                text: "Joined_\(Self.sentinel)",
+                copiedAt: baseTime.addingTimeInterval(61)
+            )
+            let expectedMergedBody = "\(String(repeating: "m", count: 20_000))\nJoined_\(Self.sentinel)"
+
+            let plainDup = ClipboardItem.fixture(
+                kind: .text,
+                text: expectedMergedBody,
+                copiedAt: baseTime.addingTimeInterval(56)
+            )
+            let favoritedSameText = ClipboardItem.fixture(
+                kind: .text,
+                text: expectedMergedBody,
+                copiedAt: baseTime.addingTimeInterval(57),
+                isFavorite: true
+            )
+            let taggedSameText = ClipboardItem.fixture(
+                kind: .text,
+                text: expectedMergedBody,
+                copiedAt: baseTime.addingTimeInterval(58),
+                tags: [mergeTag.id]
+            )
+            let titledSameText = ClipboardItem.fixture(
+                kind: .text,
+                title: "Protected User Title",
+                text: expectedMergedBody,
+                copiedAt: baseTime.addingTimeInterval(59)
+            )
+            for item in [plainDup, favoritedSameText, taggedSameText, titledSameText, mergePartA, mergePartB] {
+                try spyStore.saveAndReconcileItem(item, convertingExternalAssets: true)
+            }
+            harness.coordinator.loadHistory(sweepsCaches: false)
+
+            let partAHeader = try #require(harness.currentItem(mergePartA.id))
+            let partBHeader = try #require(harness.currentItem(mergePartB.id))
+            spyStore.resetRecordedCalls()
+            harness.coordinator.merge([partAHeader, partBHeader])
+            #expect(spyStore.loadingContentCalls.allSatisfy { $0.scope == .body })
+            #expect(harness.currentItem(plainDup.id) == nil, "Plain unkept duplicate must be deduplicated by deleteExistingMatches")
+            #expect(harness.currentItem(favoritedSameText.id) != nil, "Favorited item with identical text must NEVER be deleted on merge")
+            #expect(harness.currentItem(taggedSameText.id) != nil, "Tagged item with identical text must NEVER be deleted on merge")
+            #expect(harness.currentItem(titledSameText.id) != nil, "Titled item with identical text must NEVER be deleted on merge")
+            let mergedTop = try #require(harness.model.items.first)
+            #expect(!mergedTop.isContentLoaded)
+            #expect(try spyStore.base.loadingContent(of: mergedTop, scope: .body).text == expectedMergedBody)
+
+            // Double-copy Copy & Merge onto an unloaded >8 KB target item in SQLite.
+            harness.model.preferences.copyAndMergeEnabled = true
+            harness.model.preferences.copyAndMergeSeparator = CopyAndMergeSeparatorPreference.space.rawValue
+            harness.model.preferences.copyToClipboardAfterMerge = true
+            harness.clipboardMonitor.updatePreferences(harness.model.preferences)
+
+            harness.pasteboard.clearContents()
+            harness.pasteboard.setString("DOUBLE_COPY_SUFFIX", forType: .string)
+            await harness.clipboardMonitor.pollAndWaitForDelivery()
+            harness.pasteboard.clearContents()
+            harness.pasteboard.setString("DOUBLE_COPY_SUFFIX", forType: .string)
+            await harness.clipboardMonitor.pollAndWaitForDelivery()
+
+            let copyMergedHeader = try #require(harness.model.items.first)
+            #expect(!copyMergedHeader.isContentLoaded)
+            #expect(copyMergedHeader.storedContentKey != nil)
+            #expect(
+                try spyStore.base.loadingContent(of: copyMergedHeader, scope: .body).text
+                    == "\(expectedMergedBody) DOUBLE_COPY_SUFFIX"
+            )
+            harness.model.preferences.copyAndMergeEnabled = false
+            harness.clipboardMonitor.updatePreferences(harness.model.preferences)
+
+            // 6. canSplit & split with newlines past char 10,000 keeps newly split items unloaded.
+            let singleLineShort = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(kind: .text, text: "Single line without newline", copiedAt: baseTime.addingTimeInterval(70)),
+                convertingExternalAssets: true
+            )
+            let splitPast10KText = String(repeating: "L", count: 10_500) + "\nSecondLine_\(Self.sentinel)"
+            let splitSourceSaved = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(kind: .text, text: splitPast10KText, copiedAt: baseTime.addingTimeInterval(71)),
+                convertingExternalAssets: true
+            )
+            harness.coordinator.loadHistory(sweepsCaches: false)
+
+            let shortHeader = try #require(harness.currentItem(singleLineShort.id))
+            let splitSourceHeader = try #require(harness.currentItem(splitSourceSaved.id))
+            spyStore.resetRecordedCalls()
+            #expect(!harness.coordinator.canSplit(shortHeader))
+            #expect(spyStore.loadingContentCalls.isEmpty)
+
+            #expect(harness.coordinator.canSplit(splitSourceHeader))
+            #expect(spyStore.loadingContentCalls == [.init(id: splitSourceHeader.id, scope: .body)])
+
+            spyStore.resetRecordedCalls()
+            harness.coordinator.split(splitSourceHeader)
+            #expect(spyStore.loadingContentCalls == [.init(id: splitSourceHeader.id, scope: .body)])
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+            #expect(harness.model.items[0].characterCount == 10_500)
+            #expect(
+                try spyStore.base.loadingContent(of: harness.model.items[1], scope: .body).text
+                    == "SecondLine_\(Self.sentinel)"
+            )
+
+            // 7. editContent (.body scope) + blank edit to Trash + Undo + restore preserve unloaded headers & full bodies.
+            let editableRichSaved = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(
+                    kind: .richText,
+                    text: Self.make40KBBody(prefix: "BeforeEdit "),
+                    rtfData: richRTF40KB,
+                    html: richHTML40KB,
+                    copiedAt: baseTime.addingTimeInterval(80)
+                ),
+                convertingExternalAssets: true
+            )
+            harness.coordinator.loadHistory(sweepsCaches: false)
+            let editableHeader = try #require(harness.currentItem(editableRichSaved.id))
+            let edited40KB = Self.make40KBBody(prefix: "AfterEdit ")
+
+            spyStore.resetRecordedCalls()
+            harness.coordinator.editContent(editableHeader, text: edited40KB)
+            #expect(spyStore.loadingContentCalls == [.init(id: editableHeader.id, scope: .body)])
+            let afterEditHeader = try #require(harness.currentItem(editableHeader.id))
+            #expect(!afterEditHeader.isContentLoaded)
+            #expect(!afterEditHeader.hasFormatting)
+            #expect(try spyStore.base.loadingContent(of: afterEditHeader, scope: .body).text == edited40KB)
+
+            // Blank edit moves to Trash; Undo and explicit putBack keep headers unloaded while preserving 40 KB body.
+            harness.coordinator.editContent(afterEditHeader, text: "   \n ")
+            #expect(harness.currentItem(editableHeader.id) == nil)
+            harness.model.trashedItems = try spyStore.fetchTrashedItems()
+            #expect(harness.model.trashedItems.allSatisfy { !$0.isContentLoaded })
+
+            harness.coordinator.undoHistoryChange()
+            let restoredByUndo = try #require(harness.currentItem(editableHeader.id))
+            #expect(!restoredByUndo.isContentLoaded)
+            #expect(try spyStore.base.loadingContent(of: restoredByUndo, scope: .body).text == edited40KB)
+
+            harness.coordinator.delete(restoredByUndo)
+            harness.model.trashedItems = try spyStore.fetchTrashedItems()
+            let trashedHeader = try #require(harness.model.trashedItems.first { $0.id == editableHeader.id })
+            #expect(!trashedHeader.isContentLoaded)
+            harness.coordinator.putBack([trashedHeader])
+            let restoredExplicit = try #require(harness.currentItem(editableHeader.id))
+            #expect(!restoredExplicit.isContentLoaded)
+            #expect(try spyStore.base.loadingContent(of: restoredExplicit, scope: .body).text == edited40KB)
+
+            // 8. setSensitiveContentLifetime(.dontSave) catches a secret at char 250,000 via containsRestSecret!
+            let secretToken250K = ["ghp", "_", String(repeating: "k9M2pQ4r", count: 5)].joined()
+            let tailSecret250KText = String(repeating: "p", count: 250_000) + " " + secretToken250K
+            let tailSecretSaved = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(kind: .text, text: tailSecret250KText, copiedAt: baseTime.addingTimeInterval(90)),
+                convertingExternalAssets: true
+            )
+            harness.coordinator.loadHistory(sweepsCaches: false)
+            let tailSecretHeader = try #require(harness.currentItem(tailSecretSaved.id))
+            #expect(!tailSecretHeader.isContentLoaded)
+            #expect(!tailSecretHeader.containsPreviewSecret)
+            #expect(tailSecretHeader.containsRestSecret)
+
+            let confirmDeletionModal = OSAllocatedUnfairLock(initialState: true)
+            RunLoop.main.perform(inModes: [.modalPanel]) {
+                guard confirmDeletionModal.withLock({ state in
+                    defer { state = false }
+                    return state
+                }) else { return }
+                MainActor.assumeIsolated {
+                    if NSApp.modalWindow != nil {
+                        NSApp.stopModal(withCode: .alertFirstButtonReturn)
+                    }
+                }
+            }
+            harness.coordinator.setSensitiveContentLifetime(ContentLifetime.dontSave)
+            confirmDeletionModal.withLock { $0 = false }
+            #expect(harness.currentItem(tailSecretSaved.id) == nil)
+            #expect(try !spyStore.base.fetchAll().contains { $0.id == tailSecretSaved.id })
+            harness.coordinator.setSensitiveContentLifetime(ContentLifetime.keep)
+
+            // 9. Tag rename & delete update both model.items and model.trashedItems in one batch with 0 N+1 upserts!
+            let batchTag = try spyStore.createTag(name: "InitialBatchTag", color: "#00AA88")
+            harness.model.tags = try spyStore.fetchTags()
+
+            let activeTaggedA = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(kind: .text, text: "Active tagged A", copiedAt: baseTime.addingTimeInterval(100), tags: [batchTag.id]),
+                convertingExternalAssets: true
+            )
+            let activeTaggedB = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(kind: .text, text: "Active tagged B", copiedAt: baseTime.addingTimeInterval(101), tags: [batchTag.id]),
+                convertingExternalAssets: true
+            )
+            let trashedTagged = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(kind: .text, text: "Trashed tagged C", copiedAt: baseTime.addingTimeInterval(102), tags: [batchTag.id]),
+                convertingExternalAssets: true
+            )
+            try spyStore.moveToTrash(ids: [trashedTagged.id], at: baseTime.addingTimeInterval(103))
+            harness.coordinator.loadHistory(sweepsCaches: false)
+            harness.model.trashedItems = try spyStore.fetchTrashedItems()
+
+            let revActiveBefore = try #require(harness.currentItem(activeTaggedA.id)).searchRevision
+            let revTrashedBefore = try #require(harness.model.trashedItems.first { $0.id == trashedTagged.id }).searchRevision
+
+            spyStore.resetRecordedCalls()
+            harness.coordinator.updateTag(batchTag, name: "RenamedBatchTag", color: .systemOrange)
+            #expect(spyStore.upsertCallIDs.isEmpty, "updateTag must not run N+1 upserts")
+            #expect(spyStore.loadingContentCalls.isEmpty, "updateTag must not hydrate bodies")
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+            #expect(harness.model.trashedItems.allSatisfy { !$0.isContentLoaded })
+            #expect(try #require(harness.currentItem(activeTaggedA.id)).searchRevision != revActiveBefore)
+            #expect(try #require(harness.model.trashedItems.first { $0.id == trashedTagged.id }).searchRevision != revTrashedBefore)
+
+            // Headless search immediately matches RenamedBatchTag in both Active and Trash.
+            harness.model.searchQuery = "RenamedBatchTag"
+            #expect(Set(harness.model.filteredItems.map(\.id)) == [activeTaggedA.id, activeTaggedB.id])
+            harness.model.selectedHistoryFilterContentTypes = [.trash]
+            #expect(harness.model.filteredItems.map(\.id) == [trashedTagged.id])
+            harness.model.selectedHistoryFilterContentTypes = []
+            harness.model.searchQuery = ""
+
+            let renamedTag = try #require(harness.model.tags.first { $0.id == batchTag.id })
+            spyStore.resetRecordedCalls()
+            harness.coordinator.deleteTag(renamedTag)
+            #expect(spyStore.upsertCallIDs.isEmpty, "deleteTag must not run N+1 upserts")
+            #expect(spyStore.loadingContentCalls.isEmpty, "deleteTag must not hydrate bodies")
+            #expect(try #require(harness.currentItem(activeTaggedA.id)).tags.isEmpty)
+            #expect(try #require(harness.model.trashedItems.first { $0.id == trashedTagged.id }).tags.isEmpty)
+
+            harness.model.searchQuery = "RenamedBatchTag"
+            #expect(harness.model.filteredItems.isEmpty)
+            harness.model.searchQuery = ""
+        }
+    }
+
     @Suite
     struct PreferencesSavingTests {
         struct ShortcutRow: Sendable, CustomTestStringConvertible {

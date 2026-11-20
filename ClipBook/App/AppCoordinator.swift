@@ -26,7 +26,7 @@ final class AppCoordinator: ObservableObject {
   let model: AppModel
   
   private let preferencesStore: PreferencesStore
-  private let historyStore: HistoryStore
+  nonisolated let historyStore: any HistoryStore
   private let clipboardMonitor: PasteboardMonitor
   private let pasteService: PasteService
   private let globalShortcuts: GlobalShortcutService
@@ -259,6 +259,20 @@ final class AppCoordinator: ObservableObject {
     }
   }
 
+  nonisolated func fetchSearchTexts(
+    for ids: [UUID],
+    trashed: Bool,
+    tagNamesByID: [Tag.ID: String],
+    isCancelled: () -> Bool
+  ) throws -> [String?]? {
+    try historyStore.fetchSearchTexts(
+      for: ids,
+      trashed: trashed,
+      tagNamesByID: tagNamesByID,
+      isCancelled: isCancelled
+    )
+  }
+
   func cancelBackgroundMaintenance() {
     cancelLinkPreviewTasks()
     retentionTimer?.invalidate()
@@ -415,8 +429,8 @@ final class AppCoordinator: ObservableObject {
     DispatchQueue.global(qos: .userInitiated).async {
       let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
       do {
-        // The archive keeps the formatting, which the history's items come without.
-        let items = items.map { (try? historyStore.loadingFormatting(of: $0)) ?? $0 }
+        // The archive keeps the full body and formatting, which the history's items come without.
+        let items = items.map { (try? historyStore.loadingContent(of: $0, scope: .full)) ?? $0 }
         try archiveService.export(items: items, tags: tags, to: url, progress: reportProgress)
         let result = ClipBookArchiveExportResult(url: url, itemCount: items.count, tagCount: tags.count)
         DispatchQueue.main.async {
@@ -1904,11 +1918,60 @@ final class AppCoordinator: ObservableObject {
   }
 
   func canMerge(_ items: [ClipboardItem]) -> Bool {
-    items.count > 1 && items.allSatisfy { mergeText(for: $0) != nil }
+    items.count > 1 && items.allSatisfy { item in
+      switch item.kind {
+      case .text, .richText, .link, .email, .color:
+        return item.hasTextContent
+      case .file:
+        return !item.filePaths.isEmpty
+      case .image:
+        return false
+      }
+    }
+  }
+
+  private static func hasMultipleNonEmptyLines(in text: String) -> Bool {
+    guard text.contains(where: \.isNewline) else {
+      return false
+    }
+    var nonEmptyLineCount = 0
+    var index = text.startIndex
+    while index < text.endIndex {
+      let lineEnd = text[index...].firstIndex(where: \.isNewline) ?? text.endIndex
+      if text[index..<lineEnd].unicodeScalars.contains(where: { !CharacterSet.whitespacesAndNewlines.contains($0) }) {
+        nonEmptyLineCount += 1
+        if nonEmptyLineCount > 1 {
+          return true
+        }
+      }
+      guard lineEnd < text.endIndex else {
+        break
+      }
+      index = text.index(after: lineEnd)
+    }
+    return false
   }
 
   func canSplit(_ item: ClipboardItem) -> Bool {
-    splitTextParts(for: item).count > 1
+    guard (item.kind == .text || item.kind == .richText), item.hasTextContent else {
+      return false
+    }
+    if item.isContentLoaded {
+      guard let text = item.text else {
+        return false
+      }
+      return Self.hasMultipleNonEmptyLines(in: text)
+    }
+    if let textPreview = item.textPreview, Self.hasMultipleNonEmptyLines(in: textPreview) {
+      return true
+    }
+    let previewCoversFullText = item.characterCount <= ClipboardItem.textPreviewBodyLimit
+      && (item.textPreview?.utf16.count ?? 0) < ClipboardItem.textPreviewMaxUTF16Length - 2
+      && !(item.hasFormatting && item.textPreview == nil)
+    if previewCoversFullText {
+      return false
+    }
+    return splitTextParts(for: item).count > 1
   }
 
   func split(_ item: ClipboardItem) {
@@ -1951,10 +2014,11 @@ final class AppCoordinator: ObservableObject {
           savedItems.append(saved)
         }
       }
-      model.items.insert(contentsOf: savedItems, at: 0)
-      model.selectedItemID = savedItems.first?.id
-      model.selectedItemIDs = Set(savedItems.map(\.id))
-      model.selectedItemIDsInSelectionOrder = savedItems.map(\.id)
+      let unloadedSavedItems = savedItems.map { $0.unloadingContent() }
+      model.items.insert(contentsOf: unloadedSavedItems, at: 0)
+      model.selectedItemID = unloadedSavedItems.first?.id
+      model.selectedItemIDs = Set(unloadedSavedItems.map(\.id))
+      model.selectedItemIDsInSelectionOrder = unloadedSavedItems.map(\.id)
       if savedItems.contains(where: { $0.expiresAt != nil }) {
         deleteExpiredItems()
       }
@@ -2206,6 +2270,8 @@ final class AppCoordinator: ObservableObject {
       return
     }
 
+    let item = (try? historyStore.loadingContent(of: item, scope: .body)) ?? item
+
     do {
       guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         try moveToTrash([item])
@@ -2242,6 +2308,7 @@ final class AppCoordinator: ObservableObject {
       return
     }
 
+    let item = (try? historyStore.loadingContent(of: item, scope: .body)) ?? item
     guard let text = item.text else {
       model.lastError = "\(item.kind.title) cannot be transformed."
       return
@@ -2338,7 +2405,25 @@ final class AppCoordinator: ObservableObject {
       } else {
         model.tags.append(updatedTag)
       }
-      try rebuildSearchTextForItemsReferencingTag(tag.id)
+      let tagNamesByID = Dictionary(uniqueKeysWithValues: model.tags.map { ($0.id, $0.name) })
+      let updatedItems = model.items.compactMap { item -> ClipboardItem? in
+        guard item.tags.contains(tag.id) else {
+          return nil
+        }
+        return item.rebuildingSearchText(tagNames: item.tags.compactMap { tagNamesByID[$0] })
+      }
+      if !updatedItems.isEmpty {
+        model.replace(updatedItems)
+      }
+      if model.trashedItems.contains(where: { $0.tags.contains(tag.id) }) {
+        model.trashedItems = model.trashedItems.map { item in
+          guard item.tags.contains(tag.id) else {
+            return item
+          }
+          return item.rebuildingSearchText(tagNames: item.tags.compactMap { tagNamesByID[$0] })
+            .unloadingContent()
+        }
+      }
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -2346,8 +2431,12 @@ final class AppCoordinator: ObservableObject {
 
   func deleteTag(_ tag: Tag) {
     do {
+      try historyStore.deleteTag(id: tag.id)
+      model.tags.removeAll { $0.id == tag.id }
+      model.selectedHistoryFilterTagIDs.remove(tag.id)
+
       let remainingTagNamesByID = Dictionary(
-        uniqueKeysWithValues: model.tags.lazy.filter { $0.id != tag.id }.map { ($0.id, $0.name) }
+        uniqueKeysWithValues: model.tags.map { ($0.id, $0.name) }
       )
       let updatedItems = model.items.compactMap { item -> ClipboardItem? in
         guard item.tags.contains(tag.id) else {
@@ -2357,17 +2446,19 @@ final class AppCoordinator: ObservableObject {
         updated.tags.removeAll { $0 == tag.id }
         return updated.rebuildingSearchText(tagNames: updated.tags.compactMap { remainingTagNamesByID[$0] })
       }
-
-      try historyStore.performInTransaction {
-        try historyStore.deleteTag(id: tag.id)
-        for updated in updatedItems {
-          try historyStore.upsert(updated)
-        }
-      }
-      model.tags.removeAll { $0.id == tag.id }
-      model.selectedHistoryFilterTagIDs.remove(tag.id)
       if !updatedItems.isEmpty {
         model.replace(updatedItems)
+      }
+      if model.trashedItems.contains(where: { $0.tags.contains(tag.id) }) {
+        model.trashedItems = model.trashedItems.map { item in
+          guard item.tags.contains(tag.id) else {
+            return item
+          }
+          var updated = item
+          updated.tags.removeAll { $0 == tag.id }
+          return updated.rebuildingSearchText(tagNames: updated.tags.compactMap { remainingTagNamesByID[$0] })
+            .unloadingContent()
+        }
       }
     } catch {
       model.lastError = error.localizedDescription
@@ -2406,32 +2497,15 @@ final class AppCoordinator: ObservableObject {
     }
   }
 
-  private func rebuildSearchTextForItemsReferencingTag(_ tagID: Tag.ID) throws {
-    let tagNamesByID = Dictionary(uniqueKeysWithValues: model.tags.map { ($0.id, $0.name) })
-    let updatedItems = model.items.compactMap { item -> ClipboardItem? in
-      guard item.tags.contains(tagID) else {
-        return nil
-      }
-      return item.rebuildingSearchText(tagNames: item.tags.compactMap { tagNamesByID[$0] })
-    }
-    guard !updatedItems.isEmpty else {
-      return
-    }
-
-    try historyStore.performInTransaction {
-      for updated in updatedItems {
-        try historyStore.upsert(updated)
-      }
-    }
-    model.replace(updatedItems)
-  }
-
   func openInBrowser(_ item: ClipboardItem) {
     guard allowsUsingHistoryItems() else {
       return
     }
 
-    guard let url = item.browserURL else {
+    let resolvedItem = (!item.isContentLoaded && item.browserURL == nil)
+      ? loadingContent(of: item, scope: .body)
+      : item
+    guard let url = resolvedItem.browserURL else {
       return
     }
     NSWorkspace.shared.open(url)
@@ -2514,9 +2588,12 @@ final class AppCoordinator: ObservableObject {
       return
     }
 
+    let resolvedItem = (!item.isContentLoaded && item.kind == .link && item.browserURL == nil)
+      ? loadingContent(of: item, scope: .body)
+      : item
     // A link opens in the browser that handles its address, the same
     // application the preview names on its Open in ... button.
-    guard let url = item.quickLookURL ?? item.browserURL,
+    guard let url = resolvedItem.quickLookURL ?? resolvedItem.browserURL,
           let application = AssociatedApplication.forOpening(url, iconSize: NSSize(width: 22, height: 22)) else {
       return
     }
@@ -2575,10 +2652,15 @@ final class AppCoordinator: ObservableObject {
 
   private func updateLinkPreview(for item: ClipboardItem, force: Bool) {
     guard item.kind == .link,
-          let url = item.browserURL,
           force || item.linkPreviewDetails == nil,
           force || pendingLinkPreviewModelUpdatesByItemID[item.id] == nil,
           linkPreviewTasksByItemID[item.id] == nil else {
+      return
+    }
+    let resolvedItem = (!item.isContentLoaded && item.browserURL == nil)
+      ? loadingContent(of: item, scope: .body)
+      : item
+    guard let url = resolvedItem.browserURL else {
       return
     }
 
@@ -2731,9 +2813,9 @@ final class AppCoordinator: ObservableObject {
     return representation.representation(using: .png, properties: [:])
   }
 
-  /// The item with the formatting its history copy comes without.
-  func loadingFormatting(of item: ClipboardItem) -> ClipboardItem {
-    (try? historyStore.loadingFormatting(of: item)) ?? item
+  /// The item with its stored content read for the requested scope.
+  func loadingContent(of item: ClipboardItem, scope: ClipboardContentScope = .full) -> ClipboardItem {
+    (try? historyStore.loadingContent(of: item, scope: scope)) ?? item
   }
 
   private nonisolated static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
@@ -2966,7 +3048,8 @@ final class AppCoordinator: ObservableObject {
   private func mergeText(for item: ClipboardItem) -> String? {
     switch item.kind {
     case .text, .richText, .link, .email, .color:
-      return item.text
+      let loaded = item.isContentLoaded ? item : loadingContent(of: item, scope: .body)
+      return loaded.text
     case .file:
       return item.filePaths.isEmpty ? nil : item.filePaths.joined(separator: "\n")
     case .image:
@@ -2975,8 +3058,11 @@ final class AppCoordinator: ObservableObject {
   }
 
   private func splitTextParts(for item: ClipboardItem) -> [String] {
-    guard item.kind == .text || item.kind == .richText,
-          let text = item.text,
+    guard item.kind == .text || item.kind == .richText else {
+      return []
+    }
+    let loaded = item.isContentLoaded ? item : loadingContent(of: item, scope: .body)
+    guard let text = loaded.text,
           text.contains(where: \.isNewline) else {
       return []
     }
@@ -2988,11 +3074,31 @@ final class AppCoordinator: ObservableObject {
   }
 
   private func deleteExistingMatches(for item: ClipboardItem) throws {
-    for existingItem in model.items where existingItem.kind == item.kind && existingItem.searchText == item.searchText {
+    var deletedIDs: Set<ClipboardItem.ID> = []
+    for existingItem in model.items where
+      existingItem.id != item.id
+      && existingItem.kind == item.kind
+      && !existingItem.isKeptByUser
+      && existingItem.title == nil
+      && existingItem.linkPreviewDetails == nil
+      && existingItem.sourceAppName == item.sourceAppName
+      && existingItem.characterCount == item.characterCount
+      && existingItem.textPreview == item.textPreview
+    {
+      let loaded = try historyStore.loadingContent(of: existingItem, scope: .body)
+      guard loaded.text == item.text,
+            (loaded.qrCodeText ?? "").isEmpty,
+            loaded.filePaths == item.filePaths else {
+        continue
+      }
       try historyStore.delete(existingItem.id)
-      let remainingItems = model.items.filter { $0.id != existingItem.id }
+      deletedIDs.insert(existingItem.id)
+      let remainingItems = model.items.filter { !deletedIDs.contains($0.id) }
       removeFilePreviewFiles(for: [existingItem], remainingItems: remainingItems)
       removeAssetFiles(for: [existingItem], remainingItems: remainingItems)
+    }
+    if !deletedIDs.isEmpty {
+      model.remove(deletedIDs)
     }
   }
 

@@ -102,7 +102,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     init(
         directory: URL,
         keyProvider: (any DatabaseKeyProvider)? = nil,
-        loadsBodiesOnFetchAll: Bool = true
+        loadsBodiesOnFetchAll: Bool = false
     ) {
         self.directory = directory
         self.loadsBodiesOnFetchAll = loadsBodiesOnFetchAll
@@ -150,6 +150,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
 
+        SVGImageRenderer.unregisterTextLoader(ownerID: instanceID)
         ImageAssetStore.unregisterKeys(forSupportDirectory: directory, ownerID: instanceID)
         ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: directory)
         ImageDragFiles.removeAll()
@@ -1203,7 +1204,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 }
 
                 let clipSQL = """
-                    SELECT c.id, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
+                    SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
                            cc.text, cc.qrCodeText
                     FROM clips c
                     LEFT JOIN clip_contents cc ON cc.clipId = c.id
@@ -1262,7 +1263,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 }
 
                 let clipSQL = """
-                    SELECT c.id, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
+                    SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
                            cc.text, cc.qrCodeText
                     FROM clips c
                     LEFT JOIN clip_contents cc ON cc.clipId = c.id
@@ -1642,12 +1643,51 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             s.keys = keys
             s.lockState = .unlocked
             ImageAssetStore.registerKeys(keys, forSupportDirectory: directory, ownerID: instanceID)
+            SVGImageRenderer.registerTextLoader(
+                { [weak self] clipID in
+                    self?.loadDecryptedSVGText(for: clipID)
+                },
+                ownerID: instanceID
+            )
             return true
         }
 
         if !installed {
             closeWriterCleanly(writer)
             throw DatabaseError(resultCode: .SQLITE_MISUSE, message: "Connection is closed")
+        }
+    }
+
+    private func loadDecryptedSVGText(for clipID: UUID) -> String? {
+        guard state.withLock({
+            $0.lifecycle == .open && $0.lockState == .unlocked && $0.dbWriter != nil && $0.keys != nil
+        }) else {
+            return nil
+        }
+        return try? withRead { db, keys in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT c.isEncrypted, cc.text
+                    FROM clips c
+                    LEFT JOIN clip_contents cc ON cc.clipId = c.id
+                    WHERE c.id = ?
+                    LIMIT 1
+                    """,
+                arguments: [clipID.uuidString]
+            ) else {
+                return nil
+            }
+            let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
+            return try Self.decodeStringColumn(
+                from: row,
+                rowColumn: "text",
+                aadTable: "clip_contents",
+                aadColumn: "text",
+                clipID: clipID,
+                isEncrypted: isEncrypted,
+                keys: keys
+            )
         }
     }
 
@@ -3417,6 +3457,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         guard let clipID = UUID(uuidString: idString) else {
             return ""
         }
+        let kindRaw: String = row["kind"] ?? ClipboardKind.text.rawValue
+        let kind = ClipboardKind(rawValue: kindRaw) ?? .text
         let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
         let sourceAppName: String? = row["sourceAppName"]
 
@@ -3468,7 +3510,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return ClipboardItem.makeSearchText(
                 title: title,
                 text: text,
-                filePaths: filePaths,
+                filePaths: kind == .image ? [] : filePaths,
                 tagNames: tagNames,
                 sourceAppName: sourceAppName,
                 linkPreviewDetails: linkPreviewDetails,

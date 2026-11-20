@@ -365,7 +365,7 @@ enum PasteboardAndServicesTests {
                 try pngData.write(to: pngURL)
 
                 try TestSupport.withUniquePasteboard { pasteboard in
-                    let service = PasteService(pasteboard: pasteboard, loadFormatting: { $0 })
+                    let service = PasteService(pasteboard: pasteboard, loadContent: { item, _ in item })
                     try service.copy(ClipboardItem.fixture(kind: .image, text: nil, assetPath: pngURL.path), variant: .standard)
 
                     let item = try #require(pasteboard.pasteboardItems?.first)
@@ -382,7 +382,7 @@ enum PasteboardAndServicesTests {
                 try TestSupport.makePDFData().write(to: fileURL)
 
                 try TestSupport.withUniquePasteboard { pasteboard in
-                    let service = PasteService(pasteboard: pasteboard, loadFormatting: { $0 })
+                    let service = PasteService(pasteboard: pasteboard, loadContent: { item, _ in item })
                     try service.copy(ClipboardItem.fixture(kind: .file, text: nil, filePaths: [fileURL.path]), variant: .standard)
 
                     let urls = pasteboard.readObjects(
@@ -421,7 +421,7 @@ enum PasteboardAndServicesTests {
                 ]
 
                 try TestSupport.withUniquePasteboard { pasteboard in
-                    let service = PasteService(pasteboard: pasteboard, loadFormatting: { $0 })
+                    let service = PasteService(pasteboard: pasteboard, loadContent: { item, _ in item })
                     for testCase in cases {
                         try service.copy(testCase.item, variant: testCase.variant)
 
@@ -503,7 +503,7 @@ enum PasteboardAndServicesTests {
                 ]
 
                 try TestSupport.withUniquePasteboard { pasteboard in
-                    let service = PasteService(pasteboard: pasteboard, loadFormatting: { $0 })
+                    let service = PasteService(pasteboard: pasteboard, loadContent: { item, _ in item })
 
                     for entry in sensitiveCases {
                         try service.copy(entry.item, variant: entry.variant)
@@ -694,7 +694,8 @@ enum PasteboardAndServicesTests {
                 pasteboard.clearContents()
                 pasteboard.setString("Before pause", forType: .string)
                 await monitor.pollAndWaitForDelivery()
-                #expect(delegate.items.map(\.text) == ["Before pause"])
+                #expect(delegate.items.allSatisfy { !$0.isContentLoaded })
+                #expect(delegate.items.map(\.previewText) == ["Before pause"])
 
                 monitor.isPaused = true
                 pasteboard.clearContents()
@@ -703,12 +704,12 @@ enum PasteboardAndServicesTests {
 
                 monitor.isPaused = false
                 await monitor.pollAndWaitForDelivery()
-                #expect(delegate.items.map(\.text) == ["Before pause"])
+                #expect(delegate.items.map(\.previewText) == ["Before pause"])
 
                 pasteboard.clearContents()
                 pasteboard.setString("After resume", forType: .string)
                 await monitor.pollAndWaitForDelivery()
-                #expect(delegate.items.map(\.text) == ["After resume", "Before pause"])
+                #expect(delegate.items.map(\.previewText) == ["After resume", "Before pause"])
             }
         }
 
@@ -746,7 +747,7 @@ enum PasteboardAndServicesTests {
 
                 pasteboard.setString("Arrived late", forType: .string)
                 await monitor.pollAndWaitForDelivery()
-                #expect(delegate.items.map(\.text) == ["Arrived late"])
+                #expect(delegate.items.map(\.previewText) == ["Arrived late"])
             }
         }
 
@@ -759,7 +760,7 @@ enum PasteboardAndServicesTests {
 
                 await fixture.monitor.pollAndWaitForDelivery()
 
-                #expect(fixture.delegate.items.map(\.text) == ["Copied"])
+                #expect(fixture.delegate.items.map(\.previewText) == ["Copied"])
             }
         }
 
@@ -795,7 +796,7 @@ enum PasteboardAndServicesTests {
                 fixture.clock.advance(by: 0.6)
                 await fixture.deliverUnchanged(changeCount: 1)
                 #expect(fixture.delegate.capturedHistory.count == 1)
-                #expect(fixture.delegate.items.first?.text == "First")
+                #expect(fixture.delegate.items.first?.previewText == "First")
 
                 // Double-copy within 0.5s merges into the previous item.
                 fixture.clock.advance(by: 1)
@@ -805,7 +806,7 @@ enum PasteboardAndServicesTests {
                 fixture.clock.advance(by: 0.1)
                 await fixture.deliver(.text("Second"), changeCount: 3)
                 #expect(fixture.delegate.capturedHistory.count == 2)
-                #expect(fixture.delegate.items.first?.text == "First Second")
+                #expect(fixture.delegate.items.first?.previewText == "First Second")
                 #expect(fixture.pasteboard.string(forType: .string) == "First Second")
                 #expect(fixture.pasteboard.string(forType: PasteboardMonitor.ghostType) == "1")
             }
@@ -828,8 +829,8 @@ enum PasteboardAndServicesTests {
                 await fixture.deliver(.text("Seq B"), changeCount: 2)
                 let expectedSequenceID = Date(timeIntervalSince1970: 1_700_000_000)
                 #expect(delegate.items.count == 2)
-                let itemB = try #require(delegate.items.first { $0.text == "Seq B" })
-                let itemA = try #require(delegate.items.first { $0.text == "Seq A" })
+                let itemB = try #require(delegate.items.first { $0.previewText == "Seq B" })
+                let itemA = try #require(delegate.items.first { $0.previewText == "Seq A" })
                 #expect(itemA.copySequenceID == expectedSequenceID)
                 #expect(itemA.copySequenceOrder == 0)
                 #expect(itemB.copySequenceID == expectedSequenceID)
@@ -839,13 +840,13 @@ enum PasteboardAndServicesTests {
                 fixture.monitor.markCopySequencePasteBoundary()
                 fixture.clock.advance(by: 1)
                 await fixture.deliver(.text("Seq C after paste"), changeCount: 3)
-                let itemC = try #require(delegate.items.first { $0.text == "Seq C after paste" })
+                let itemC = try #require(delegate.items.first { $0.previewText == "Seq C after paste" })
                 #expect(itemC.copySequenceID == nil)
                 #expect(itemC.copySequenceOrder == nil)
 
                 fixture.clock.advance(by: 35)
                 await fixture.deliver(.text("Seq D after 35s"), changeCount: 4)
-                let itemD = try #require(delegate.items.first { $0.text == "Seq D after 35s" })
+                let itemD = try #require(delegate.items.first { $0.previewText == "Seq D after 35s" })
                 #expect(itemD.copySequenceID == nil)
                 #expect(itemD.copySequenceOrder == nil)
             }
@@ -936,18 +937,20 @@ enum PasteboardAndServicesTests {
 
                 try await PasteboardAndServicesTests.withMonitor { fixture in
                     await fixture.deliver(Self.fileContent([imageURL.path]), changeCount: 1)
-                    var stored = try #require(fixture.delegate.items.first)
+                    let stored = try #require(fixture.delegate.items.first)
                     _ = await TestSupport.waitUntil { !fixture.delegate.recognizedEvents.isEmpty }
 
                     // What the coordinator does with the recognized text.
-                    stored.text = "Text read from the scan"
-                    try fixture.store.upsert(stored)
+                    var toPersist = try fixture.store.loadingContent(of: stored, scope: .body)
+                    toPersist.text = "Text read from the scan"
+                    try fixture.store.upsert(toPersist)
 
                     fixture.clock.advance(by: 60)
                     await fixture.deliver(Self.fileContent([imageURL.path]), changeCount: 2)
                     let recopied = try #require(fixture.delegate.items.first)
                     #expect(recopied.id == stored.id)
-                    #expect(recopied.text == "Text read from the scan")
+                    #expect(!recopied.isContentLoaded)
+                    #expect(try fixture.store.loadingContent(of: recopied, scope: .body).text == "Text read from the scan")
                     #expect(recopied.copyCount == stored.copyCount + 1)
                 }
             }
@@ -962,7 +965,7 @@ enum PasteboardAndServicesTests {
                     await fixture.deliver(.text(text), changeCount: index + 1)
                     // The delegate has the item, and the store holds it, once the delivery has run.
                     #expect(fixture.delegate.capturedHistory.count == index + 1)
-                    let stored = (try? fixture.store.fetchAll()) ?? []
+                    let stored = try fixture.store.fetchAll().map { try fixture.store.loadingContent(of: $0, scope: .body) }
                     #expect(stored.contains { $0.text == text })
                 }
                 #expect(fixture.delegate.capturedHistory.map(\.item.text) == ["First", "Second", "Third"])
@@ -1000,12 +1003,19 @@ enum PasteboardAndServicesTests {
                 let captured = try #require(fixture.delegate.items.first)
                 #expect(captured.id == id)
                 #expect(captured.kind == .image)
-                #expect(captured.searchText.contains("OCR Invoice"))
-                #expect(captured.searchText.contains("https://qr.example"))
-                #expect(captured.searchText.contains("Notes"))
-                #expect(!captured.searchText.contains(id.uuidString))
-                #expect(!captured.searchText.localizedCaseInsensitiveContains("png"))
-                #expect(!captured.searchText.localizedCaseInsensitiveContains("enc"))
+                #expect(!captured.isContentLoaded)
+                #expect(captured.searchText.isEmpty)
+
+                let rawCaptured = try #require(fixture.delegate.capturedHistory.first?.item)
+                let hydrated = try fixture.store.loadingContent(of: captured, scope: .body)
+                for candidate in [rawCaptured, hydrated] {
+                    #expect(candidate.searchText.contains("OCR Invoice"))
+                    #expect(candidate.searchText.contains("https://qr.example"))
+                    #expect(candidate.searchText.contains("Notes"))
+                    #expect(!candidate.searchText.contains(id.uuidString))
+                    #expect(!candidate.searchText.localizedCaseInsensitiveContains("png"))
+                    #expect(!candidate.searchText.localizedCaseInsensitiveContains("enc"))
+                }
             }
         }
 

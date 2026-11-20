@@ -70,8 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     preferencesStore = PreferencesStore(userDefaults: userDefaults)
     historyStore = GRDBHistoryStore(directory: supportDirectory)
     model = AppModel()
-    pasteService = PasteService { [historyStore] item in
-      (try? historyStore.loadingFormatting(of: item)) ?? item
+    pasteService = PasteService { [historyStore] item, scope in
+      (try? historyStore.loadingContent(of: item, scope: scope)) ?? item
     }
     globalShortcuts = GlobalShortcutService(isEnabled: !Self.isRunningTests)
     updateService = Self.isRunningTests ? DisabledUpdateService() : SparkleUpdateService()

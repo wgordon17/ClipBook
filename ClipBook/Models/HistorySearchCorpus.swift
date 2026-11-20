@@ -7,13 +7,59 @@ import os
 nonisolated final class HistorySearchCorpus: Sendable {
     let revision: Int
     let ids: [UUID]
+    let revisions: [UInt64]
     let texts: [String]
+    let tagNamesByID: [Tag.ID: String]
+    let hasCompleteTexts: Bool
     fileprivate let cachedIndexByID = OSAllocatedUnfairLock<[UUID: Int]?>(initialState: nil)
 
-    init(revision: Int, ids: [UUID], texts: [String]) {
+    init(
+        revision: Int,
+        ids: [UUID],
+        revisions: [UInt64] = [],
+        texts: [String],
+        tagNamesByID: [Tag.ID: String] = [:],
+        hasCompleteTexts: Bool = true
+    ) {
         self.revision = revision
         self.ids = ids
+        self.revisions = revisions.count == ids.count
+            ? revisions
+            : Array(repeating: 0, count: ids.count)
         self.texts = texts
+        self.tagNamesByID = tagNamesByID
+        self.hasCompleteTexts = hasCompleteTexts
+    }
+
+    func indexByID() -> [UUID: Int] {
+        if let cached = cachedIndexByID.withLock({ $0 }) {
+            return cached
+        }
+        var built = [UUID: Int](minimumCapacity: ids.count)
+        for (index, id) in ids.enumerated() {
+            built[id] = index
+        }
+        let indexByID = built
+        return cachedIndexByID.withLock { state in
+            if let existing = state {
+                return existing
+            }
+            state = indexByID
+            return indexByID
+        }
+    }
+
+    func reusableText(for item: ClipboardItem, tagNamesByID: [Tag.ID: String]) -> String? {
+        guard hasCompleteTexts,
+              item.searchRevision != 0,
+              let index = indexByID()[item.id],
+              index < revisions.count,
+              index < texts.count,
+              revisions[index] == item.searchRevision,
+              item.tags.isEmpty || item.tags.allSatisfy({ self.tagNamesByID[$0] == tagNamesByID[$0] }) else {
+            return nil
+        }
+        return texts[index]
     }
 }
 

@@ -78,9 +78,11 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 #expect(activeItems.count == 1)
                 let fetched = try #require(activeItems.first)
                 #expect(fetched.id == original.id)
+                #expect(!fetched.isContentLoaded)
                 #expect(fetched.title == "Custom Diagram Title")
-                #expect(fetched.text == "Recognized OCR Text From Vision")
-                #expect(fetched.qrCodeText == "https://example.com/qr")
+                let hydratedFetched = try store.loadingContent(of: fetched, scope: .body)
+                #expect(hydratedFetched.text == "Recognized OCR Text From Vision")
+                #expect(hydratedFetched.qrCodeText == "https://example.com/qr")
             }
         }
 
@@ -145,8 +147,10 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 #expect(reloadedUnloaded.title == "Pinned Rich Clip")
                 #expect(!reloadedUnloaded.isFormattingLoaded)
 
-                let withFormatting = try store.loadingFormatting(of: reloadedUnloaded)
+                let withFormatting = try store.loadingContent(of: reloadedUnloaded, scope: .full)
+                #expect(withFormatting.isContentLoaded)
                 #expect(withFormatting.isFormattingLoaded)
+                #expect(withFormatting.text == "Rich HTML Body")
                 #expect(withFormatting.html == html)
                 #expect(withFormatting.rtfData == rtfData)
 
@@ -157,7 +161,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
 
                 let afterStrip = try Self.fetchItem(richItem.id, from: store)
                 #expect(!afterStrip.hasFormatting)
-                let loadedAfterStrip = try store.loadingFormatting(of: afterStrip)
+                let loadedAfterStrip = try store.loadingContent(of: afterStrip, scope: .full)
                 #expect(loadedAfterStrip.html == nil)
                 #expect(loadedAfterStrip.rtfData == nil)
             }
@@ -374,7 +378,8 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     let activeByID = Dictionary(uniqueKeysWithValues: activeItems.map { ($0.id, $0) })
 
                     let migratedSecretText = try #require(activeByID[secretTextID])
-                    #expect(migratedSecretText.text == secretPlainText)
+                    #expect(!migratedSecretText.isContentLoaded)
+                    #expect(try store.loadingContent(of: migratedSecretText, scope: .body).text == secretPlainText)
                     #expect(migratedSecretText.isFavorite)
                     #expect(migratedSecretText.favoriteOrder == 3)
                     #expect(abs(migratedSecretText.copiedAt.timeIntervalSince1970 - subSecondCopiedAt) < 0.000_5)
@@ -386,15 +391,17 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     }
 
                     let migratedSecretRich = try #require(activeByID[secretRichID])
-                    #expect(migratedSecretRich.text == "Benign Rich Heading")
+                    #expect(!migratedSecretRich.isContentLoaded)
                     #expect(migratedSecretRich.hasFormatting)
                     #expect(migratedSecretRich.htmlDigest == expectedHTMLDigest)
                     let hydratedRich = try store.loadingContent(of: migratedSecretRich, scope: .full)
+                    #expect(hydratedRich.text == "Benign Rich Heading")
                     #expect(hydratedRich.html == secretHTML)
                     #expect(hydratedRich.rtfData == secretRTFData)
 
                     let migratedSensImage = try #require(activeByID[sensitiveImageID])
-                    #expect(migratedSensImage.qrCodeText == secretQRText)
+                    #expect(!migratedSensImage.isContentLoaded)
+                    #expect(try store.loadingContent(of: migratedSensImage, scope: .body).qrCodeText == secretQRText)
                     #expect(migratedSensImage.imageDigest == expectedSensitiveImageDigest)
                     #expect(migratedSensImage.imageDimensions?.width == 40)
                     #expect(migratedSensImage.imageDimensions?.height == 30)
@@ -494,8 +501,10 @@ enum SQLiteHistoryStoreAndArchiveTests {
 
                     let reopenedActive = try reopenedStore.fetchAll()
                     let reopenedByID = Dictionary(uniqueKeysWithValues: reopenedActive.map { ($0.id, $0) })
-                    #expect(reopenedByID[secretTextID]?.copyCount == 3)
-                    #expect(reopenedByID[secretTextID]?.text == secretPlainText)
+                    let reopenedSecretTextHeader = try #require(reopenedByID[secretTextID])
+                    #expect(!reopenedSecretTextHeader.isContentLoaded)
+                    #expect(reopenedSecretTextHeader.copyCount == 3)
+                    #expect(try reopenedStore.loadingContent(of: reopenedSecretTextHeader, scope: .body).text == secretPlainText)
                     #expect(reopenedByID[sensitiveImageID]?.imageDigest == expectedSensitiveImageDigest)
                     #expect(reopenedByID[plainImageID]?.copyCount == 2)
 
@@ -1135,7 +1144,8 @@ enum SQLiteHistoryStoreAndArchiveTests {
 
                 // Upgraded item still decrypts cleanly via GRDBHistoryStore.
                 let fetchedUpgraded = try #require(try store.fetchAll().first { $0.id == upgradeTarget.id })
-                #expect(fetchedUpgraded.text == canaryUpgradePlain)
+                #expect(!fetchedUpgraded.isContentLoaded)
+                #expect(try store.loadingContent(of: fetchedUpgraded, scope: .body).text == canaryUpgradePlain)
             }
         }
 
@@ -1312,9 +1322,23 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     let byID = Dictionary(uniqueKeysWithValues: allItems.map { ($0.id, $0) })
 
                     let healthy = try #require(byID[healthyID])
-                    #expect(healthy.text == "Healthy surviving item")
+                    #expect(!healthy.isContentLoaded)
+                    #expect(healthy.previewText == "Healthy surviving item")
+                    #expect(try store.loadingContent(of: healthy, scope: .body).text == "Healthy surviving item")
 
-                    for corruptID in [tamperedTextID, tamperedTitleID, plainAssetPathID, downgradedPNGPathID] {
+                    // tamperedTextID only tampered clip_contents.text (which unloaded fetchAll() skips);
+                    // hydrating its body or changing sensitivity strictly throws authenticationFailed.
+                    let tamperedTextHeader = try #require(byID[tamperedTextID])
+                    #expect(!tamperedTextHeader.isContentLoaded)
+                    #expect(tamperedTextHeader.title == "Valid Title")
+                    #expect(throws: HistoryStoreError.authenticationFailed) {
+                        _ = try store.loadingContent(of: tamperedTextHeader, scope: .body)
+                    }
+                    #expect(throws: HistoryStoreError.authenticationFailed) {
+                        _ = try store.setSensitivity(.notSensitive, for: tamperedTextID)
+                    }
+
+                    for corruptID in [tamperedTitleID, plainAssetPathID, downgradedPNGPathID] {
                         let placeholder = try #require(byID[corruptID])
                         #expect(placeholder.sensitivity == .sensitive)
                         #expect(placeholder.assetPath == nil)
@@ -2037,7 +2061,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 try sourceStore.upsert(imageItem)
                 try sourceStore.upsert(linkItem)
 
-                let itemsForExport = try sourceStore.fetchAll().map { try sourceStore.loadingFormatting(of: $0) }
+                let itemsForExport = try sourceStore.fetchAll().map { try sourceStore.loadingContent(of: $0, scope: .full) }
                 let tagsForExport = try sourceStore.fetchTags()
                 let sourceArchiveService = ClipBookArchiveService(
                     fileManager: fileManager,
@@ -2084,17 +2108,21 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let importedByID = Dictionary(uniqueKeysWithValues: importedItems.map { ($0.id, $0) })
 
                 let importedRich = try #require(importedByID[richItem.id])
+                #expect(!importedRich.isContentLoaded)
                 #expect(importedRich.isFavorite)
                 #expect(importedRich.favoriteOrder == 1)
                 #expect(importedRich.sensitivity == .notSensitive)
-                let loadedRich = try targetStore.loadingFormatting(of: importedRich)
+                let loadedRich = try targetStore.loadingContent(of: importedRich, scope: .full)
+                #expect(loadedRich.text == "Bold & Italic Spec")
                 #expect(loadedRich.html == "<b>Bold &amp; Italic Spec</b>")
                 #expect(loadedRich.rtfData == Data(#"{\rtf1\ansi\b Bold & Italic Spec\b0}"#.utf8))
 
                 let importedImage = try #require(importedByID[imageItem.id])
+                #expect(!importedImage.isContentLoaded)
                 #expect(importedImage.title == "Architecture Mockup")
-                #expect(importedImage.text == "OCR Diagram Text")
-                #expect(importedImage.qrCodeText == "https://example.com/mockup")
+                let loadedImage = try targetStore.loadingContent(of: importedImage, scope: .body)
+                #expect(loadedImage.text == "OCR Diagram Text")
+                #expect(loadedImage.qrCodeText == "https://example.com/mockup")
                 #expect(importedImage.imageDigest == ContentDigest.sha256(imageBytes))
                 let importedImagePath = try #require(importedImage.assetPath)
                 #expect(try Data(contentsOf: URL(fileURLWithPath: importedImagePath)) == imageBytes)

@@ -7,13 +7,16 @@ final class PasteService {
   private static let interKeyDelay: TimeInterval = 0.06
 
   private let pasteboard: NSPasteboard
-  // History items come without their formatting; this reads it for the one
-  // item being pasted or copied.
-  private let loadFormatting: (ClipboardItem) -> ClipboardItem
+  // History items come without their body and formatting; this reads the
+  // required scope for the one item being pasted or copied.
+  private let loadContent: (ClipboardItem, ClipboardContentScope) -> ClipboardItem
 
-  init(pasteboard: NSPasteboard = .general, loadFormatting: @escaping (ClipboardItem) -> ClipboardItem) {
+  init(
+    pasteboard: NSPasteboard = .general,
+    loadContent: @escaping (ClipboardItem, ClipboardContentScope) -> ClipboardItem = { item, _ in item }
+  ) {
     self.pasteboard = pasteboard
-    self.loadFormatting = loadFormatting
+    self.loadContent = loadContent
   }
 
   // The process that owned keyboard focus the last time the history panel took
@@ -144,7 +147,16 @@ final class PasteService {
 
     switch variant {
     case .plainText:
-      guard pasteboard.setString(item.previewText, forType: .string) else {
+      let hydratedItem: ClipboardItem
+      if (item.kind == .file && !item.filePaths.isEmpty)
+          || (item.kind == .image && !item.hasRecognizedText) {
+        hydratedItem = item
+      } else {
+        let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
+        hydratedItem = loadContent(item, scope)
+      }
+      isConcealed = isConcealed || SensitiveContent.shouldEncryptAtRest(hydratedItem)
+      guard pasteboard.setString(hydratedItem.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }
     case .filePath:
@@ -214,7 +226,7 @@ final class PasteService {
       pasteboard.writeObjects(urls as [NSURL])
       return item
     case .richText:
-      let item = loadFormatting(item)
+      let item = loadContent(item, .full)
       if let rtfData = item.rtfData {
         pasteboard.setData(rtfData, forType: .rtf)
       }
@@ -226,6 +238,8 @@ final class PasteService {
       }
       return item
     default:
+      let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
+      let item = loadContent(item, scope)
       guard pasteboard.setString(item.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }

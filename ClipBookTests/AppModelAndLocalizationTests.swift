@@ -243,7 +243,9 @@ enum AppModelAndLocalizationTests {
 
             #expect(model.items.map(\.id) == [activeItem.id])
             #expect(model.trashedItems.count == 1)
-            #expect(model.trashedItems.first?.text == "Recognized OCR in trash")
+            #expect(model.trashedItems.first?.isContentLoaded == false)
+            #expect(model.trashedItems.first?.hasRecognizedText == true)
+            #expect(model.trashedItems.first?.previewText == "Recognized OCR in trash")
 
             model.replace(unloadedTrashedNotInMemory)
             #expect(model.items.map(\.id) == [activeItem.id])
@@ -278,7 +280,8 @@ enum AppModelAndLocalizationTests {
             model.replace([newItem, other, newItemLater])
 
             #expect(model.items.map(\.id) == [newItem.id, other.id, existing.id])
-            #expect(model.items.first?.text == "New, latest version")
+            #expect(model.items.first?.isContentLoaded == false)
+            #expect(model.items.first?.previewText == "New, latest version")
         }
 
         @Test
@@ -333,6 +336,122 @@ enum AppModelAndLocalizationTests {
             #expect(model.items.contains { $0.id == trashedOne.id && $0.deletedAt == nil })
             #expect(model.selectedItemID == trashedOne.id)
             #expect(model.selectedItemIDs == [trashedOne.id])
+        }
+
+        @Test
+        @MainActor
+        func unloadedHeaderInsertionTagMutationInvalidationAndStoreAwareCorpusDonorReuse() throws {
+            try TestSupport.withTemporaryHistoryStore { baseStore, _ in
+                let spyStore = SpyHistoryStore(base: baseStore)
+                let model = AppModel()
+
+                let tagOps = try spyStore.createTag(name: "OpsVault", color: "#3B85ED")
+                let tagDocs = try spyStore.createTag(name: "DocsTeam", color: "#2196F3")
+                model.tags = [tagOps, tagDocs]
+
+                let body40KB = String(repeating: "x", count: 40_000) + "TAIL_SENTINEL_AT_40KB"
+                let rtfBytes = try TestSupport.makeRTFData(text: body40KB)
+                let htmlMarkup = "<article><p>\(body40KB)</p></article>"
+
+                let richSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .richText,
+                        text: body40KB,
+                        rtfData: rtfBytes,
+                        html: htmlMarkup,
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_100),
+                        tags: [tagOps.id]
+                    ),
+                    convertingExternalAssets: true
+                )
+                let plainSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .text,
+                        text: "Plain untagged note",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_200),
+                        tags: []
+                    ),
+                    convertingExternalAssets: true
+                )
+
+                // AppModel.insert, insertIntoTrash, restore, and replace strip body + formatting while preserving header flags.
+                model.insert(richSaved)
+                model.insert(plainSaved)
+                #expect(model.items.count == 2)
+                #expect(model.items.allSatisfy { !$0.isContentLoaded && !$0.isFormattingLoaded && $0.searchText.isEmpty })
+
+                let richInModel = try #require(model.items.first { $0.id == richSaved.id })
+                #expect(richInModel.text == nil)
+                #expect(richInModel.html == nil)
+                #expect(richInModel.rtfData == nil)
+                #expect(richInModel.characterCount == body40KB.count)
+                #expect(richInModel.hasFormatting)
+                #expect(richInModel.storedContentKey == richSaved.storedContentKey)
+
+                model.selectedHistoryFilterContentTypes = [.trash]
+                model.insertIntoTrash([richSaved])
+                #expect(model.trashedItems.first?.isContentLoaded == false)
+                #expect(model.trashedItems.first?.searchText.isEmpty == true)
+                model.selectedHistoryFilterContentTypes = []
+                model.restore([richSaved], selection: nil)
+                #expect(model.items.allSatisfy { !$0.isContentLoaded && $0.searchText.isEmpty })
+
+                // Idle: cachedSearchCorpus is nil until a search corpus is built.
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                // First makeSearchCorpus(using:) hydrates all 2 unloaded items and caches complete corpus.
+                spyStore.resetRecordedCalls()
+                let corpus1 = model.makeSearchCorpus(using: spyStore)
+                #expect(corpus1.hasCompleteTexts)
+                #expect(spyStore.fetchSearchTextsCalls.count == 1)
+                #expect(Set(spyStore.fetchSearchTextsCalls[0].ids) == [richSaved.id, plainSaved.id])
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus === corpus1)
+
+                // Repeat makeSearchCorpus(using:) at same sortedListRevision returns cached corpus with 0 DB calls.
+                spyStore.resetRecordedCalls()
+                let corpus2 = model.makeSearchCorpus(using: spyStore)
+                #expect(corpus2 === corpus1)
+                #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+
+                // Direct model.tags mutation invalidates sortedListRevision + cachedSearchCorpus,
+                // and incremental donor reuse reuses untagged plainSaved while querying ONLY tagged richSaved!
+                let revBeforeTagRename = model.sortedListRevision
+                model.tags = [ClipBook.Tag(id: tagOps.id, name: "RenamedSecOps", color: tagOps.color), tagDocs]
+                #expect(model.sortedListRevision != revBeforeTagRename)
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                // Make corpus1 the donor via installSearchResult before building the next corpus.
+                let seedResult = try #require(
+                    HistorySearchJob().run(
+                        corpus: corpus1,
+                        terms: HistorySearchTerms(query: "TAIL_SENTINEL_AT_40KB"),
+                        locale: .current
+                    )
+                )
+                model.installSearchResult(seedResult)
+
+                spyStore.resetRecordedCalls()
+                let corpusAfterDirectTagMutation = model.makeSearchCorpus(using: spyStore)
+                #expect(corpusAfterDirectTagMutation.hasCompleteTexts)
+                #expect(spyStore.fetchSearchTextsCalls.count == 1)
+                #expect(spyStore.fetchSearchTextsCalls[0].ids == [richSaved.id])
+                #expect(corpusAfterDirectTagMutation.texts.contains { $0.contains("RenamedSecOps") && $0.contains("TAIL_SENTINEL_AT_40KB") })
+
+                // Unpersisted header fallback sets hasCompleteTexts == false, revision slot == 0, and does NOT cache.
+                let unpersisted = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Transient unpersisted clip",
+                    copiedAt: Date(timeIntervalSince1970: 1_700_000_300)
+                )
+                model.insert(unpersisted)
+                spyStore.resetRecordedCalls()
+                let degradedCorpus = model.makeSearchCorpus(using: spyStore)
+                #expect(!degradedCorpus.hasCompleteTexts)
+                let unpersistedSlot = try #require(degradedCorpus.indexByID()[unpersisted.id])
+                #expect(degradedCorpus.revisions[unpersistedSlot] == 0)
+                #expect(degradedCorpus.texts[unpersistedSlot].contains("Transient unpersisted clip"))
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+            }
         }
     }
 
