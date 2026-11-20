@@ -2,6 +2,8 @@
 import AppKit
 import Carbon
 import Foundation
+import GRDB
+import Security
 import Testing
 
 @Suite
@@ -322,6 +324,298 @@ enum ServicesAndUtilitiesTests {
             monitor = nil
             try click()
             #expect(dismissalCount == 1)
+        }
+    }
+
+    @Suite
+    struct AppDirectoriesAndGRDBLinkageTests {
+        // Self-contained public X.509 v3 DER certificate fixture (no private key) for SecCertificateCreateWithData.
+        private static let testCertificateDERBase64 = """
+        MIIEBTCCAm2gAwIBAgIJAPgyU39GTDg0MA0GCSqGSIb3DQEBCwUAMCUxIzAhBgNV
+        BAMMGkNsaXBCb29rIEZvcmsgQ29kZSBTaWduaW5nMB4XDTI2MTExNjEzMjc0NloX
+        DTM2MTExMzEzMjc0NlowJTEjMCEGA1UEAwwaQ2xpcEJvb2sgRm9yayBDb2RlIFNp
+        Z25pbmcwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDQjyunOLBdXkd3
+        30Y67hpWz4MnxOzk+288unxuPVcmFo8ubRjws9zjxgUKPppJnY1cYyHENzGTWwKs
+        kQrbYsqpZYW82cxWXOkdyu3Toyy7Sp+5iakvQmPZLNUDz3Ny7FGEjZn5JBdDziFu
+        FhDzZhOmdz6RbEgdeWrURmXGdtT3ak8U/nQGe84nTqHANRnzlA868msfgrustYGM
+        RIGjLJ4Mcc3D/RvaUzf6SoTIjghrIMV4X/jaLf0x6wnAkl7L546EMZwKXMFx7MZU
+        7L0vkSdGBdwrbiItQbRLa5JjQ+HvIA2ymGv2rxHjwpuG2RnGbyHfY7IksOcYxAv/
+        GQhUhG9Swd21ZuY+mvUkG0P22ISElfttiU3R8cxqkME5nr8BVXJa/M8FlsbTwdd1
+        GwJUStVDWC3dO6LpL3Xt4e2eyKcRJu1zBeSiWqHWi3QEpvk93qoNwfBXarBrXVIa
+        Ogs6oHSc8O7HEf7GjkaONLrOXCXAA3RAo/7bk3PNqkWjpTKVDC8CAwEAAaM4MDYw
+        DAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwFgYDVR0lAQH/BAwwCgYIKwYB
+        BQUHAwMwDQYJKoZIhvcNAQELBQADggGBADIqWR3PL6dqw1ipZo4JvZApN+0lUxvL
+        wpZ0WY58KvtlLWICANhWbFFO+0fB7SQnopK7yajcLgC9uiTtfWvH99eCPhFiTtqo
+        aQh89aYR47APf2xb1UcvZmoWz+B0+iW11e+3xKbSB/f3N3ADUvaRBGuYt1xLehAv
+        53w+Hs5M0IvpNeF8T7niHWzz+2U/XnMJBHHpbwsPZQTABzg4fjVksgpiEaJQ3bFL
+        EsZLoNH0u2ic3hw+Njmwt5TmL69k3TuN0vIzNDLy79nkolleidj2yByWodueJVWE
+        4o5WU+eMdQ3nti+j8qEUcGS+EVgNihavi+SIVJJOF8kyhXMsW/UzXQBjXspMS6Pc
+        aMro1BeuR4Z/ej/RykceUj0+o9ERJXARpZ2U0b/or8sw6k3R6CkFOoMT9UMCy2VG
+        XmINm9f6XsTqXdgtdviaPz1w5z1iPljCraAg9L72UB2kcSEXh3wIvNFJ/YFLFxa/
+        LzBuRzOn6LNyN8l1CkFi7YTelRpdGSP2pg==
+        """
+
+        @Test
+        func supportFolderAndDirectoryIsolationInThrowawayBaseDirectory() throws {
+            #expect(AppDirectories.usesIsolatedDebugStorage)
+            #expect(AppDirectories.supportFolderName() == "ClipBook2-Debug")
+            #expect(AppDirectories.supportFolderName(isDebugBuild: false) == "ClipBook2")
+            #expect(AppDirectories.supportFolderName(isDebugBuild: true) == "ClipBook2-Debug")
+
+            let fileManager = FileManager.default
+            let baseDirectory = fileManager.temporaryDirectory
+                .appendingPathComponent("ClipBookAppDirectoriesTests-\(UUID().uuidString)", isDirectory: true)
+            try fileManager.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+            defer {
+                try? fileManager.removeItem(at: baseDirectory)
+            }
+
+            func expectDirectoryExists(at url: URL) {
+                var isDirectory: ObjCBool = false
+                #expect(fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory))
+                #expect(isDirectory.boolValue)
+            }
+
+            let releaseBase = baseDirectory.appendingPathComponent("release", isDirectory: true)
+            let releaseSupport = AppDirectories.applicationSupport(
+                fileManager: fileManager,
+                baseDirectory: releaseBase,
+                isDebugBuild: false
+            )
+            #expect(
+                releaseSupport.standardizedFileURL
+                    == releaseBase.appendingPathComponent("ClipBook2", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: releaseSupport)
+            #expect(!fileManager.fileExists(atPath: releaseBase.appendingPathComponent("ClipBook2-Debug").path))
+
+            let releaseForkInSupport = AppDirectories.forkSupportDirectory(
+                in: releaseSupport,
+                fileManager: fileManager
+            )
+            #expect(
+                releaseForkInSupport.standardizedFileURL
+                    == releaseBase.appendingPathComponent("ClipBook2/Fork", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: releaseForkInSupport)
+
+            let releaseDirectBase = baseDirectory.appendingPathComponent("release-direct", isDirectory: true)
+            let releaseForkDirect = AppDirectories.forkSupportDirectory(
+                fileManager: fileManager,
+                baseDirectory: releaseDirectBase,
+                isDebugBuild: false
+            )
+            #expect(
+                releaseForkDirect.standardizedFileURL
+                    == releaseDirectBase.appendingPathComponent("ClipBook2/Fork", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: releaseDirectBase.appendingPathComponent("ClipBook2", isDirectory: true))
+            expectDirectoryExists(at: releaseForkDirect)
+
+            let debugBase = baseDirectory.appendingPathComponent("debug", isDirectory: true)
+            let debugSupport = AppDirectories.applicationSupport(
+                fileManager: fileManager,
+                baseDirectory: debugBase,
+                isDebugBuild: true
+            )
+            #expect(
+                debugSupport.standardizedFileURL
+                    == debugBase.appendingPathComponent("ClipBook2-Debug", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: debugSupport)
+            #expect(!fileManager.fileExists(atPath: debugBase.appendingPathComponent("ClipBook2").path))
+
+            let debugForkInSupport = AppDirectories.forkSupportDirectory(
+                in: debugSupport,
+                fileManager: fileManager
+            )
+            #expect(
+                debugForkInSupport.standardizedFileURL
+                    == debugBase.appendingPathComponent("ClipBook2-Debug/Fork", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: debugForkInSupport)
+
+            let debugDirectBase = baseDirectory.appendingPathComponent("debug-direct", isDirectory: true)
+            let debugForkDirect = AppDirectories.forkSupportDirectory(
+                fileManager: fileManager,
+                baseDirectory: debugDirectBase,
+                isDebugBuild: true
+            )
+            #expect(
+                debugForkDirect.standardizedFileURL
+                    == debugDirectBase.appendingPathComponent("ClipBook2-Debug/Fork", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: debugDirectBase.appendingPathComponent("ClipBook2-Debug", isDirectory: true))
+            expectDirectoryExists(at: debugForkDirect)
+
+            let defaultBase = baseDirectory.appendingPathComponent("default", isDirectory: true)
+            let defaultSupport = AppDirectories.applicationSupport(
+                fileManager: fileManager,
+                baseDirectory: defaultBase
+            )
+            #expect(
+                defaultSupport.standardizedFileURL
+                    == defaultBase.appendingPathComponent("ClipBook2-Debug", isDirectory: true).standardizedFileURL
+            )
+            let defaultFork = AppDirectories.forkSupportDirectory(
+                fileManager: fileManager,
+                baseDirectory: defaultBase
+            )
+            #expect(
+                defaultFork.standardizedFileURL
+                    == defaultBase.appendingPathComponent("ClipBook2-Debug/Fork", isDirectory: true).standardizedFileURL
+            )
+            expectDirectoryExists(at: defaultFork)
+        }
+
+        @Test
+        func certificateSignedReleaseEvaluationAcrossSigningDictionaries() throws {
+            let derData = try #require(
+                Data(base64Encoded: Self.testCertificateDERBase64, options: .ignoreUnknownCharacters)
+            )
+            let rawCertificate = SecCertificateCreateWithData(nil, derData as CFData)
+            #expect(rawCertificate != nil)
+            let certificate = try #require(rawCertificate)
+
+            let idKey = kSecCodeInfoIdentifier as String
+            let flagsKey = kSecCodeInfoFlags as String
+            let certsKey = kSecCodeInfoCertificates as String
+            let validID = "com.ikryanov.clipbook.v2"
+
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: nil))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [:]))
+
+            // Missing, empty, or non-String identifier fails closed.
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                flagsKey: UInt32(0x10000),
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: "",
+                flagsKey: UInt32(0x10000),
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: 42,
+                flagsKey: UInt32(0x10000),
+                certsKey: [certificate]
+            ]))
+
+            // Ad-hoc (0x10002 / 0x0002) and linker-signed (0x20002 / 0x20000 / 0x30000) flags fail closed.
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x10002),
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: SecCodeSignatureFlags.adhoc.rawValue,
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x20002),
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: SecCodeSignatureFlags.linkerSigned.rawValue,
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x30000),
+                certsKey: [certificate]
+            ]))
+
+            // Empty, missing, or wrong-type certificate chain fails closed.
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x10000),
+                certsKey: [SecCertificate]()
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x10000)
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x10000),
+                certsKey: ["not-a-certificate"]
+            ]))
+
+            // Missing, CFBoolean, non-integer, negative, or overflow flags fail closed.
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: kCFBooleanTrue as Any,
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: kCFBooleanFalse as Any,
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: NSNumber(value: true),
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: "0x10000",
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: -1,
+                certsKey: [certificate]
+            ]))
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: NSNumber(value: Int64(UInt32.max) + 1),
+                certsKey: [certificate]
+            ]))
+
+            // Certificate-signed hardened runtime (0x10000) succeeds across UInt32, Int, and non-CFBoolean NSNumber.
+            #expect(AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: UInt32(0x10000),
+                certsKey: [certificate]
+            ]))
+            #expect(AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: Int(0x10000),
+                certsKey: [certificate]
+            ]))
+            #expect(AppDirectories.isCertificateSignedRelease(signingInfo: [
+                idKey: validID,
+                flagsKey: NSDecimalNumber(value: 0x10000),
+                certsKey: [certificate]
+            ]))
+
+            // Ad-hoc signed test host process is never treated as a certificate-signed release.
+            #expect(!AppDirectories.isCertificateSignedRelease(signingInfo: AppDirectories.currentProcessSigningInfo()))
+        }
+
+        @Test
+        func grdbRuntimeInfoDeserializesModuleTypesAndResolvesSymbolsViaBundleLoader() throws {
+            let queue: DatabaseQueue = try GRDBRuntimeInfo.makeInMemoryQueue()
+            try queue.write { db in
+                try db.execute(sql: "CREATE TABLE grdb_smoke (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+                try db.execute(sql: "INSERT INTO grdb_smoke (label) VALUES (?)", arguments: ["bundle-loader-ok"])
+            }
+            let storedLabel = try queue.read { db in
+                try String.fetchOne(db, sql: "SELECT label FROM grdb_smoke WHERE id = 1")
+            }
+            #expect(storedLabel == "bundle-loader-ok")
+
+            let version = try GRDBRuntimeInfo.sqliteVersion()
+            #expect(!version.isEmpty)
+            #expect(version.range(of: #"^\d+\.\d+\.\d+"#, options: .regularExpression) != nil)
         }
     }
 }

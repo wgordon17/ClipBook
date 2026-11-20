@@ -3,7 +3,6 @@ import SwiftUI
 import AppKit
 import Carbon
 import Combine
-import SQLite3
 
 enum HistoryItemActionPreference: String, Codable, CaseIterable, Identifiable {
     case paste

@@ -2,7 +2,6 @@ import Foundation
 import AppKit
 import Carbon
 import Combine
-import SQLite3
 
 enum ClipboardKind: String, Codable, CaseIterable, Identifiable, Hashable {
     case text

@@ -31,13 +31,22 @@ DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$ROOT_DIR/DerivedData/Release}"
 REPO="wgordon17/ClipBook"
 PREVIOUS_BUILD=""
 OUTPUT_DIR="$ROOT_DIR/Releases/fork"
+APP_ARCHS_EXPLICIT=0
+if [[ -n "${APP_ARCHS+x}" ]]; then
+  APP_ARCHS_EXPLICIT=1
+fi
 APP_ARCHS="${APP_ARCHS:-arm64 x86_64}"
 SMOKE_TEST=0
+SIGN_AND_VERIFY_APP=""
 SPARKLE_CACHE_STAGE_DIR=""
+VERIFY_SCRATCH_DIR=""
 
 cleanup_release_fork() {
   if [[ -n "${SPARKLE_CACHE_STAGE_DIR:-}" ]]; then
     rm -rf "$SPARKLE_CACHE_STAGE_DIR"
+  fi
+  if [[ -n "${VERIFY_SCRATCH_DIR:-}" ]]; then
+    rm -rf "$VERIFY_SCRATCH_DIR"
   fi
 }
 trap cleanup_release_fork EXIT
@@ -62,6 +71,7 @@ usage() {
   printf '%s\n' "  --previous-build INT         Optional monotonic CFBundleVersion floor."
   printf '%s\n' "  --output-dir DIR             Output root directory (default: Releases/fork)."
   printf '%s\n' "  --arch-list \"arm64 x86_64\"   Space-separated architectures to archive."
+  printf '%s\n' "  --sign-and-verify-app PATH   Sign and verify an existing ClipBook.app bundle in place."
   printf '%s\n' "  --smoke-test                 Unprivileged verification mode (ephemeral Ed25519; ad-hoc unless --p12-file is set)."
   printf '%s\n' "  -h, --help                   Show this help."
 }
@@ -139,6 +149,12 @@ while [[ $# -gt 0 ]]; do
     --arch-list)
       require_option_arg "$@"
       APP_ARCHS="$2"
+      APP_ARCHS_EXPLICIT=1
+      shift 2
+      ;;
+    --sign-and-verify-app)
+      require_option_arg "$@"
+      SIGN_AND_VERIFY_APP="$2"
       shift 2
       ;;
     --smoke-test)
@@ -206,6 +222,128 @@ run_rcodesign() {
 }
 
 # Normalize paths, validate version/run-number, enforce monotonic build floor, prepare workspace.
+if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
+  unset FALLBACK_ED_PRIVKEY
+
+  if [[ -n "$RUN_NUMBER" || -n "$ED_KEY_FILE" ]]; then
+    printf 'Error: --sign-and-verify-app cannot be combined with --run-number or --ed-key-file.\n' >&2
+    exit 1
+  fi
+  if [[ ! -d "$SIGN_AND_VERIFY_APP" ]]; then
+    printf 'Error: --sign-and-verify-app bundle directory does not exist: %s\n' "$SIGN_AND_VERIFY_APP" >&2
+    exit 1
+  fi
+  APP_PATH="$(cd "$SIGN_AND_VERIFY_APP" && pwd)"
+  if [[ ! -f "$APP_PATH/Contents/MacOS/$APP_NAME" ]]; then
+    printf 'Error: --sign-and-verify-app bundle is missing Contents/MacOS/%s: %s\n' "$APP_NAME" "$APP_PATH" >&2
+    exit 1
+  fi
+
+  if [[ -n "$KEYCHAIN_PATH" ]]; then
+    KEYCHAIN_PATH="$(normalize_existing_file "--keychain" "$KEYCHAIN_PATH")"
+  fi
+  if [[ -n "$P12_FILE" ]]; then
+    P12_FILE="$(normalize_existing_file "--p12-file" "$P12_FILE")"
+  fi
+  if [[ -n "$P12_PASSWORD_FILE" ]]; then
+    P12_PASSWORD_FILE="$(normalize_existing_file "--p12-password-file" "$P12_PASSWORD_FILE")"
+  fi
+  if [[ -n "$SIGNER_BIN" ]]; then
+    if [[ ! -f "$SIGNER_BIN" || ! -x "$SIGNER_BIN" ]]; then
+      printf 'Error: --rcodesign-bin is missing or not executable: %s\n' "$SIGNER_BIN" >&2
+      exit 1
+    fi
+    SIGNER_BIN="$(cd "$(dirname "$SIGNER_BIN")" && pwd)/$(basename "$SIGNER_BIN")"
+  fi
+  if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$SIGNER_BIN" ]]; then
+    if [[ -z "$P12_FILE" || -z "$P12_PASSWORD_FILE" || -z "$SIGNER_BIN" ]]; then
+      printf 'Error: --p12-file, --p12-password-file, and --rcodesign-bin must all be provided together.\n' >&2
+      exit 1
+    fi
+  fi
+
+  if [[ ! -f "$ENTITLEMENTS_PATH" ]]; then
+    printf 'Error: Release entitlements file not found: %s\n' "$ENTITLEMENTS_PATH" >&2
+    exit 1
+  fi
+
+  require_tool xcrun
+  require_tool ditto
+
+  if [[ "$APP_ARCHS_EXPLICIT" -eq 0 ]]; then
+    APP_ARCHS="$(xcrun lipo -archs "$APP_PATH/Contents/MacOS/$APP_NAME")"
+  fi
+  read -r -a REQUIRED_APP_ARCHS <<< "$APP_ARCHS"
+  if [[ "${#REQUIRED_APP_ARCHS[@]}" -eq 0 ]]; then
+    printf 'Error: --arch-list must specify at least one architecture.\n' >&2
+    exit 1
+  fi
+  for arch_item in "${REQUIRED_APP_ARCHS[@]}"; do
+    if [[ ! "$arch_item" =~ ^[A-Za-z0-9_]+$ ]]; then
+      printf 'Error: Invalid architecture token in --arch-list: %s\n' "$arch_item" >&2
+      exit 1
+    fi
+  done
+
+  VERIFY_SCRATCH_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/var/tmp}/clipbook-verify.XXXXXXXXXX")"
+  chmod 700 "$VERIFY_SCRATCH_DIR"
+  WORK_DIR="$VERIFY_SCRATCH_DIR"
+  STAGING_PATH="$VERIFY_SCRATCH_DIR/dmg-staging"
+  mkdir -p "$STAGING_PATH"
+
+  SMOKE_PUBLIC_ED_KEY=""
+  EFFECTIVE_SIGNING_IDENTITY="$SIGNING_IDENTITY"
+  USES_ADHOC_SIGNING=0
+  LEAF_SHA1=""
+  REPO_CERT_SHA1=""
+  EXPECTED_AUTHORITY="$SIGNING_IDENTITY"
+
+  if [[ -n "$P12_FILE" ]]; then
+    if [[ ! -x /usr/bin/openssl ]]; then
+      printf 'Error: Expected macOS /usr/bin/openssl to be present and executable.\n' >&2
+      exit 1
+    fi
+    if ! LEAF_CERT_PEM="$(/usr/bin/openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin file:"$P12_PASSWORD_FILE" 2>/dev/null)" || [[ -z "$LEAF_CERT_PEM" ]]; then
+      printf 'Error: Could not extract leaf certificate PEM from PKCS#12 file (invalid bundle or passphrase).\n' >&2
+      exit 1
+    fi
+    if ! /usr/bin/openssl x509 -noout -checkend 3600 <<< "$LEAF_CERT_PEM" >/dev/null 2>&1; then
+      printf 'Error: PKCS#12 leaf certificate is expired or expires within 3600 seconds.\n' >&2
+      exit 1
+    fi
+    RAW_FP="$(/usr/bin/openssl x509 -noout -fingerprint -sha1 <<< "$LEAF_CERT_PEM")"
+    LEAF_SHA1="$(printf '%s' "${RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$LEAF_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
+      printf 'Error: Could not extract 40-hex leaf SHA-1 fingerprint from PKCS#12 certificate (got: %s).\n' "$LEAF_SHA1" >&2
+      exit 1
+    fi
+    LEAF_SUBJECT="$(/usr/bin/openssl x509 -noout -subject -nameopt RFC2253 <<< "$LEAF_CERT_PEM" | tr -d '\r\n')"
+    if [[ "$LEAF_SUBJECT" != *CN=* ]]; then
+      printf 'Error: PKCS#12 leaf certificate subject is missing CN= (got: %s).\n' "$LEAF_SUBJECT" >&2
+      exit 1
+    fi
+    EXPECTED_AUTHORITY="${LEAF_SUBJECT#*CN=}"
+    EXPECTED_AUTHORITY="${EXPECTED_AUTHORITY%%,*}"
+    if [[ -z "$EXPECTED_AUTHORITY" ]]; then
+      printf 'Error: PKCS#12 leaf certificate has an empty Common Name (subject: %s).\n' "$LEAF_SUBJECT" >&2
+      exit 1
+    fi
+  else
+    if [[ "$SMOKE_TEST" -eq 1 ]]; then
+      EFFECTIVE_SIGNING_IDENTITY="-"
+    fi
+    if [[ -z "$EFFECTIVE_SIGNING_IDENTITY" ]]; then
+      printf 'Error: --signing-identity cannot be empty.\n' >&2
+      exit 1
+    fi
+    if [[ "$EFFECTIVE_SIGNING_IDENTITY" == "-" ]]; then
+      USES_ADHOC_SIGNING=1
+    elif [[ -f "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" && -x /usr/bin/openssl ]]; then
+      REPO_RAW_FP="$(/usr/bin/openssl x509 -in "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" -noout -fingerprint -sha1 2>/dev/null || true)"
+      REPO_CERT_SHA1="$(printf '%s' "${REPO_RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
+    fi
+  fi
+else
 mkdir -p "$OUTPUT_DIR" "$DERIVED_DATA_PATH"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 DERIVED_DATA_PATH="$(cd "$DERIVED_DATA_PATH" && pwd)"
@@ -516,6 +654,7 @@ fi
 if [[ "$REPO" != "wgordon17/ClipBook" ]]; then
   /usr/libexec/PlistBuddy -c "Set :SUFeedURL https://github.com/${REPO}/releases/latest/download/appcast.xml" "$APP_PATH/Contents/Info.plist"
 fi
+fi
 
 # Inside-out Hardened Runtime signing across all 6 targets (never codesign --deep).
 SPARKLE_VERSION_B="$APP_PATH/Contents/Frameworks/Sparkle.framework/Versions/B"
@@ -542,6 +681,48 @@ for strip_target in \
   "$APP_PATH"; do
   /usr/bin/codesign --remove-signature "$strip_target"
 done
+
+# Inspect Contents/Resources/*.bundle: strip _CodeSignature inside Mach-O-less SwiftPM
+# resource bundles (such as GRDB_GRDB.bundle) so outer CodeResources (^Resources/) seals
+# them cleanly, and pass --exclude CLI flags in rcodesign mode.
+is_macho_resource_bundle() {
+  local bundle_dir="$1"
+  local info_plist=""
+  if [[ -f "$bundle_dir/Contents/Info.plist" ]]; then
+    info_plist="$bundle_dir/Contents/Info.plist"
+  elif [[ -f "$bundle_dir/Info.plist" ]]; then
+    info_plist="$bundle_dir/Info.plist"
+  fi
+  local exec_name=""
+  if [[ -n "$info_plist" ]]; then
+    exec_name="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$info_plist" 2>/dev/null || true)"
+  fi
+  local exec_path=""
+  if [[ -n "$exec_name" ]]; then
+    if [[ -f "$bundle_dir/Contents/MacOS/$exec_name" ]]; then
+      exec_path="$bundle_dir/Contents/MacOS/$exec_name"
+    elif [[ -f "$bundle_dir/$exec_name" ]]; then
+      exec_path="$bundle_dir/$exec_name"
+    fi
+  fi
+  [[ -n "$exec_path" ]] && [[ "$(/usr/bin/file -b "$exec_path")" == *"Mach-O"* ]]
+}
+
+exclude_args=()
+SIGNABLE_RESOURCE_BUNDLES=()
+shopt -s nullglob
+for res_bundle in "$APP_PATH"/Contents/Resources/*.bundle; do
+  [[ -d "$res_bundle" ]] || continue
+  res_bundle_name="$(basename "$res_bundle")"
+  if is_macho_resource_bundle "$res_bundle"; then
+    /usr/bin/codesign --remove-signature "$res_bundle" 2>/dev/null || rm -rf "$res_bundle/Contents/_CodeSignature" "$res_bundle/_CodeSignature"
+    SIGNABLE_RESOURCE_BUNDLES+=("$res_bundle")
+  else
+    rm -rf "$res_bundle/Contents/_CodeSignature" "$res_bundle/_CodeSignature"
+    exclude_args+=(--exclude "Contents/Resources/$res_bundle_name")
+  fi
+done
+shopt -u nullglob
 
 if [[ -n "$P12_FILE" ]]; then
   compile_csreq() {
@@ -604,7 +785,7 @@ if [[ -n "$P12_FILE" ]]; then
     printf 'code_requirements_file = %s\n' "$q_downloader_csreq"
   } > "$SIGNER_TOML"
 
-  run_rcodesign -C "$SIGNER_TOML" sign --timestamp-url none "$APP_PATH"
+  run_rcodesign -C "$SIGNER_TOML" sign --timestamp-url none ${exclude_args[@]+"${exclude_args[@]}"} "$APP_PATH"
 else
   CODESIGN_KEYCHAIN_ARGS=()
   if [[ -n "$KEYCHAIN_PATH" && "$EFFECTIVE_SIGNING_IDENTITY" != "-" ]]; then
@@ -621,6 +802,10 @@ else
     ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} "$UPDATER_APP"
   /usr/bin/codesign --force --sign "$EFFECTIVE_SIGNING_IDENTITY" --options runtime --timestamp=none \
     ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} "$SPARKLE_VERSION_B"
+  for signable_res_bundle in ${SIGNABLE_RESOURCE_BUNDLES[@]+"${SIGNABLE_RESOURCE_BUNDLES[@]}"}; do
+    /usr/bin/codesign --force --sign "$EFFECTIVE_SIGNING_IDENTITY" --options runtime --timestamp=none \
+      ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} "$signable_res_bundle"
+  done
   /usr/bin/codesign --force --sign "$EFFECTIVE_SIGNING_IDENTITY" --options runtime --timestamp=none \
     --entitlements "$ENTITLEMENTS_PATH" \
     ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} "$APP_PATH"
@@ -650,6 +835,105 @@ if [[ -n "$P12_FILE" ]]; then
 else
   /usr/bin/codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 fi
+
+verify_app_rpaths() {
+  local target_app="$1"
+  local target_bin="$target_app/Contents/MacOS/ClipBook"
+  if [[ ! -f "$target_bin" ]]; then
+    printf 'Error: Main executable missing for LC_RPATH check: %s\n' "$target_bin" >&2
+    exit 1
+  fi
+
+  local otool_out
+  otool_out="$(xcrun otool -arch all -l "$target_bin")"
+
+  local in_rpath=0
+  local saw_path_in_rpath=0
+  local saw_any_load_cmd=0
+  local slice_rpath_count=0
+  local total_rpath_count=0
+  local line rpath_val
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ \(architecture\ [A-Za-z0-9_]+\):$ ]]; then
+      if [[ "$in_rpath" -eq 1 && "$saw_path_in_rpath" -eq 0 ]]; then
+        printf 'Error: Malformed LC_RPATH load command without path entry in %s\n' "$target_bin" >&2
+        exit 1
+      fi
+      if [[ "$saw_any_load_cmd" -eq 1 && "$slice_rpath_count" -le 0 ]]; then
+        printf 'Error: Expected at least one LC_RPATH entry in architecture slice of %s\n' "$target_bin" >&2
+        exit 1
+      fi
+      in_rpath=0
+      saw_path_in_rpath=0
+      saw_any_load_cmd=0
+      slice_rpath_count=0
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*Load[[:space:]]+command[[:space:]]+[0-9]+ ]]; then
+      if [[ "$in_rpath" -eq 1 && "$saw_path_in_rpath" -eq 0 ]]; then
+        printf 'Error: Malformed LC_RPATH load command without path entry in %s\n' "$target_bin" >&2
+        exit 1
+      fi
+      in_rpath=0
+      saw_path_in_rpath=0
+      saw_any_load_cmd=1
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*cmd[[:space:]]+LC_RPATH[[:space:]]*$ ]]; then
+      in_rpath=1
+      saw_path_in_rpath=0
+      continue
+    fi
+    if [[ "$in_rpath" -eq 1 && "$line" =~ ^[[:space:]]*path\ (.*)\ \(offset\ [0-9]+\)$ ]]; then
+      rpath_val="${BASH_REMATCH[1]}"
+      saw_path_in_rpath=1
+      slice_rpath_count="$((slice_rpath_count + 1))"
+      total_rpath_count="$((total_rpath_count + 1))"
+      if [[ "$rpath_val" != "@executable_path/../Frameworks" && "$rpath_val" != "/usr/lib/swift" ]]; then
+        printf 'Error: Disallowed LC_RPATH entry "%s" in %s (allowed: @executable_path/../Frameworks, /usr/lib/swift)\n' \
+          "$rpath_val" "$target_bin" >&2
+        exit 1
+      fi
+    fi
+  done <<< "$otool_out"
+
+  if [[ "$in_rpath" -eq 1 && "$saw_path_in_rpath" -eq 0 ]]; then
+    printf 'Error: Malformed trailing LC_RPATH load command without path entry in %s\n' "$target_bin" >&2
+    exit 1
+  fi
+  if [[ "$slice_rpath_count" -le 0 || "$total_rpath_count" -le 0 ]]; then
+    printf 'Error: Expected at least one LC_RPATH entry in %s, found %d\n' "$target_bin" "$total_rpath_count" >&2
+    exit 1
+  fi
+}
+
+verify_app_rpaths "$STAGED_APP"
+
+# Offline trustd-free check across Mach-O-less Contents/Resources/*.bundle directories
+# (such as GRDB_GRDB.bundle) so --p12-file / rcodesign mode also verifies nested
+# _CodeSignature exclusion and outer CodeResources sealing without SecTrustEvaluate.
+shopt -s nullglob
+for staged_res_bundle in "$STAGED_APP"/Contents/Resources/*.bundle; do
+  [[ -d "$staged_res_bundle" ]] || continue
+  if is_macho_resource_bundle "$staged_res_bundle"; then
+    continue
+  fi
+  staged_res_bundle_name="$(basename "$staged_res_bundle")"
+  if ! [[ ! -e "$staged_res_bundle/Contents/_CodeSignature" && ! -e "$staged_res_bundle/_CodeSignature" ]] \
+    || [[ -L "$staged_res_bundle/Contents/_CodeSignature" || -L "$staged_res_bundle/_CodeSignature" ]]; then
+    printf 'Error: Mach-O-less resource bundle must not carry nested _CodeSignature: %s\n' "$staged_res_bundle" >&2
+    exit 1
+  fi
+  if [[ -n "$(find "$staged_res_bundle" -type f ! -name '.DS_Store' -print -quit)" ]]; then
+    if [[ ! -f "$STAGED_APP/Contents/_CodeSignature/CodeResources" ]] \
+      || ! grep -Fq "<key>Resources/${staged_res_bundle_name}/" "$STAGED_APP/Contents/_CodeSignature/CodeResources"; then
+      printf 'Error: Outer CodeResources does not seal Mach-O-less resource bundle: %s\n' "$staged_res_bundle" >&2
+      exit 1
+    fi
+  fi
+done
+shopt -u nullglob
 
 assert_runtime_and_authority() {
   local target_path="$1"
@@ -783,6 +1067,10 @@ assert_plist_value() {
 }
 
 assert_plist_value "CFBundleIdentifier" "com.ikryanov.clipbook.v2"
+if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
+  printf 'Signed and verified app bundle: %s\n' "$APP_PATH"
+  exit 0
+fi
 assert_plist_value "CFBundleShortVersionString" "$MARKETING_VERSION"
 assert_plist_value "CFBundleVersion" "$BUILD_NUMBER"
 assert_plist_value "SUFeedURL" "https://github.com/${REPO}/releases/latest/download/appcast.xml"

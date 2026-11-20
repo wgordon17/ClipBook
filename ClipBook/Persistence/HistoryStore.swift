@@ -3,7 +3,6 @@ import SwiftUI
 import AppKit
 import Carbon
 import Combine
-import SQLite3
 
 protocol HistoryStore {
     /// The items in the history. Items in the Trash are left out of this and
