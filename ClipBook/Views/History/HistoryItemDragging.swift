@@ -111,7 +111,9 @@ enum HistoryItemDragging {
 
     let pasteboardItem = ImageAssetDragItem.make(
       assetURL: assetURL,
-      fileName: draggedImageFileName(for: item)
+      fileName: draggedImageFileName(for: item),
+      ownerClipID: item.id,
+      requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
     )
     return singleEntryPayload(pasteboardItem)
   }
@@ -152,6 +154,7 @@ enum HistoryItemDragging {
       pasteboardItem.setString(title, forType: urlNameType)
     }
     pasteboardItem.setString(url.absoluteString, forType: .string)
+    markConcealedIfNeeded(pasteboardItem, for: item)
     return singleEntryPayload(pasteboardItem)
   }
 
@@ -175,6 +178,7 @@ enum HistoryItemDragging {
       return textPayload(for: item)
     }
 
+    markConcealedIfNeeded(pasteboardItem, for: item)
     return singleEntryPayload(pasteboardItem)
   }
 
@@ -187,6 +191,7 @@ enum HistoryItemDragging {
        let colorData = color.pasteboardPropertyList(forType: .color) as? Data {
       pasteboardItem.setData(colorData, forType: .color)
     }
+    markConcealedIfNeeded(pasteboardItem, for: item)
     return singleEntryPayload(pasteboardItem)
   }
 
@@ -198,7 +203,14 @@ enum HistoryItemDragging {
 
     let pasteboardItem = NSPasteboardItem()
     pasteboardItem.setString(text, forType: .string)
+    markConcealedIfNeeded(pasteboardItem, for: item)
     return singleEntryPayload(pasteboardItem)
+  }
+
+  private static func markConcealedIfNeeded(_ pasteboardItem: NSPasteboardItem, for item: ClipboardItem) {
+    if SensitiveContent.shouldEncryptAtRest(item) {
+      pasteboardItem.setData(Data(), forType: PasteboardReader.concealedType)
+    }
   }
 
   private static func singleEntryPayload(_ writer: NSPasteboardWriting) -> HistoryRowDragPayload {

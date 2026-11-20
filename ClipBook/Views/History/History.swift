@@ -365,7 +365,9 @@ final class History: NSView {
     } else {
       sensitiveContentRevealedItemIDs.remove(item.id)
     }
-    if let row = tableRowIndex(forItemID: item.id) {
+    if showsTiles {
+      tileGrid.reloadVisibleRows()
+    } else if let row = tableRowIndex(forItemID: item.id) {
       reloadRows(IndexSet(integer: row))
     }
   }
@@ -377,7 +379,11 @@ final class History: NSView {
 
     let rows = tableRowIndexes(forItemIDs: sensitiveContentRevealedItemIDs)
     sensitiveContentRevealedItemIDs = []
-    reloadRows(rows)
+    if showsTiles {
+      tileGrid.reloadVisibleRows()
+    } else {
+      reloadRows(rows)
+    }
   }
 
   private func reloadRows(_ rows: IndexSet) {
@@ -1283,7 +1289,17 @@ final class History: NSView {
   private func configureTileGrid(menu: NSMenu) {
     tileGrid.menu = menu
     tileGrid.configureTile = { [weak self] tileView, item, itemIndex in
-      tileView.configure(item: item, quickPasteIndex: self?.quickPasteIndex(forItemIndex: itemIndex))
+      guard let self else {
+        return
+      }
+      let hidesContent = SensitiveContent.isMasked(item, detectsAutomatically: self.detectsSensitiveContent)
+        && !self.revealsSensitiveContent(of: item)
+      tileView.configure(
+        item: item,
+        quickPasteIndex: self.quickPasteIndex(forItemIndex: itemIndex),
+        detectsSensitiveContent: self.detectsSensitiveContent,
+        hidesSensitiveContent: hidesContent
+      )
     }
     tileGrid.selectionState = { [weak self] row in
       self?.tileSelectionState(forRow: row) ?? HistoryTileSelectionState()

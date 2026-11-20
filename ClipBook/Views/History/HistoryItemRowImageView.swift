@@ -9,7 +9,9 @@ final class HistoryItemRowImageView: HistoryItemRowView {
 
   override func configureContent(item: ClipboardItem, quickPasteIndex: Int?) {
     let title = Self.title(for: item)
-    configureImagePreview(for: item, title: title)
+    if !hidesSensitiveContent {
+      configureImagePreview(for: item, title: title)
+    }
     let sizeLine = isCompact
       ? nil
       : makeSecondaryLabel(text: ByteCountFormatter.string(fromByteCount: Int64(item.byteSize), countStyle: .file))
@@ -54,11 +56,17 @@ final class HistoryItemRowImageView: HistoryItemRowView {
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: boxSize, scale: scale)
     let toolTip = title
 
+    let assetContext = ImageAssetThumbnailLoader.ManagedAssetContext(
+      role: .image,
+      ownerClipID: item.id,
+      requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+    )
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
-      maximumPixelSize: maximumPixelSize
+      maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext
     ) { [weak self] image in
-      guard let self, self.isConfigured(for: item), let image else {
+      guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent, let image else {
         return
       }
 

@@ -8,6 +8,19 @@ import ImageIO
 /// into view gets its picture at once. Decoding a full-size screenshot on the
 /// main thread for every row that scrolls in is what made image rows stutter.
 nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
+  nonisolated struct ManagedAssetContext: Hashable, Sendable {
+    let role: AssetRole
+    let ownerClipID: UUID
+    let requiresEncryption: Bool
+  }
+
+  private struct PendingDecode {
+    let id: UInt64
+    let startGlobalEpoch: UInt64
+    let startEvictionEpoch: UInt64
+    var completions: [@MainActor (NSImage?) -> Void]
+  }
+
   static let shared = ImageAssetThumbnailLoader()
 
   private let cache = NSCache<NSString, NSImage>()
@@ -17,7 +30,8 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     attributes: .concurrent
   )
   private let lock = NSLock()
-  private var pendingCompletions: [String: [@MainActor (NSImage?) -> Void]] = [:]
+  private var pendingDecodes: [String: PendingDecode] = [:]
+  private var nextDecodeID: UInt64 = 0
   private var cachedKeysByPath: [String: Set<String>] = [:]
   private var globalEpoch: UInt64 = 0
   private var evictionEpoch: UInt64 = 0
@@ -42,10 +56,17 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
   func thumbnail(
     for url: URL,
     maximumPixelSize: Int,
+    assetContext: ManagedAssetContext? = nil,
     completion: @escaping @MainActor (NSImage?) -> Void
   ) -> NSImage? {
     let normalizedPath = Self.normalizedFilePath(url.path)
-    let key = "\(normalizedPath)\n\(maximumPixelSize)"
+    let contextKey: String
+    if let assetContext {
+      contextKey = "\n\(assetContext.role.rawValue)\n\(assetContext.ownerClipID.uuidString)\n\(assetContext.requiresEncryption ? 1 : 0)"
+    } else {
+      contextKey = ""
+    }
+    let key = "\(normalizedPath)\n\(maximumPixelSize)\(contextKey)"
     if let image = cache.object(forKey: key as NSString) {
       return image
     }
@@ -53,20 +74,47 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     enum LookupOutcome {
       case cached(NSImage)
       case joinedPending
-      case startDecode(globalEpoch: UInt64, startEvictionEpoch: UInt64)
+      case startDecode(
+        decodeID: UInt64,
+        globalEpoch: UInt64,
+        startEvictionEpoch: UInt64,
+        supersededCompletions: [@MainActor (NSImage?) -> Void]
+      )
     }
 
     let outcome: LookupOutcome = lock.withLock {
       if let image = cache.object(forKey: key as NSString) {
         return .cached(image)
       }
-      if pendingCompletions[key] != nil {
-        pendingCompletions[key]?.append(completion)
-        return .joinedPending
+      var superseded: [@MainActor (NSImage?) -> Void] = []
+      if var existing = pendingDecodes[key] {
+        let existingEvicted = isEvicted(
+          normalizedPath: normalizedPath,
+          sinceGlobalEpoch: existing.startGlobalEpoch,
+          sinceEvictionEpoch: existing.startEvictionEpoch
+        )
+        if !existingEvicted {
+          existing.completions.append(completion)
+          pendingDecodes[key] = existing
+          return .joinedPending
+        }
+        superseded = existing.completions
       }
 
-      pendingCompletions[key] = [completion]
-      return .startDecode(globalEpoch: globalEpoch, startEvictionEpoch: evictionEpoch)
+      nextDecodeID &+= 1
+      let decodeID = nextDecodeID
+      pendingDecodes[key] = PendingDecode(
+        id: decodeID,
+        startGlobalEpoch: globalEpoch,
+        startEvictionEpoch: evictionEpoch,
+        completions: [completion]
+      )
+      return .startDecode(
+        decodeID: decodeID,
+        globalEpoch: globalEpoch,
+        startEvictionEpoch: evictionEpoch,
+        supersededCompletions: superseded
+      )
     }
 
     switch outcome {
@@ -74,9 +122,20 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
       return image
     case .joinedPending:
       return nil
-    case .startDecode(let startGlobalEpoch, let startEvictionEpoch):
+    case .startDecode(let decodeID, let startGlobalEpoch, let startEvictionEpoch, let supersededCompletions):
+      if !supersededCompletions.isEmpty {
+        DispatchQueue.main.async {
+          MainActor.assumeIsolated {
+            supersededCompletions.forEach { $0(nil) }
+          }
+        }
+      }
       decodeQueue.async { [weak self] in
-        let decodedImage = Self.decodeThumbnail(at: url, maximumPixelSize: maximumPixelSize)
+        let decodedImage = Self.decodeThumbnail(
+          at: url,
+          maximumPixelSize: maximumPixelSize,
+          assetContext: assetContext
+        )
         guard let self else {
           return
         }
@@ -91,10 +150,18 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
             self.cache.setObject(decodedImage, forKey: key as NSString, cost: Self.cost(of: decodedImage))
             self.cachedKeysByPath[normalizedPath, default: []].insert(key)
           }
-          let waiting = self.pendingCompletions.removeValue(forKey: key) ?? []
+          let waiting: [@MainActor (NSImage?) -> Void]
+          if self.pendingDecodes[key]?.id == decodeID {
+            waiting = self.pendingDecodes.removeValue(forKey: key)?.completions ?? []
+          } else {
+            waiting = []
+          }
           return (waiting, wasEvicted ? nil : decodedImage)
         }
 
+        guard !completions.isEmpty else {
+          return
+        }
         DispatchQueue.main.async {
           MainActor.assumeIsolated {
             completions.forEach { $0(imageToDeliver) }
@@ -212,9 +279,29 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
       .standardizedFileURL
   }
 
-  private static func decodeThumbnail(at url: URL, maximumPixelSize: Int) -> NSImage? {
-    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-      return nil
+  private static func decodeThumbnail(
+    at url: URL,
+    maximumPixelSize: Int,
+    assetContext: ManagedAssetContext?
+  ) -> NSImage? {
+    let source: CGImageSource
+    if let context = assetContext {
+      guard let data = try? ImageAssetStore.readAssetData(
+        at: url,
+        role: context.role,
+        ownerClipID: context.ownerClipID,
+        requiresEncryption: context.requiresEncryption
+      ),
+      let dataSource = CGImageSourceCreateWithData(data as CFData, nil) else {
+        return nil
+      }
+      source = dataSource
+    } else {
+      guard !ImageAssetStore.isEncryptedAssetFile(at: url),
+            let urlSource = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+        return nil
+      }
+      source = urlSource
     }
 
     let options = [

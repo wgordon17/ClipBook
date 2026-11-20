@@ -82,6 +82,7 @@ final class ItemPreviewDetailsView: NSView {
     var key: FieldKey?
     // An icon can stand for the value, which then shows only in the tooltip.
     var showsValue: Bool
+    var showsToolTip: Bool
     // How a value too long for its room gives way. A path keeps its start and
     // the file name at its end, so it loses its middle instead.
     var lineBreakMode: NSLineBreakMode
@@ -92,6 +93,7 @@ final class ItemPreviewDetailsView: NSView {
       icon: NSImage? = nil,
       key: FieldKey? = nil,
       showsValue: Bool = true,
+      showsToolTip: Bool = true,
       lineBreakMode: NSLineBreakMode = .byTruncatingTail
     ) {
       self.title = title
@@ -99,6 +101,7 @@ final class ItemPreviewDetailsView: NSView {
       self.icon = icon
       self.key = key
       self.showsValue = showsValue
+      self.showsToolTip = showsToolTip
       self.lineBreakMode = lineBreakMode
     }
   }
@@ -148,12 +151,14 @@ final class ItemPreviewDetailsView: NSView {
   private let fieldsView = ItemPreviewDetailsFieldsView()
   private let style: Style
   private var item: ClipboardItem
+  private var hidesSensitiveContent: Bool
   // The line between the docked bar and the preview above it.
   private var topSeparatorView: NSView?
 
-  init(item: ClipboardItem, style: Style = .floating) {
+  init(item: ClipboardItem, style: Style = .floating, hidesSensitiveContent: Bool = false) {
     self.style = style
     self.item = item
+    self.hidesSensitiveContent = hidesSensitiveContent
     backdropView = style == .floating
       ? Self.makeBackdropView(contentView: fieldsView)
       : Self.makeDockedBackgroundView(contentView: fieldsView)
@@ -201,8 +206,9 @@ final class ItemPreviewDetailsView: NSView {
     return hitView
   }
 
-  func update(item: ClipboardItem) {
+  func update(item: ClipboardItem, hidesSensitiveContent: Bool = false) {
     self.item = item
+    self.hidesSensitiveContent = hidesSensitiveContent
     rebuild(for: item)
   }
 
@@ -428,7 +434,8 @@ final class ItemPreviewDetailsView: NSView {
     let fields = Self.fields(
       for: item,
       includesSource: style == .floating,
-      includesFilePath: style == .docked && arrangement == .list
+      includesFilePath: style == .docked && arrangement == .list,
+      hidesSensitiveContent: hidesSensitiveContent
     )
     let shapes = fields.map(FieldShape.init)
     // Moving through the history mostly shows items with the same fields, and
@@ -439,9 +446,9 @@ final class ItemPreviewDetailsView: NSView {
         views.valueField.lineBreakMode = field.lineBreakMode
         views.iconView?.image = field.icon
         if arrangement == .inline {
-          views.iconView?.setAccessibilityLabel(field.value)
+          views.iconView?.setAccessibilityLabel(field.showsToolTip ? field.value : nil)
         }
-        views.container.toolTip = field.value
+        views.container.toolTip = field.showsToolTip ? field.value : nil
         // List rows place their value by hand, from its new width.
         views.container.needsLayout = true
       }
@@ -475,6 +482,7 @@ final class ItemPreviewDetailsView: NSView {
           title: field.title,
           value: field.value,
           icon: field.icon,
+          showsToolTip: field.showsToolTip,
           lineBreakMode: field.lineBreakMode,
           isShaded: index.isMultiple(of: 2)
         )
@@ -551,15 +559,20 @@ final class ItemPreviewDetailsView: NSView {
     fieldStack.spacing = Self.titleValueSpacing
     // Long values are truncated to keep the bar compact, so the full value has
     // to stay reachable.
-    fieldStack.toolTip = field.value
+    fieldStack.toolTip = field.showsToolTip ? field.value : nil
     return FieldValueViews(container: fieldStack, valueField: valueField, iconView: fieldIconView)
   }
 
   // MARK: - Fields
 
-  private static func fields(for item: ClipboardItem, includesSource: Bool, includesFilePath: Bool) -> [Field] {
+  private static func fields(
+    for item: ClipboardItem,
+    includesSource: Bool,
+    includesFilePath: Bool,
+    hidesSensitiveContent: Bool
+  ) -> [Field] {
     var fields = [Field(title: L10n.string("Type"), value: typeName(for: item))]
-    if includesFilePath, let filePathField = filePathField(for: item) {
+    if includesFilePath, let filePathField = filePathField(for: item, hidesSensitiveContent: hidesSensitiveContent) {
       fields.append(filePathField)
     }
     fields.append(contentsOf: contentFields(for: item))
@@ -630,14 +643,24 @@ final class ItemPreviewDetailsView: NSView {
 
   // Where the file of a single file item lives, with the home folder written
   // as a tilde. Several files have no one path to show.
-  private static func filePathField(for item: ClipboardItem) -> Field? {
+  private static func filePathField(for item: ClipboardItem, hidesSensitiveContent: Bool) -> Field? {
     guard item.kind == .file, item.filePaths.count == 1, let filePath = item.filePaths.first else {
       return nil
+    }
+
+    if hidesSensitiveContent {
+      return Field(
+        title: L10n.string("Path"),
+        value: SensitiveContent.wholeMask,
+        showsToolTip: false,
+        lineBreakMode: .byTruncatingTail
+      )
     }
 
     return Field(
       title: L10n.string("Path"),
       value: (filePath as NSString).abbreviatingWithTildeInPath,
+      showsToolTip: true,
       lineBreakMode: .byTruncatingMiddle
     )
   }
@@ -721,7 +744,14 @@ private final class ItemPreviewDetailsListRowView: NSView {
   let iconView: NSImageView?
   private let isShaded: Bool
 
-  init(title: String, value: String, icon: NSImage?, lineBreakMode: NSLineBreakMode, isShaded: Bool) {
+  init(
+    title: String,
+    value: String,
+    icon: NSImage?,
+    showsToolTip: Bool,
+    lineBreakMode: NSLineBreakMode,
+    isShaded: Bool
+  ) {
     titleField = NSTextField(labelWithString: title)
     titleField.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
     titleField.textColor = .secondaryLabelColor
@@ -751,7 +781,7 @@ private final class ItemPreviewDetailsListRowView: NSView {
     iconView.map(addSubview)
     // Values are truncated when the pane is narrow, so the full value has to
     // stay reachable.
-    toolTip = value
+    toolTip = showsToolTip ? value : nil
   }
 
   @available(*, unavailable)

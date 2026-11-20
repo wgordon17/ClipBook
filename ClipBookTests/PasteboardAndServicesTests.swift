@@ -1,20 +1,27 @@
 @testable import ClipBook
 import AppKit
+import CryptoKit
+import Darwin
 import Foundation
 import Testing
 
 @Suite
 enum PasteboardAndServicesTests {
+    private static func makeRuntimeSecretToken(tag: String = "alpha") -> String {
+        let raw = ["sk", "-proj-", tag, "-", String(repeating: "x9K2mP7q", count: 4)].joined()
+        return raw
+    }
+
     /// Reads `pasteboard` the way the monitor does on a poll.
     private static func readOutcome(
         from pasteboard: NSPasteboard,
-        imagesDirectory: URL,
         lastChangeCount: Int = -1,
         retriesUnchangedPasteboard: Bool = false,
         ignoresTransientContent: Bool = true,
         ignoresConcealedContent: Bool = true,
         ignoredApplicationEntries: [String] = [],
         frontmostApplication: FrontmostApplication? = nil,
+        computeImageDigest: @escaping @Sendable (Data) -> String = ContentDigest.sha256,
         findStoredImage: @escaping @Sendable (String) -> StoredImage? = { _ in nil }
     ) -> PasteboardReadResult.Outcome {
         let request = PasteboardReadRequest(
@@ -23,7 +30,7 @@ enum PasteboardAndServicesTests {
             ignoresTransientContent: ignoresTransientContent,
             ignoresConcealedContent: ignoresConcealedContent,
             ignoredApplicationEntries: ignoredApplicationEntries,
-            imagesDirectory: imagesDirectory,
+            computeImageDigest: computeImageDigest,
             findStoredImage: findStoredImage,
             frontmostApplication: { frontmostApplication }
         )
@@ -36,17 +43,14 @@ enum PasteboardAndServicesTests {
         ignoresConcealedContent: Bool = true,
         filling fill: (NSPasteboard) throws -> Void
     ) throws -> PasteboardReadResult.Outcome {
-        try TestSupport.withTemporaryDirectory { directory in
-            try TestSupport.withUniquePasteboard { pasteboard in
-                pasteboard.clearContents()
-                try fill(pasteboard)
-                return readOutcome(
-                    from: pasteboard,
-                    imagesDirectory: directory,
-                    ignoresTransientContent: ignoresTransientContent,
-                    ignoresConcealedContent: ignoresConcealedContent
-                )
-            }
+        try TestSupport.withUniquePasteboard { pasteboard in
+            pasteboard.clearContents()
+            try fill(pasteboard)
+            return readOutcome(
+                from: pasteboard,
+                ignoresTransientContent: ignoresTransientContent,
+                ignoresConcealedContent: ignoresConcealedContent
+            )
         }
     }
 
@@ -147,27 +151,23 @@ enum PasteboardAndServicesTests {
 
         @Test
         func anUnchangedPasteboardIsReadOnlyWhenARetryIsAsked() throws {
-            try TestSupport.withTemporaryDirectory { directory in
-                try TestSupport.withUniquePasteboard { pasteboard in
-                    pasteboard.clearContents()
-                    pasteboard.setString("Copied text", forType: .string)
-                    let changeCount = pasteboard.changeCount
+            TestSupport.withUniquePasteboard { pasteboard in
+                pasteboard.clearContents()
+                pasteboard.setString("Copied text", forType: .string)
+                let changeCount = pasteboard.changeCount
 
-                    let unchanged = PasteboardAndServicesTests.readOutcome(
-                        from: pasteboard,
-                        imagesDirectory: directory,
-                        lastChangeCount: changeCount
-                    )
-                    #expect(unchanged.isUnchanged, "\(unchanged)")
+                let unchanged = PasteboardAndServicesTests.readOutcome(
+                    from: pasteboard,
+                    lastChangeCount: changeCount
+                )
+                #expect(unchanged.isUnchanged, "\(unchanged)")
 
-                    let retried = PasteboardAndServicesTests.readOutcome(
-                        from: pasteboard,
-                        imagesDirectory: directory,
-                        lastChangeCount: changeCount,
-                        retriesUnchangedPasteboard: true
-                    )
-                    #expect(retried.payload?.text == "Copied text")
-                }
+                let retried = PasteboardAndServicesTests.readOutcome(
+                    from: pasteboard,
+                    lastChangeCount: changeCount,
+                    retriesUnchangedPasteboard: true
+                )
+                #expect(retried.payload?.text == "Copied text")
             }
         }
 
@@ -188,31 +188,63 @@ enum PasteboardAndServicesTests {
         @Test
         func aStandaloneImageIsStoredAndThenReusedByDigest() throws {
             let pngData = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 16)
+            let derivedKeys = ClipBookDerivedKeys(masterKey: SymmetricKey(size: .bits256))
             try TestSupport.withTemporaryDirectory { directory in
                 try TestSupport.withUniquePasteboard { pasteboard in
                     pasteboard.clearContents()
                     pasteboard.setData(pngData, forType: .png)
 
-                    let first = PasteboardAndServicesTests.readOutcome(from: pasteboard, imagesDirectory: directory)
+                    let first = PasteboardAndServicesTests.readOutcome(
+                        from: pasteboard,
+                        computeImageDigest: { HistoryCrypto.imageDigest(forPNGData: $0, keys: derivedKeys) }
+                    )
                     let firstImage = try #require(first.payload?.image)
                     #expect(!firstImage.reusesStoredFile)
+                    #expect(firstImage.pngData == pngData)
+                    #expect(firstImage.existingAssetPath == nil)
+                    #expect(firstImage.pixelWidth == 20)
+                    #expect(firstImage.pixelHeight == 16)
+                    #expect(firstImage.byteSize == pngData.count)
+                    let directoryEntries = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+                    #expect(directoryEntries.isEmpty, "PasteboardReader must never write plaintext PNG files to disk")
+
+                    let storedURL = directory.appendingPathComponent("stored.enc")
+                    try Data("CBENC01\0".utf8).write(to: storedURL)
 
                     let second = PasteboardAndServicesTests.readOutcome(
                         from: pasteboard,
-                        imagesDirectory: directory,
+                        computeImageDigest: { HistoryCrypto.imageDigest(forPNGData: $0, keys: derivedKeys) },
                         findStoredImage: { digest in
                             guard digest == firstImage.digest else { return nil }
                             return StoredImage(
-                                assetPath: firstImage.assetPath,
+                                assetPath: storedURL.path,
                                 recognizedContent: RecognizedImageContent(text: "OCR Text", qrCodeText: "https://qr.example")
                             )
                         }
                     )
                     let reused = try #require(second.payload?.image)
                     #expect(reused.reusesStoredFile)
-                    #expect(reused.assetPath == firstImage.assetPath)
+                    #expect(reused.pngData == nil)
+                    #expect(reused.existingAssetPath == storedURL.path)
                     #expect(reused.recognizedContent.text == "OCR Text")
                     #expect(reused.recognizedContent.qrCodeText == "https://qr.example")
+
+                    try FileManager.default.removeItem(at: storedURL)
+                    let missingFallback = PasteboardAndServicesTests.readOutcome(
+                        from: pasteboard,
+                        computeImageDigest: { HistoryCrypto.imageDigest(forPNGData: $0, keys: derivedKeys) },
+                        findStoredImage: { digest in
+                            guard digest == firstImage.digest else { return nil }
+                            return StoredImage(
+                                assetPath: storedURL.path,
+                                recognizedContent: RecognizedImageContent(text: "OCR Text", qrCodeText: nil)
+                            )
+                        }
+                    )
+                    let restaged = try #require(missingFallback.payload?.image)
+                    #expect(!restaged.reusesStoredFile)
+                    #expect(restaged.pngData == pngData)
+                    #expect(restaged.existingAssetPath == nil)
                 }
             }
         }
@@ -252,17 +284,14 @@ enum PasteboardAndServicesTests {
             from application: FrontmostApplication?,
             ignoring entries: [String] = []
         ) throws -> PasteboardReadResult.Outcome {
-            try TestSupport.withTemporaryDirectory { directory in
-                try TestSupport.withUniquePasteboard { pasteboard in
-                    pasteboard.clearContents()
-                    pasteboard.setString("Copied text", forType: .string)
-                    return PasteboardAndServicesTests.readOutcome(
-                        from: pasteboard,
-                        imagesDirectory: directory,
-                        ignoredApplicationEntries: entries,
-                        frontmostApplication: application
-                    )
-                }
+            TestSupport.withUniquePasteboard { pasteboard in
+                pasteboard.clearContents()
+                pasteboard.setString("Copied text", forType: .string)
+                return PasteboardAndServicesTests.readOutcome(
+                    from: pasteboard,
+                    ignoredApplicationEntries: entries,
+                    frontmostApplication: application
+                )
             }
         }
 
@@ -401,8 +430,9 @@ enum PasteboardAndServicesTests {
                         let first = try #require(pasteboardItems.first)
                         #expect(first.string(forType: PasteboardMonitor.ghostType) == "1", "\(testCase.label)")
                         #expect(first.types.contains(testCase.contentType), "\(testCase.label)")
+                        #expect(!first.types.contains(PasteboardReader.concealedType), "\(testCase.label) should omit ConcealedType on benign item")
 
-                        let outcome = PasteboardAndServicesTests.readOutcome(from: pasteboard, imagesDirectory: directory)
+                        let outcome = PasteboardAndServicesTests.readOutcome(from: pasteboard)
                         #expect(outcome.isSkipped, "PasteboardReader should skip the \(testCase.label) write: \(outcome)")
                     }
 
@@ -411,6 +441,111 @@ enum PasteboardAndServicesTests {
                     try service.copy(ClipboardItem.fixture(kind: .richText, text: nil), variant: .standard)
                     #expect(pasteboard.string(forType: PasteboardMonitor.ghostType) == "1")
                     #expect(pasteboard.pasteboardItems?.count == 1)
+                }
+            }
+        }
+
+        @Test
+        func copyingEncryptedImageDecryptsPNGAndLazyTIFFAndStampsConcealedTypeAcrossSensitiveVariants() throws {
+            let secretToken = PasteboardAndServicesTests.makeRuntimeSecretToken(tag: "paste")
+            #expect(SensitiveContent.shouldEncryptAtRest(.fixture(kind: .text, text: secretToken)))
+
+            try TestSupport.withTemporaryHistoryStore { store, supportDir in
+                let pngData = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 18)
+                let imageID = UUID()
+                let encURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: imageID, encrypted: true)
+                let rawEnc = try Data(contentsOf: encURL)
+                #expect(rawEnc.starts(with: ImageAssetStore.encryptedMagic))
+                #expect(rawEnc.firstRange(of: Data([0x89, 0x50, 0x4E, 0x47])) == nil)
+
+                let pdfURL = supportDir.appendingPathComponent("secret-\(secretToken).pdf")
+                try TestSupport.makePDFData().write(to: pdfURL)
+                let rtfData = try TestSupport.makeRTFData(text: "Header")
+
+                let sensitiveImage = ClipboardItem.fixture(
+                    id: imageID,
+                    kind: .image,
+                    text: "Token \(secretToken)",
+                    assetPath: encURL.path,
+                    sensitivity: .sensitive
+                )
+                let sensitiveRich = ClipboardItem.fixture(
+                    kind: .richText,
+                    text: "Rich body",
+                    rtfData: rtfData,
+                    html: "<a href='https://example.com?token=\(secretToken)'>Rich body</a>"
+                )
+                let sensitiveFile = ClipboardItem.fixture(
+                    kind: .file,
+                    text: nil,
+                    filePaths: [pdfURL.path],
+                    sensitivity: .sensitive
+                )
+                let notSensitiveOverride = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Override \(secretToken)",
+                    sensitivity: .notSensitive
+                )
+                #expect(SensitiveContent.shouldEncryptAtRest(sensitiveImage))
+                #expect(SensitiveContent.shouldEncryptAtRest(sensitiveRich))
+                #expect(SensitiveContent.shouldEncryptAtRest(sensitiveFile))
+                #expect(!SensitiveContent.shouldEncryptAtRest(notSensitiveOverride))
+
+                let sensitiveCases: [(label: String, item: ClipboardItem, variant: PasteVariant)] = [
+                    ("image standard", sensitiveImage, .standard),
+                    ("image plainText", sensitiveImage, .plainText),
+                    ("text standard", .fixture(kind: .text, text: "Bearer \(secretToken)"), .standard),
+                    ("text plainText", .fixture(kind: .text, text: "Bearer \(secretToken)"), .plainText),
+                    ("rich standard", sensitiveRich, .standard),
+                    ("rich rich", sensitiveRich, .rich),
+                    ("file standard", sensitiveFile, .standard),
+                    ("file filePath", sensitiveFile, .filePath)
+                ]
+
+                try TestSupport.withUniquePasteboard { pasteboard in
+                    let service = PasteService(pasteboard: pasteboard, loadFormatting: { $0 })
+
+                    for entry in sensitiveCases {
+                        try service.copy(entry.item, variant: entry.variant)
+                        let items = try #require(pasteboard.pasteboardItems, "\(entry.label)")
+                        #expect(items.count == 1, "\(entry.label)")
+                        let pbItem = try #require(items.first, "\(entry.label)")
+                        #expect(pbItem.string(forType: PasteboardMonitor.ghostType) == "1", "\(entry.label)")
+                        #expect(pbItem.types.contains(PasteboardReader.concealedType), "\(entry.label) must carry ConcealedType")
+                        if entry.label == "image standard" {
+                            #expect(pbItem.data(forType: .png) == pngData)
+                            #expect(pbItem.data(forType: .tiff) != nil)
+                        }
+                    }
+
+                    // Explicit .notSensitive override omits ConcealedType.
+                    try service.copy(notSensitiveOverride, variant: .standard)
+                    let nonSensitivePB = try #require(pasteboard.pasteboardItems?.first)
+                    #expect(!nonSensitivePB.types.contains(PasteboardReader.concealedType))
+
+                    // copyText sets ConcealedType only when markAsConcealed is true.
+                    try service.copyText("Concealed OCR line", markAsGhost: false, markAsConcealed: true)
+                    #expect((pasteboard.types ?? []).contains(PasteboardReader.concealedType))
+                    #expect(pasteboard.string(forType: PasteboardMonitor.ghostType) == nil)
+
+                    try service.copyText("Benign OCR line", markAsGhost: true, markAsConcealed: false)
+                    #expect(!(pasteboard.types ?? []).contains(PasteboardReader.concealedType))
+                    #expect(pasteboard.string(forType: PasteboardMonitor.ghostType) == "1")
+
+                    // Transplanted clipB pointing at clipA's .enc throws unsupportedItem.
+                    let transplanted = ClipboardItem.fixture(
+                        id: UUID(),
+                        kind: .image,
+                        text: nil,
+                        assetPath: encURL.path
+                    )
+                    #expect(throws: PasteServiceError.unsupportedItem) {
+                        try service.copy(transplanted, variant: .standard)
+                    }
+
+                    // Verify Images/<id>.enc on disk is still encrypted.
+                    let afterDisk = try Data(contentsOf: encURL)
+                    #expect(afterDisk == rawEnc)
                 }
             }
         }
@@ -462,18 +597,26 @@ enum PasteboardAndServicesTests {
         let clock: MutableClock
         let store: GRDBHistoryStore
         let pasteboard: NSPasteboard
+        let supportDirectory: URL
 
-        init(monitor: PasteboardMonitor, clock: MutableClock, store: GRDBHistoryStore, pasteboard: NSPasteboard) {
+        init(
+            monitor: PasteboardMonitor,
+            clock: MutableClock,
+            store: GRDBHistoryStore,
+            pasteboard: NSPasteboard,
+            supportDirectory: URL
+        ) {
             self.monitor = monitor
             self.clock = clock
             self.store = store
             self.pasteboard = pasteboard
+            self.supportDirectory = supportDirectory
             monitor.delegate = delegate
         }
 
         /// Hands the monitor what a poll would have read after `changeCount` changed, and waits
         /// until the delegate has heard about any capture it makes.
-        func deliver(_ payload: PasteboardContent.Payload, changeCount: Int) async {
+        func deliver(_ payload: PasteboardContent.Payload, changeCount: Int, isConcealed: Bool = false) async {
             monitor.processReadResultForTesting(
                 PasteboardReadResult(
                     changeCount: changeCount,
@@ -481,7 +624,8 @@ enum PasteboardAndServicesTests {
                         PasteboardContent(
                             payload: payload,
                             sourceAppName: "Notes",
-                            sourceBundleIdentifier: "com.apple.Notes"
+                            sourceBundleIdentifier: "com.apple.Notes",
+                            isConcealed: isConcealed
                         )
                     )
                 )
@@ -499,6 +643,8 @@ enum PasteboardAndServicesTests {
     private static func withMonitor<T>(
         clockStart: TimeInterval = 1_700_000_000,
         preferences configurePreferences: ((inout AppPreferences) -> Void)? = nil,
+        recognizeImageData: (@Sendable (Data) -> RecognizedImageContent)? = nil,
+        recognizeImageFile: (@Sendable (URL) -> RecognizedImageContent)? = nil,
         _ body: (MonitorFixture) async throws -> T
     ) async throws -> T {
         try await TestSupport.withTemporaryDirectory { supportDirectory in
@@ -514,7 +660,9 @@ enum PasteboardAndServicesTests {
                     fileManager: .default,
                     supportDirectory: supportDirectory,
                     pasteboard: pasteboard,
-                    now: { clock.current }
+                    now: { clock.current },
+                    recognizeImageData: recognizeImageData ?? ImageTextRecognizer.recognizeContent(ofPNGData:),
+                    recognizeImageFile: recognizeImageFile ?? ImageTextRecognizer.recognizeContent(ofImageAt:)
                 )
                 defer { monitor.stop() }
                 if let configurePreferences {
@@ -522,7 +670,15 @@ enum PasteboardAndServicesTests {
                     configurePreferences(&preferences)
                     monitor.updatePreferences(preferences)
                 }
-                return try await body(MonitorFixture(monitor: monitor, clock: clock, store: store, pasteboard: pasteboard))
+                return try await body(
+                    MonitorFixture(
+                        monitor: monitor,
+                        clock: clock,
+                        store: store,
+                        pasteboard: pasteboard,
+                        supportDirectory: supportDirectory
+                    )
+                )
             }
         }
     }
@@ -816,33 +972,692 @@ enum PasteboardAndServicesTests {
         @Test
         @MainActor
         func imageCaptureSearchTextIncludesRecognizedContentAndSourceAppWithoutAssetPath() async throws {
-            try await TestSupport.withTemporaryDirectory { directory in
-                let id = UUID()
-                let assetPath = directory.appendingPathComponent("\(id.uuidString).png").path
-                try await PasteboardAndServicesTests.withMonitor { fixture in
-                    await fixture.deliver(
-                        .image(
-                            id: id,
-                            assetPath: assetPath,
-                            byteSize: 128,
-                            recognizedContent: RecognizedImageContent(
-                                text: "OCR Invoice",
-                                qrCodeText: "https://qr.example"
-                            ),
-                            digest: "abc",
-                            reusesStoredFile: false
+            let pngData = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 16)
+            let id = UUID()
+            try await PasteboardAndServicesTests.withMonitor(
+                recognizeImageData: { _ in
+                    RecognizedImageContent(text: "OCR Invoice", qrCodeText: "https://qr.example")
+                }
+            ) { fixture in
+                await fixture.deliver(
+                    .image(
+                        id: id,
+                        pngData: pngData,
+                        existingAssetPath: nil,
+                        pixelWidth: 20,
+                        pixelHeight: 16,
+                        byteSize: pngData.count,
+                        recognizedContent: RecognizedImageContent(
+                            text: "OCR Invoice",
+                            qrCodeText: "https://qr.example"
                         ),
-                        changeCount: 1
-                    )
+                        digest: fixture.store.computeImageDigest(forPNGData: pngData),
+                        reusesStoredFile: false
+                    ),
+                    changeCount: 1
+                )
 
-                    let captured = try #require(fixture.delegate.items.first)
-                    #expect(captured.id == id)
-                    #expect(captured.kind == .image)
-                    #expect(captured.searchText.contains("OCR Invoice"))
-                    #expect(captured.searchText.contains("https://qr.example"))
-                    #expect(captured.searchText.contains("Notes"))
-                    #expect(!captured.searchText.contains(id.uuidString))
-                    #expect(!captured.searchText.localizedCaseInsensitiveContains("png"))
+                let captured = try #require(fixture.delegate.items.first)
+                #expect(captured.id == id)
+                #expect(captured.kind == .image)
+                #expect(captured.searchText.contains("OCR Invoice"))
+                #expect(captured.searchText.contains("https://qr.example"))
+                #expect(captured.searchText.contains("Notes"))
+                #expect(!captured.searchText.contains(id.uuidString))
+                #expect(!captured.searchText.localizedCaseInsensitiveContains("png"))
+                #expect(!captured.searchText.localizedCaseInsensitiveContains("enc"))
+            }
+        }
+
+        @Test
+        @MainActor
+        func concealedImageWithDontSaveWritesZeroFilesToImagesDirectory() async throws {
+            let pngData = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 18)
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: { $0.confidentialContentLifetime = ContentLifetime.dontSave }
+            ) { fixture in
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(pngData, forType: .png)
+                fixture.pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
+
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                #expect(fixture.delegate.items.isEmpty)
+                #expect((try? fixture.store.fetchAll())?.isEmpty == true)
+                let imagesDir = fixture.supportDirectory.appendingPathComponent("Images", isDirectory: true)
+                let files = (try? FileManager.default.contentsOfDirectory(atPath: imagesDir.path)) ?? []
+                #expect(files.isEmpty, "Concealed image with dontSave must write zero files to Images/")
+            }
+        }
+
+        @Test
+        @MainActor
+        func recopyingImageWithMissingStoredFileRestagesUnderExistingIDWithoutAADMismatch() async throws {
+            let pngData = try TestSupport.makePNGData(pixelWidth: 28, pixelHeight: 20)
+            try await PasteboardAndServicesTests.withMonitor(
+                recognizeImageData: { _ in RecognizedImageContent(text: "Receipt 42", qrCodeText: nil) }
+            ) { fixture in
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(pngData, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let original = try #require(fixture.delegate.items.first)
+                let arrivedFirst = await TestSupport.waitUntil { !fixture.delegate.recognizedEvents.isEmpty }
+                #expect(arrivedFirst)
+                _ = try fixture.store.finalizeRecognizedImage(
+                    id: original.id,
+                    content: RecognizedImageContent(text: "Receipt 42", qrCodeText: nil),
+                    sensitiveContentLifetime: ContentLifetime.keep
+                )
+
+                let storedAfterFirst = try #require(try fixture.store.fetchAll().first)
+                let firstAssetPath = try #require(storedAfterFirst.assetPath)
+                try FileManager.default.removeItem(atPath: firstAssetPath)
+                #expect(!FileManager.default.fileExists(atPath: firstAssetPath))
+
+                fixture.clock.advance(by: 10)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(pngData, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let recopied = try #require(fixture.delegate.items.first)
+                #expect(recopied.id == original.id, "Re-copying missing-file image must re-stage under existing.id")
+                let restagedPath = try #require(recopied.assetPath)
+                #expect(restagedPath.hasSuffix("\(original.id.uuidString).enc"))
+                #expect(FileManager.default.fileExists(atPath: restagedPath))
+
+                let decrypted = try ImageAssetStore.readAssetData(
+                    at: URL(fileURLWithPath: restagedPath),
+                    role: .image,
+                    ownerClipID: original.id,
+                    requiresEncryption: true
+                )
+                #expect(decrypted == pngData)
+            }
+        }
+
+        @Test
+        @MainActor
+        func doubleCopyingImageWhileCopyAndMergeEnabledPreservesPendingPNGDataThroughCaptureFallback() async throws {
+            let pngData = try TestSupport.makePNGData(pixelWidth: 22, pixelHeight: 18)
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                    $0.copyToClipboardAfterMerge = true
+                },
+                recognizeImageData: { _ in RecognizedImageContent(text: "Double copy OCR", qrCodeText: nil) }
+            ) { fixture in
+                // Seed a text target so copyAndMergeTargetItem() is non-nil while copyAndMergedItem returns nil on .image.
+                _ = try fixture.store.capture(.fixture(kind: .text, text: "Target text"), updatesCopySequence: false)
+
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(pngData, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+                #expect(fixture.delegate.capturedHistory.isEmpty, "First copy should be held for Copy & Merge window")
+
+                // Double-copy the same image within the 0.5s hold window.
+                fixture.clock.advance(by: 0.1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(pngData, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                #expect(fixture.delegate.capturedHistory.count == 1)
+                let captured = try #require(fixture.delegate.items.first)
+                #expect(captured.kind == .image)
+                let assetPath = try #require(captured.assetPath)
+                #expect(assetPath.hasSuffix(".enc"))
+                #expect(FileManager.default.fileExists(atPath: assetPath))
+
+                let decrypted = try ImageAssetStore.readAssetData(
+                    at: URL(fileURLWithPath: assetPath),
+                    role: .image,
+                    ownerClipID: captured.id,
+                    requiresEncryption: true
+                )
+                #expect(decrypted == pngData)
+
+                let ocrDone = await TestSupport.waitUntil { !fixture.delegate.recognizedEvents.isEmpty }
+                #expect(ocrDone)
+                #expect(fixture.delegate.recognizedEvents.first?.id == captured.id)
+            }
+        }
+
+        @Test
+        @MainActor
+        func copyAndMergePropagatesConcealedTypeSensitivityMinimumExpiryAndStoredContentKey() async throws {
+            let secretToken = PasteboardAndServicesTests.makeRuntimeSecretToken(tag: "merge")
+            let longPrefix = String(repeating: "m", count: 9_000)
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                    $0.copyAndMergeSeparator = CopyAndMergeSeparatorPreference.space.rawValue
+                    $0.copyToClipboardAfterMerge = true
+                    $0.confidentialContentLifetime = 120
+                    $0.sensitiveContentLifetime = 60
+                }
+            ) { fixture in
+                fixture.clock.advance(by: 1)
+                await fixture.deliver(.text(longPrefix), changeCount: 1, isConcealed: true)
+                fixture.clock.advance(by: 0.6)
+                await fixture.deliverUnchanged(changeCount: 1)
+
+                let firstCaptured = try #require(fixture.delegate.capturedHistory.last?.item)
+                #expect(firstCaptured.sensitivity == .sensitive)
+                let firstExpiry = try #require(firstCaptured.expiresAt)
+
+                // Double-copy a secret token within the hold window so it merges into the concealed item.
+                fixture.clock.advance(by: 5)
+                await fixture.deliver(.text(secretToken), changeCount: 2)
+                fixture.clock.advance(by: 0.1)
+                await fixture.deliver(.text(secretToken), changeCount: 3)
+
+                let merged = try #require(fixture.delegate.capturedHistory.last?.item)
+                #expect(merged.sensitivity == .sensitive)
+                #expect(merged.storedContentKey != nil, ">8 KB Copy & Merge item must retain storedContentKey")
+                let mergedExpiry = try #require(merged.expiresAt)
+                #expect(mergedExpiry <= firstExpiry)
+                #expect((fixture.pasteboard.types ?? []).contains(PasteboardReader.concealedType))
+                #expect(fixture.pasteboard.string(forType: PasteboardMonitor.ghostType) == "1")
+            }
+        }
+    }
+
+    @Suite(.serialized)
+    struct EncryptedAssetReadersAndDragTests {
+        @Test
+        @MainActor
+        func encryptedAssetReadersRejectPlaintextDowngradeOverwriteAndCrossClipTransplant() async throws {
+            TestSupport.ensureAppKitInitialized()
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let keyProvider = InMemoryDatabaseKeyProvider()
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                defer { store.close() }
+
+                let pngData = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 24)
+                let clipA = UUID()
+                let clipB = UUID()
+                let encURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: clipA, encrypted: true)
+                let plainURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: clipB, encrypted: false)
+                let linkClipID = UUID()
+                let linkEncURL = try store.writeManagedAsset(pngData: pngData, role: .linkPreview, clipID: linkClipID, encrypted: true)
+                let linkPlainClipID = UUID()
+                let linkPlainURL = try store.writeManagedAsset(pngData: pngData, role: .linkPreview, clipID: linkPlainClipID, encrypted: false)
+
+                @MainActor
+                func makeOffscreenHostWindow(hosting card: LinkPreviewCardView) -> NSWindow {
+                    let window = NSWindow(
+                        contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+                        styleMask: [.titled],
+                        backing: .buffered,
+                        defer: false
+                    )
+                    window.isReleasedWhenClosed = false
+                    card.frame = NSRect(x: 0, y: 0, width: 320, height: 240)
+                    window.contentView = card
+                    card.layoutSubtreeIfNeeded()
+                    return window
+                }
+
+                @MainActor
+                func revealedCardImages(in root: NSView) -> [NSImageView] {
+                    let own = (root as? NSImageView).map { [$0] } ?? []
+                    let children = root.subviews.flatMap { revealedCardImages(in: $0) }
+                    return (own + children).filter { !$0.isHidden && $0.image != nil && $0.image?.isTemplate == false }
+                }
+
+                // 1. Valid owner-bound .enc reads succeed in ImageAssetStore, ImageAssetThumbnailLoader, and LinkPreviewCardView.
+                let validData = try ImageAssetStore.readAssetData(
+                    at: encURL,
+                    role: .image,
+                    ownerClipID: clipA,
+                    requiresEncryption: true
+                )
+                #expect(validData == pngData)
+
+                var decodedThumb: NSImage?
+                var didFinishDecode = false
+                let immediate = ImageAssetThumbnailLoader.shared.thumbnail(
+                    for: encURL,
+                    maximumPixelSize: 128,
+                    assetContext: .init(role: .image, ownerClipID: clipA, requiresEncryption: true)
+                ) { img in
+                    decodedThumb = img
+                    didFinishDecode = true
+                }
+                if let immediate {
+                    decodedThumb = immediate
+                    didFinishDecode = true
+                }
+                let thumbLoaded = await TestSupport.waitUntil { didFinishDecode }
+                #expect(thumbLoaded)
+                #expect(decodedThumb != nil)
+
+                let validLinkPreview = LinkPreview(
+                    url: try #require(URL(string: "https://example.com")),
+                    title: "Encrypted Card",
+                    description: "Preview",
+                    image: nil,
+                    favicon: nil,
+                    imageURL: linkEncURL,
+                    ownerClipID: linkClipID,
+                    requiresEncryptedAssets: true
+                )
+                let validCard = LinkPreviewCardView(preview: validLinkPreview, layout: .vertical)
+                let validHostWindow = makeOffscreenHostWindow(hosting: validCard)
+                defer {
+                    validHostWindow.contentView = nil
+                    validHostWindow.close()
+                }
+                let cardLoaded = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    !revealedCardImages(in: validCard).isEmpty
+                }
+                #expect(cardLoaded)
+
+                // 2. Pointing a sensitive item (requiresEncryption == true) at a plain .png fails closed.
+                #expect(throws: HistoryStoreError.authenticationFailed) {
+                    _ = try ImageAssetStore.readAssetData(
+                        at: plainURL,
+                        role: .image,
+                        ownerClipID: clipB,
+                        requiresEncryption: true
+                    )
+                }
+                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: plainURL.path)
+                var downgradeThumb: NSImage? = NSImage(size: NSSize(width: 1, height: 1))
+                var downgradeDone = false
+                _ = ImageAssetThumbnailLoader.shared.thumbnail(
+                    for: plainURL,
+                    maximumPixelSize: 128,
+                    assetContext: .init(role: .image, ownerClipID: clipB, requiresEncryption: true)
+                ) { img in
+                    downgradeThumb = img
+                    downgradeDone = true
+                }
+                let waitedDowngrade = await TestSupport.waitUntil { downgradeDone }
+                #expect(waitedDowngrade)
+                #expect(downgradeThumb == nil)
+
+                let downgradedLinkPreview = LinkPreview(
+                    url: try #require(URL(string: "https://example.com")),
+                    title: "Downgraded Card",
+                    description: "Preview",
+                    image: nil,
+                    favicon: nil,
+                    imageURL: linkPlainURL,
+                    ownerClipID: linkPlainClipID,
+                    requiresEncryptedAssets: true
+                )
+                let downgradedCard = LinkPreviewCardView(preview: downgradedLinkPreview, layout: .vertical)
+                let downgradedHostWindow = makeOffscreenHostWindow(hosting: downgradedCard)
+                defer {
+                    downgradedHostWindow.contentView = nil
+                    downgradedHostWindow.close()
+                }
+                try? await Task.sleep(for: .milliseconds(120))
+                #expect(revealedCardImages(in: downgradedCard).isEmpty)
+
+                // 3. Transplanting Images/<clipA>.enc onto clipB (even with requiresEncryption == false) fails AAD check.
+                #expect(throws: HistoryStoreError.authenticationFailed) {
+                    _ = try ImageAssetStore.readAssetData(
+                        at: encURL,
+                        role: .image,
+                        ownerClipID: clipB,
+                        requiresEncryption: false
+                    )
+                }
+                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: encURL.path)
+                var transplantThumb: NSImage? = NSImage(size: NSSize(width: 1, height: 1))
+                var transplantDone = false
+                _ = ImageAssetThumbnailLoader.shared.thumbnail(
+                    for: encURL,
+                    maximumPixelSize: 128,
+                    assetContext: .init(role: .image, ownerClipID: clipB, requiresEncryption: false)
+                ) { img in
+                    transplantThumb = img
+                    transplantDone = true
+                }
+                let waitedTransplant = await TestSupport.waitUntil { transplantDone }
+                #expect(waitedTransplant)
+                #expect(transplantThumb == nil)
+
+                let transplantedLinkPreview = LinkPreview(
+                    url: try #require(URL(string: "https://example.com")),
+                    title: "Transplanted Card",
+                    description: "Preview",
+                    image: nil,
+                    favicon: nil,
+                    imageURL: linkEncURL,
+                    ownerClipID: clipB,
+                    requiresEncryptedAssets: false
+                )
+                let transplantedCard = LinkPreviewCardView(preview: transplantedLinkPreview, layout: .vertical)
+                let transplantedHostWindow = makeOffscreenHostWindow(hosting: transplantedCard)
+                defer {
+                    transplantedHostWindow.contentView = nil
+                    transplantedHostWindow.close()
+                }
+                try? await Task.sleep(for: .milliseconds(120))
+                #expect(revealedCardImages(in: transplantedCard).isEmpty)
+
+                // 4. Overwriting Images/<clipA>.enc in place with raw .png bytes fails closed.
+                try pngData.write(to: encURL, options: .atomic)
+                #expect(throws: HistoryStoreError.authenticationFailed) {
+                    _ = try ImageAssetStore.readAssetData(
+                        at: encURL,
+                        role: .image,
+                        ownerClipID: clipA,
+                        requiresEncryption: false
+                    )
+                }
+            }
+        }
+
+        @Test
+        @MainActor
+        func thumbnailLoaderEvictsByEpochAndPreservesKeyRegistryAcrossOverlappingStoreReopen() async throws {
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let sharedKeyProvider = InMemoryDatabaseKeyProvider(key: SymmetricKey(size: .bits256))
+                let store1 = GRDBHistoryStore(directory: supportDir, keyProvider: sharedKeyProvider)
+                let pngData = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 32)
+                let clipID = UUID()
+                let encURL = try store1.writeManagedAsset(pngData: pngData, role: .image, clipID: clipID, encrypted: true)
+
+                // Populate cache on store1.
+                var loaded1: NSImage?
+                var done1 = false
+                if let cached = ImageAssetThumbnailLoader.shared.thumbnail(
+                    for: encURL,
+                    maximumPixelSize: 128,
+                    assetContext: .init(role: .image, ownerClipID: clipID, requiresEncryption: true),
+                    completion: { img in
+                        loaded1 = img
+                        done1 = true
+                    }
+                ) {
+                    loaded1 = cached
+                    done1 = true
+                }
+                #expect(await TestSupport.waitUntil { done1 })
+                #expect(loaded1 != nil)
+                #expect(
+                    ImageAssetThumbnailLoader.shared.thumbnail(
+                        for: encURL,
+                        maximumPixelSize: 128,
+                        assetContext: .init(role: .image, ownerClipID: clipID, requiresEncryption: true),
+                        completion: { _ in }
+                    ) != nil
+                )
+
+                // Epoch-safe eviction clears the cached thumbnail immediately.
+                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: encURL.path)
+                let postEvictImmediate = ImageAssetThumbnailLoader.shared.thumbnail(
+                    for: encURL,
+                    maximumPixelSize: 128,
+                    assetContext: .init(role: .image, ownerClipID: clipID, requiresEncryption: true),
+                    completion: { _ in }
+                )
+                #expect(postEvictImmediate == nil)
+
+                // Open store2 on the same supportDirectory BEFORE closing store1 (and let an extra ephemeral store deinit).
+                let store2 = GRDBHistoryStore(directory: supportDir, keyProvider: sharedKeyProvider)
+                defer { store2.close() }
+                _ = try store2.fetchAll()
+
+                do {
+                    let transientStore = GRDBHistoryStore(directory: supportDir, keyProvider: sharedKeyProvider)
+                    _ = try transientStore.fetchAll()
+                    // Re-register store2 by writing/opening on store2, then close store1 and let transientStore deinit:
+                    // wait — store2 opened before transientStore, so closing store1 must NOT unregister transientStore/store2!
+                    store1.close()
+                    transientStore.close()
+                }
+
+                // Re-open store3 after store1/transientStore closed and verify store2 closing cannot clobber store3!
+                let store3 = GRDBHistoryStore(directory: supportDir, keyProvider: sharedKeyProvider)
+                defer { store3.close() }
+                _ = try store3.fetchAll()
+                store2.close()
+
+                let decryptedAfterStore2Close = try ImageAssetStore.readAssetData(
+                    at: encURL,
+                    role: .image,
+                    ownerClipID: clipID,
+                    requiresEncryption: true
+                )
+                #expect(decryptedAfterStore2Close == pngData, "Closing an older store instance must not unregister a newer store's keys")
+
+                store3.close()
+                #expect(throws: HistoryStoreError.encryptionKeyUnavailable(.notFound)) {
+                    _ = try ImageAssetStore.readAssetData(
+                        at: encURL,
+                        role: .image,
+                        ownerClipID: clipID,
+                        requiresEncryption: true
+                    )
+                }
+            }
+        }
+
+        @Test
+        @MainActor
+        func imageAssetDragItemAndImageDragFilesHardenDirectoryDecryptAuthorizedDragsRejectTamperAndScrubDotFiles() throws {
+            defer { ImageDragFiles.removeAll() }
+
+            try TestSupport.withTemporaryHistoryStore { store, _ in
+                let pngData = try TestSupport.makePNGData(pixelWidth: 28, pixelHeight: 20)
+                let clipA = UUID()
+                let clipB = UUID()
+                let encURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: clipA, encrypted: true)
+                let plainURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: clipB, encrypted: false)
+                let originalEncBytes = try Data(contentsOf: encURL)
+
+                // 1. Authorized .enc drag provides decrypted PNG, TIFF, .fileURL, and ConcealedType while Images/<id>.enc stays encrypted.
+                try TestSupport.withUniquePasteboard { pasteboard in
+                    pasteboard.clearContents()
+                    let dragItem = ImageAssetDragItem.make(
+                        assetURL: encURL,
+                        fileName: "SecretDiagram.png",
+                        ownerClipID: clipA,
+                        requiresEncryption: true
+                    )
+                    #expect(pasteboard.writeObjects([dragItem]))
+
+                    let fileURLString = try #require(pasteboard.string(forType: .fileURL))
+                    let draggedFileURL = try #require(URL(string: fileURLString))
+                    let canonicalDragRoot = ImageDragFiles.directory.resolvingSymlinksInPath().standardizedFileURL
+                    let canonicalDraggedFile = draggedFileURL.resolvingSymlinksInPath().standardizedFileURL
+                    #expect(canonicalDraggedFile.path.hasPrefix(canonicalDragRoot.path + "/"))
+                    #expect(try Data(contentsOf: draggedFileURL) == pngData)
+                    #expect(pasteboard.data(forType: .png) == pngData)
+                    #expect(pasteboard.data(forType: .tiff) != nil)
+                    #expect((pasteboard.types ?? []).contains(PasteboardReader.concealedType))
+
+                    // Verify 0o700 + isExcludedFromBackup on ImageDragFiles.directory, 0o700 on UUID subdir, and 0o600 on PNG file.
+                    var rootStat = stat()
+                    #expect(Darwin.lstat(ImageDragFiles.directory.path, &rootStat) == 0)
+                    #expect((rootStat.st_mode & 0o777) == 0o700)
+                    let rootValues = try ImageDragFiles.directory.resourceValues(forKeys: [.isExcludedFromBackupKey])
+                    #expect(rootValues.isExcludedFromBackup == true)
+
+                    var folderStat = stat()
+                    #expect(Darwin.lstat(draggedFileURL.deletingLastPathComponent().path, &folderStat) == 0)
+                    #expect((folderStat.st_mode & 0o777) == 0o700)
+
+                    var fileStat = stat()
+                    #expect(Darwin.lstat(draggedFileURL.path, &fileStat) == 0)
+                    #expect((fileStat.st_mode & 0o777) == 0o600)
+
+                    // Source .enc on disk remains untouched and encrypted.
+                    #expect(try Data(contentsOf: encURL) == originalEncBytes)
+                }
+
+                // 2. Non-sensitive plain .png drag omits ConcealedType.
+                try TestSupport.withUniquePasteboard { pasteboard in
+                    pasteboard.clearContents()
+                    let plainDrag = ImageAssetDragItem.make(
+                        assetURL: plainURL,
+                        fileName: "PublicPhoto.png",
+                        ownerClipID: clipB,
+                        requiresEncryption: false
+                    )
+                    #expect(pasteboard.writeObjects([plainDrag]))
+                    #expect(pasteboard.string(forType: .fileURL) != nil)
+                    #expect(pasteboard.data(forType: .png) == pngData)
+                    #expect(!(pasteboard.types ?? []).contains(PasteboardReader.concealedType))
+                }
+
+                // 3. Transplanted / downgraded / tampered drag items attach NO .fileURL and yield nil PNG/TIFF data.
+                try TestSupport.withUniquePasteboard { pasteboard in
+                    pasteboard.clearContents()
+                    let transplantedDrag = ImageAssetDragItem.make(
+                        assetURL: encURL,
+                        fileName: "Transplant.png",
+                        ownerClipID: clipB,
+                        requiresEncryption: false
+                    )
+                    #expect(transplantedDrag.string(forType: .fileURL) == nil)
+                    #expect(pasteboard.writeObjects([transplantedDrag]))
+                    #expect(pasteboard.string(forType: .fileURL) == nil)
+                    #expect(pasteboard.data(forType: .png) == nil)
+                    #expect(pasteboard.data(forType: .tiff) == nil)
+
+                    pasteboard.clearContents()
+                    let downgradedDrag = ImageAssetDragItem.make(
+                        assetURL: plainURL,
+                        fileName: "Downgrade.png",
+                        ownerClipID: clipB,
+                        requiresEncryption: true
+                    )
+                    #expect(downgradedDrag.string(forType: .fileURL) == nil)
+                    #expect(pasteboard.writeObjects([downgradedDrag]))
+                    #expect(pasteboard.data(forType: .png) == nil)
+                }
+
+                // 4. Dot-prefixed user title drag files (e.g. .env-keys.png) are enumerated with options: [] and zero-filled via secureUnlink on expiry AND removeAll.
+                let expiredDotFileURL = try #require(
+                    ImageDragFiles.makeCopy(
+                        of: encURL,
+                        named: ".env-keys.png",
+                        ownerClipID: clipA,
+                        requiresEncryption: true
+                    )
+                )
+                #expect(expiredDotFileURL.lastPathComponent == ".env-keys.png")
+                let expiredFD = Darwin.open(expiredDotFileURL.path, O_RDONLY)
+                #expect(expiredFD >= 0)
+                defer {
+                    if expiredFD >= 0 { Darwin.close(expiredFD) }
+                }
+
+                let expiredFolder = expiredDotFileURL.deletingLastPathComponent()
+                let twoHoursAgo = Date().addingTimeInterval(-7_200)
+                try FileManager.default.setAttributes(
+                    [.creationDate: twoHoursAgo, .modificationDate: twoHoursAgo],
+                    ofItemAtPath: expiredFolder.path
+                )
+                ImageDragFiles.removeExpiredCopies(now: Date())
+                #expect(!FileManager.default.fileExists(atPath: expiredDotFileURL.path))
+                #expect(!FileManager.default.fileExists(atPath: expiredFolder.path))
+
+                var scrubbedHeader = [UInt8](repeating: 0xFF, count: 16)
+                let readExpiredBytes = Darwin.pread(expiredFD, &scrubbedHeader, scrubbedHeader.count, 0)
+                #expect(readExpiredBytes == scrubbedHeader.count)
+                #expect(scrubbedHeader.allSatisfy { $0 == 0 }, "Expired dot-prefixed drag file must be zero-filled via secureUnlink")
+
+                let activeDotFileURL = try #require(
+                    ImageDragFiles.makeCopy(
+                        of: encURL,
+                        named: ".env-keys.png",
+                        ownerClipID: clipA,
+                        requiresEncryption: true
+                    )
+                )
+                let activeFD = Darwin.open(activeDotFileURL.path, O_RDONLY)
+                #expect(activeFD >= 0)
+                defer {
+                    if activeFD >= 0 { Darwin.close(activeFD) }
+                }
+
+                ImageDragFiles.removeAll()
+                #expect(!FileManager.default.fileExists(atPath: activeDotFileURL.path))
+                #expect(!FileManager.default.fileExists(atPath: ImageDragFiles.directory.path))
+
+                var scrubbedActiveHeader = [UInt8](repeating: 0xFF, count: 16)
+                let readActiveBytes = Darwin.pread(activeFD, &scrubbedActiveHeader, scrubbedActiveHeader.count, 0)
+                #expect(readActiveBytes == scrubbedActiveHeader.count)
+                #expect(scrubbedActiveHeader.allSatisfy { $0 == 0 }, "removeAll must zero-fill dot-prefixed drag files via secureUnlink")
+            }
+        }
+
+        @Test
+        @MainActor
+        func filePreviewCacheCancelsInFlightGenerationOnRemovePreviewsAndScrubsExistingFiles() async throws {
+            try await TestSupport.withTemporaryDirectory { tempDir in
+                let cacheDir = tempDir.appendingPathComponent("FilePreviews", isDirectory: true)
+                let cache = FilePreviewCache(directory: cacheDir)
+
+                let existingSource = tempDir.appendingPathComponent("existing.png")
+                try TestSupport.makePNGData(pixelWidth: 64, pixelHeight: 64).write(to: existingSource)
+
+                var generatedExisting = false
+                _ = cache.image(
+                    forFileAt: existingSource.path,
+                    targetSize: CGSize(width: 32, height: 32)
+                ) { _ in
+                    generatedExisting = true
+                }
+                #expect(await TestSupport.waitUntil { generatedExisting })
+
+                let cachedEntries = (try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)) ?? []
+                let cachedPNG = try #require(cachedEntries.first { $0.pathExtension == "png" })
+                let cachedFD = Darwin.open(cachedPNG.path, O_RDONLY)
+                #expect(cachedFD >= 0)
+                defer {
+                    if cachedFD >= 0 { Darwin.close(cachedFD) }
+                }
+
+                cache.removePreviews(forFilePaths: [existingSource.path])
+                let afterRemoveEntries = (try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)) ?? []
+                #expect(afterRemoveEntries.isEmpty)
+
+                var scrubbedPreviewBytes = [UInt8](repeating: 0xFF, count: 16)
+                let readCount = Darwin.pread(cachedFD, &scrubbedPreviewBytes, scrubbedPreviewBytes.count, 0)
+                #expect(readCount == scrubbedPreviewBytes.count)
+                #expect(scrubbedPreviewBytes.allSatisfy { $0 == 0 }, "FilePreviewCache.removePreviews must zero-fill cached PNGs via secureUnlink")
+
+                // Schedule an in-flight thumbnail generation for a large image and immediately cancel via removePreviews.
+                let canceledSource = tempDir.appendingPathComponent("canceled-secret.png")
+                try TestSupport.makePNGData(pixelWidth: 1_024, pixelHeight: 768).write(to: canceledSource)
+                let barrierSource = tempDir.appendingPathComponent("barrier.png")
+                try TestSupport.makePNGData(pixelWidth: 48, pixelHeight: 48).write(to: barrierSource)
+
+                var canceledCompletionCalled = false
+                _ = cache.image(
+                    forFileAt: canceledSource.path,
+                    targetSize: CGSize(width: 40, height: 40)
+                ) { _ in
+                    canceledCompletionCalled = true
+                }
+                cache.removePreviews(forFilePaths: [canceledSource.path])
+
+                // Schedule a second image on the serial generationQueue so awaiting it drains the canceled work item.
+                var barrierFinished = false
+                _ = cache.image(
+                    forFileAt: barrierSource.path,
+                    targetSize: CGSize(width: 40, height: 40)
+                ) { _ in
+                    barrierFinished = true
+                }
+                #expect(await TestSupport.waitUntil { barrierFinished })
+                #expect(!canceledCompletionCalled)
+
+                let finalEntries = (try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)) ?? []
+                // Only barrierSource's .png + .json (2 files) may exist; zero files for canceledSource!
+                #expect(finalEntries.count == 2)
+                for jsonURL in finalEntries where jsonURL.pathExtension == "json" {
+                    let jsonText = String(decoding: (try? Data(contentsOf: jsonURL)) ?? Data(), as: UTF8.self)
+                    #expect(!jsonText.contains("canceled-secret.png"))
                 }
             }
         }
@@ -900,9 +1715,39 @@ private extension PasteboardContent.Payload {
         if case .files(let paths, let byteSize, _) = self { (paths, byteSize) } else { nil }
     }
 
-    var image: (assetPath: String, digest: String, reusesStoredFile: Bool, recognizedContent: RecognizedImageContent)? {
-        if case .image(_, let assetPath, _, let recognizedContent, let digest, let reusesStoredFile) = self {
-            (assetPath, digest, reusesStoredFile, recognizedContent)
+    var image: (
+        id: UUID,
+        pngData: Data?,
+        existingAssetPath: String?,
+        pixelWidth: Int?,
+        pixelHeight: Int?,
+        byteSize: Int,
+        digest: String,
+        reusesStoredFile: Bool,
+        recognizedContent: RecognizedImageContent
+    )? {
+        if case .image(
+            let id,
+            let pngData,
+            let existingAssetPath,
+            let pixelWidth,
+            let pixelHeight,
+            let byteSize,
+            let recognizedContent,
+            let digest,
+            let reusesStoredFile
+        ) = self {
+            (
+                id,
+                pngData,
+                existingAssetPath,
+                pixelWidth,
+                pixelHeight,
+                byteSize,
+                digest,
+                reusesStoredFile,
+                recognizedContent
+            )
         } else {
             nil
         }

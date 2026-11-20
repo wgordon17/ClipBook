@@ -24,6 +24,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private static let walJournalSizeLimit = 4_194_304
     private static let searchInClauseBatchLimit = 500
     private static let migrationBatchSize = 500
+    private static let dontSaveContentLifetime = 0
 
     private enum LifecycleState: Equatable, Sendable {
         case open
@@ -55,6 +56,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     let directory: URL
     let loadsBodiesOnFetchAll: Bool
 
+    private let instanceID = UUID()
     private let keyProvider: any DatabaseKeyProvider
     private let assetStore: ImageAssetStore
     private let openLock = NSLock()
@@ -148,7 +150,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
 
+        ImageAssetStore.unregisterKeys(forSupportDirectory: directory, ownerID: instanceID)
         ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: directory)
+        ImageDragFiles.removeAll()
 
         if let writer = transition.writer {
             writer.interrupt()
@@ -210,6 +214,122 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
         try? writer.barrierWriteWithoutTransaction { db in
             self.performFreePageReleasePass(on: db, forceIfAlreadyCleared: false)
+        }
+    }
+
+    func computeImageDigest(forPNGData pngData: Data) -> String {
+        if let keys = state.withLock({ $0.lifecycle == .open && $0.lockState == .unlocked ? $0.keys : nil }) {
+            return HistoryCrypto.imageDigest(forPNGData: pngData, keys: keys)
+        }
+        if (try? openIfNeeded(allowRetryFromFailure: false)) != nil,
+           let keys = state.withLock({ $0.lifecycle == .open && $0.lockState == .unlocked ? $0.keys : nil }) {
+            return HistoryCrypto.imageDigest(forPNGData: pngData, keys: keys)
+        }
+        return ContentDigest.sha256(pngData)
+    }
+
+    func writeManagedAsset(
+        pngData: Data,
+        role: AssetRole,
+        clipID: UUID,
+        encrypted: Bool,
+        preferredPlainExtension: String? = nil
+    ) throws -> URL {
+        let (_, keys) = try acquireAccess()
+        defer {
+            activeAccessGroup.leave()
+        }
+        return try assetStore.writeAsset(
+            pngData: pngData,
+            role: role,
+            clipID: clipID,
+            encrypted: encrypted,
+            keys: keys,
+            preferredPlainExtension: preferredPlainExtension
+        )
+    }
+
+    func finalizeRecognizedImage(
+        id: UUID,
+        content: RecognizedImageContent,
+        sensitiveContentLifetime: Int
+    ) throws -> (updated: ClipboardItem?, previous: ClipboardItem?, isTrashed: Bool, purged: Bool) {
+        try withWrite { db, keys in
+            guard let priorRow = try Row.fetchOne(
+                db,
+                sql: "SELECT isEncrypted FROM clips WHERE id = ? LIMIT 1",
+                arguments: [id.uuidString]
+            ) else {
+                return (nil, nil, false, false)
+            }
+            let existingIsEncrypted = ((priorRow["isEncrypted"] as Int?) ?? 0) != 0
+
+            guard let existing = try self.fetchFullItemByID(
+                in: db,
+                id: id,
+                includeTrashed: true,
+                keys: keys
+            ) else {
+                return (nil, nil, false, false)
+            }
+
+            let isTrashed = existing.deletedAt != nil
+            var candidate = existing
+            candidate.text = content.text
+            candidate.qrCodeText = content.qrCodeText
+            let tagNamesByID = Dictionary(
+                uniqueKeysWithValues: try Self.fetchAllTags(in: db).map { ($0.id, $0.name) }
+            )
+            candidate = candidate.rebuildingSearchText(
+                tagNames: candidate.tags.compactMap { tagNamesByID[$0] }
+            )
+
+            let shouldEncrypt = SensitiveContent.shouldEncryptAtRest(candidate)
+            let hasDetectedOCRSecret = existing.sensitivity != .notSensitive
+                && SensitiveContent.detectsBodySecretAtRest(
+                    kind: candidate.kind,
+                    text: content.text,
+                    qrCodeText: content.qrCodeText,
+                    html: nil
+                )
+
+            if (isTrashed && shouldEncrypt)
+                || (hasDetectedOCRSecret && !existing.isKeptByUser && sensitiveContentLifetime == Self.dontSaveContentLifetime) {
+                try db.execute(sql: "DELETE FROM clips WHERE id = ?", arguments: [id.uuidString])
+                self.markNeedsFreePageRelease()
+                if let assetPath = existing.assetPath {
+                    let assetURL = URL(fileURLWithPath: assetPath, isDirectory: false)
+                    if self.assetStore.isManagedAssetURL(assetURL) {
+                        ImageAssetStore.secureUnlink(at: assetURL)
+                    }
+                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: assetPath)
+                }
+                let formattedPrevious = self.loadsBodiesOnFetchAll ? existing : existing.unloadingContent()
+                return (nil, formattedPrevious, isTrashed, true)
+            }
+
+            if hasDetectedOCRSecret && !candidate.isKeptByUser && sensitiveContentLifetime > 0 {
+                let ocrExpiry = existing.copiedAt.addingTimeInterval(TimeInterval(sensitiveContentLifetime))
+                if let currentExpiry = candidate.expiresAt {
+                    candidate.expiresAt = min(currentExpiry, ocrExpiry)
+                } else {
+                    candidate.expiresAt = ocrExpiry
+                }
+            }
+
+            let saved = try self.persistUpsert(
+                in: db,
+                item: candidate,
+                keys: keys,
+                assetMode: .reconcileManagedAssets
+            )
+            if !existingIsEncrypted && shouldEncrypt {
+                self.markNeedsFreePageRelease()
+            }
+
+            let formattedUpdated = self.loadsBodiesOnFetchAll ? saved : saved.unloadingContent()
+            let formattedPrevious = self.loadsBodiesOnFetchAll ? existing : existing.unloadingContent()
+            return (formattedUpdated, formattedPrevious, isTrashed, false)
         }
     }
 
@@ -1521,6 +1641,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             s.dbWriter = writer
             s.keys = keys
             s.lockState = .unlocked
+            ImageAssetStore.registerKeys(keys, forSupportDirectory: directory, ownerID: instanceID)
             return true
         }
 

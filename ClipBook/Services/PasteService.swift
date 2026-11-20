@@ -140,7 +140,8 @@ final class PasteService {
   
   func copy(_ item: ClipboardItem, variant: PasteVariant) throws {
     pasteboard.clearContents()
-    
+    var isConcealed = SensitiveContent.shouldEncryptAtRest(item)
+
     switch variant {
     case .plainText:
       guard pasteboard.setString(item.previewText, forType: .string) else {
@@ -152,31 +153,48 @@ final class PasteService {
       }
       pasteboard.setString(item.filePaths.joined(separator: "\n"), forType: .string)
     default:
-      try writeItem(item)
+      let writtenItem = try writeItem(item)
+      isConcealed = isConcealed || SensitiveContent.shouldEncryptAtRest(writtenItem)
     }
     // Marked after the item is written so `writeObjects` for images and files
     // does not leave the ghost marker on a separate, empty first pasteboard item.
     if let firstItem = pasteboard.pasteboardItems?.first {
       firstItem.setString("1", forType: PasteboardMonitor.ghostType)
+      if isConcealed {
+        firstItem.setData(Data(), forType: PasteboardReader.concealedType)
+      }
     } else {
       pasteboard.setString("1", forType: PasteboardMonitor.ghostType)
+      if isConcealed {
+        pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
+      }
     }
   }
 
-  func copyText(_ text: String, markAsGhost: Bool = false) throws {
+  func copyText(_ text: String, markAsGhost: Bool = false, markAsConcealed: Bool = false) throws {
     pasteboard.clearContents()
     if markAsGhost {
       pasteboard.setString("1", forType: PasteboardMonitor.ghostType)
+    }
+    if markAsConcealed {
+      pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
     }
     guard pasteboard.setString(text, forType: .string) else {
       throw PasteServiceError.unsupportedItem
     }
   }
-  
-  private func writeItem(_ item: ClipboardItem) throws {
+
+  @discardableResult
+  private func writeItem(_ item: ClipboardItem) throws -> ClipboardItem {
     switch item.kind {
     case .image:
-      guard let url = item.assetURL, let pngData = try? Data(contentsOf: url) else {
+      guard let url = item.assetURL,
+            let pngData = try? ImageAssetStore.readAssetData(
+              at: url,
+              role: .image,
+              ownerClipID: item.id,
+              requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+            ) else {
         throw PasteServiceError.unsupportedItem
       }
       // Image assets are stored as PNG. Write the raw bytes directly and promise
@@ -187,12 +205,14 @@ final class PasteService {
       pasteboardItem.setData(pngData, forType: .png)
       pasteboardItem.setDataProvider(LazyTiffDataProvider(pngData: pngData), forTypes: [.tiff])
       pasteboard.writeObjects([pasteboardItem])
+      return item
     case .file:
       let urls = item.filePaths.map(URL.init(fileURLWithPath:))
       guard !urls.isEmpty else {
         throw PasteServiceError.unsupportedItem
       }
       pasteboard.writeObjects(urls as [NSURL])
+      return item
     case .richText:
       let item = loadFormatting(item)
       if let rtfData = item.rtfData {
@@ -204,10 +224,12 @@ final class PasteService {
       if let text = item.text {
         pasteboard.setString(text, forType: .string)
       }
+      return item
     default:
       guard pasteboard.setString(item.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }
+      return item
     }
   }
   

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 import SwiftUI
@@ -69,6 +70,7 @@ final class AppCoordinator: ObservableObject {
   private var isRetentionPromptPresented = false
   private var isHistoryArchiveOperationRunning = false
   private var areGlobalShortcutsSuspended = false
+  private var hasBoundLifecycleObservers = false
   @Published private(set) var licenseState: LicensingService.State = .unavailable
   @Published private(set) var trialNotice: TrialNotice?
   /// Fires when something tried to use an item while the history is read-only,
@@ -161,21 +163,31 @@ final class AppCoordinator: ObservableObject {
     if shouldSavePreferences {
       preferencesStore.save(model.preferences)
     }
-    let didLoadHistory = loadHistory(sweepsCaches: false)
-    clearHistoryAfterRebootIfNeeded()
-    applyRetention()
-    scheduleRetentionChecks()
-    deleteExpiredItems()
-    if didLoadHistory {
-      pruneFilePreviewCache()
-      removeOrphanedStoredFiles()
+    if historyStore.lockState == .unlocked {
+      let didLoadHistory = loadHistory(sweepsCaches: false)
+      if historyStore.lockState == .unlocked {
+        clearHistoryAfterRebootIfNeeded()
+        applyRetention()
+        deleteExpiredItems()
+        if didLoadHistory {
+          pruneFilePreviewCache()
+          removeOrphanedStoredFiles()
+        }
+      }
+    } else {
+      model.lastError = Self.lockedStoreErrorMessage(for: historyStore.lockState)
     }
-    observeWakeForExpiredItems()
-    observeTrashVisibility()
+    scheduleRetentionChecks()
+    if !hasBoundLifecycleObservers {
+      hasBoundLifecycleObservers = true
+      observeWakeForExpiredItems()
+      observeTrashVisibility()
+    }
     configurePanel()
     configureShortcuts()
     clipboardMonitor.delegate = self
     clipboardMonitor.start(preferences: model.preferences)
+    clipboardMonitor.isPaused = model.isPaused || historyStore.lockState != .unlocked
     applyAppearance()
     #if DEBUG
     // `-ClipBookShowOnboarding YES` on the command line shows onboarding
@@ -194,10 +206,50 @@ final class AppCoordinator: ObservableObject {
   func stop() {
     historyWindow?.saveWindowFrame()
     savePreferences()
-    if model.preferences.clearHistoryOnQuit {
+    if model.preferences.clearHistoryOnQuit, historyStore.lockState == .unlocked {
       clearHistory()
     }
+    ImageDragFiles.removeAll()
     stopBackgroundWorkForTesting()
+  }
+
+  func isImageRecognitionPending(for id: ClipboardItem.ID) -> Bool {
+    clipboardMonitor.isImageRecognitionPending(for: id)
+  }
+
+  @discardableResult
+  func retryUnlockHistoryStore() -> Bool {
+    model.lastError = nil
+    do {
+      try historyStore.retryUnlock()
+      let didLoadHistory = loadHistory(sweepsCaches: false)
+      if historyStore.lockState == .unlocked {
+        clearHistoryAfterRebootIfNeeded()
+        applyRetention()
+        deleteExpiredItems()
+        if didLoadHistory {
+          pruneFilePreviewCache()
+          removeOrphanedStoredFiles()
+        }
+      }
+      clipboardMonitor.isPaused = model.isPaused || historyStore.lockState != .unlocked
+      return historyStore.lockState == .unlocked
+    } catch {
+      model.lastError = error.localizedDescription
+      clipboardMonitor.isPaused = model.isPaused || historyStore.lockState != .unlocked
+      return false
+    }
+  }
+
+  private static func lockedStoreErrorMessage(for lockState: StoreLockState) -> String? {
+    switch lockState {
+    case .unlocked:
+      return nil
+    case .locked(let reason):
+      return HistoryStoreError.encryptionKeyUnavailable(reason).localizedDescription
+    case .keyMismatch:
+      return HistoryStoreError.encryptionKeyMismatch.localizedDescription
+    }
   }
 
   nonisolated func cancelOrphanedFileSweeps(waitUntilDone: Bool = true) {
@@ -426,6 +478,7 @@ final class AppCoordinator: ObservableObject {
           let expiredItems = self.expiredItems(among: result.itemIDs)
           self.isRetentionPromptPresented = !expiredItems.isEmpty
           self.clipboardMonitor.start(preferences: self.model.preferences)
+          self.clipboardMonitor.isPaused = self.model.isPaused || self.historyStore.lockState != .unlocked
           let didLoadHistory = self.loadHistory(sweepsCaches: false)
           self.isHistoryArchiveOperationRunning = false
           self.deleteExpiredItems()
@@ -444,6 +497,7 @@ final class AppCoordinator: ObservableObject {
             return
           }
           self.clipboardMonitor.start(preferences: self.model.preferences)
+          self.clipboardMonitor.isPaused = self.model.isPaused || self.historyStore.lockState != .unlocked
           self.isHistoryArchiveOperationRunning = false
           self.deleteExpiredItems()
           completion(.failure(error))
@@ -532,7 +586,7 @@ final class AppCoordinator: ObservableObject {
   
   func togglePaused() {
     model.isPaused.toggle()
-    clipboardMonitor.isPaused = model.isPaused
+    clipboardMonitor.isPaused = model.isPaused || historyStore.lockState != .unlocked
   }
   
   /// The settings whose effects `savePreferences()` applies again.
@@ -718,7 +772,12 @@ final class AppCoordinator: ObservableObject {
   /// Deletes the history for good, the Trash included, as clearing it on quit
   /// or after a restart is meant to leave nothing behind.
   func clearHistory() {
+    guard historyStore.lockState == .unlocked else {
+      model.lastError = Self.lockedStoreErrorMessage(for: historyStore.lockState)
+      return
+    }
     cancelOrphanedFileSweeps(waitUntilDone: false)
+    ImageDragFiles.removeAll()
     do {
       let keepingItems = model.preferences.keepFavoritesOnClearHistory
       let deletedItems = model.items.filter { !keepingItems || !shouldKeepWhenClearingHistory($0) }
@@ -728,6 +787,9 @@ final class AppCoordinator: ObservableObject {
         deletedItems.forEach(removeLinkPreviewFiles)
         removeFilePreviewFiles(for: deletedItems, remainingItems: model.items.filter(shouldKeepWhenClearingHistory))
       } else {
+        ImageAssetThumbnailLoader.shared.removeAll()
+        ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: linkPreviewsDirectory)
+        scrubManagedDirectoryFiles(at: linkPreviewsDirectory)
         try? fileManager.removeItem(at: linkPreviewsDirectory)
         filePreviewCache.removeAll()
       }
@@ -1103,13 +1165,13 @@ final class AppCoordinator: ObservableObject {
   }
 
   @discardableResult
-  func copyText(_ text: String) -> Bool {
+  func copyText(_ text: String, isConcealed: Bool = false) -> Bool {
     guard allowsUsingHistoryItems() else {
       return false
     }
 
     do {
-      try pasteService.copyText(text)
+      try pasteService.copyText(text, markAsGhost: false, markAsConcealed: isConcealed)
       interruptCopySequenceTracking()
       playSound(.copy)
       return true
@@ -1137,17 +1199,26 @@ final class AppCoordinator: ObservableObject {
       // The merged item comes from the app of the item its text starts with,
       // as Copy & Merge keeps the app of the item it appends to. The app in
       // front while merging has nothing to do with the content.
+      let sensitivity: ItemSensitivity? = items.contains(where: { $0.sensitivity == .sensitive })
+        ? .sensitive
+        : nil
+      let expiresAt = items.compactMap(\.expiresAt).min()
       let item = ClipboardItem(
         kind: ClipboardKind.classifyText(text, treatDigitNumbersAsColor: model.preferences.treatDigitNumbersAsColor),
         text: text,
         sourceAppName: items[0].sourceAppName,
         sourceBundleIdentifier: items[0].sourceBundleIdentifier,
         byteSize: text.utf8.count,
-        searchText: text
+        searchText: text,
+        sensitivity: sensitivity,
+        expiresAt: expiresAt
       )
       try deleteExistingMatches(for: item)
-      try historyStore.upsert(item)
-      model.insert(item)
+      let saved = try historyStore.saveAndReconcileItem(item, convertingExternalAssets: true)
+      model.insert(saved)
+      if saved.expiresAt != nil {
+        deleteExpiredItems()
+      }
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -1169,8 +1240,12 @@ final class AppCoordinator: ObservableObject {
       return false
     }
 
+    let markAsConcealed = items.contains(where: SensitiveContent.shouldEncryptAtRest)
+      || (!items.allSatisfy { $0.sensitivity == .notSensitive }
+          && SensitiveContent.detectsBodySecretAtRest(kind: .text, text: text, qrCodeText: nil, html: nil))
+
     do {
-      try pasteService.copyText(text, markAsGhost: true)
+      try pasteService.copyText(text, markAsGhost: true, markAsConcealed: markAsConcealed)
       interruptCopySequenceTracking()
       playSound(.copy)
       return true
@@ -1250,8 +1325,7 @@ final class AppCoordinator: ObservableObject {
       return
     }
 
-    let detectsSensitiveContent = model.preferences.detectSensitiveContent
-    let sensitiveItems = items.filter { SensitiveContent.isMasked($0, detectsAutomatically: detectsSensitiveContent) }
+    let sensitiveItems = items.filter(SensitiveContent.shouldEncryptAtRest)
     try removeFromHistory(sensitiveItems)
 
     let sensitiveItemIDs = Set(sensitiveItems.map(\.id))
@@ -1452,6 +1526,9 @@ final class AppCoordinator: ObservableObject {
   /// Deletes the items that have been in the Trash longer than its period,
   /// or all of them once the Trash is turned off.
   private func purgeExpiredTrashedItems() {
+    guard historyStore.lockState == .unlocked else {
+      return
+    }
     let days = model.preferences.trashRetentionDays
     let cutoff = days > 0
       ? Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
@@ -1478,6 +1555,12 @@ final class AppCoordinator: ObservableObject {
 
   private func setTrashLoaded(_ isLoaded: Bool) {
     guard isLoaded else {
+      if !model.trashedItems.isEmpty {
+        model.trashedItems = []
+      }
+      return
+    }
+    guard historyStore.lockState == .unlocked else {
       if !model.trashedItems.isEmpty {
         model.trashedItems = []
       }
@@ -1738,7 +1821,9 @@ final class AppCoordinator: ObservableObject {
   /// may cancel it, nor while an archive is being imported, since its items
   /// are checked once it is in.
   private func applyRetention() {
-    guard !isRetentionPromptPresented, !isHistoryArchiveOperationRunning else {
+    guard !isRetentionPromptPresented,
+          !isHistoryArchiveOperationRunning,
+          historyStore.lockState == .unlocked else {
       return
     }
 
@@ -1762,7 +1847,8 @@ final class AppCoordinator: ObservableObject {
   private func deleteExpiredItems() {
     expiryTimer?.invalidate()
     expiryTimer = nil
-    guard !isHistoryArchiveOperationRunning else {
+    guard !isHistoryArchiveOperationRunning,
+          historyStore.lockState == .unlocked else {
       return
     }
 
@@ -1840,6 +1926,8 @@ final class AppCoordinator: ObservableObject {
       // lists the parts in the order they had in the text. With one shared
       // time the sort would fall back to the random item IDs.
       let splitAt = Date()
+      let propagatedSensitivity: ItemSensitivity? = item.sensitivity == .sensitive ? .sensitive : nil
+      let propagatedExpiresAt: Date? = item.isKeptByUser ? nil : item.expiresAt
       let newItems = parts.enumerated().map { index, text in
         let copiedAt = splitAt.addingTimeInterval(-0.001 * Double(index))
         return ClipboardItem(
@@ -1849,19 +1937,27 @@ final class AppCoordinator: ObservableObject {
           sourceBundleIdentifier: item.sourceBundleIdentifier,
           copiedAt: copiedAt,
           firstCopiedAt: copiedAt,
-          byteSize: text.utf8.count
+          byteSize: text.utf8.count,
+          sensitivity: propagatedSensitivity,
+          expiresAt: propagatedExpiresAt
         )
       }
 
+      var savedItems: [ClipboardItem] = []
+      savedItems.reserveCapacity(newItems.count)
       try historyStore.performInTransaction {
         for newItem in newItems {
-          try historyStore.upsert(newItem)
+          let saved = try historyStore.saveAndReconcileItem(newItem, convertingExternalAssets: false)
+          savedItems.append(saved)
         }
       }
-      model.items.insert(contentsOf: newItems, at: 0)
-      model.selectedItemID = newItems.first?.id
-      model.selectedItemIDs = Set(newItems.map(\.id))
-      model.selectedItemIDsInSelectionOrder = newItems.map(\.id)
+      model.items.insert(contentsOf: savedItems, at: 0)
+      model.selectedItemID = savedItems.first?.id
+      model.selectedItemIDs = Set(savedItems.map(\.id))
+      model.selectedItemIDsInSelectionOrder = savedItems.map(\.id)
+      if savedItems.contains(where: { $0.expiresAt != nil }) {
+        deleteExpiredItems()
+      }
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -1894,12 +1990,78 @@ final class AppCoordinator: ObservableObject {
     }
 
     do {
-      var updated = item
-      updated.sensitivity = isSensitive ? .sensitive : .notSensitive
-      try historyStore.upsert(updated)
+      guard let updated = try historyStore.setSensitivity(
+        isSensitive ? .sensitive : .notSensitive,
+        for: item.id
+      ) else {
+        return
+      }
+      reconcileSideEffectsAfterItemMutation(previous: item, updated: updated)
       model.replace(updated)
+      if item.expiresAt != updated.expiresAt {
+        deleteExpiredItems()
+      }
     } catch {
       model.lastError = error.localizedDescription
+    }
+  }
+
+  private func isItemHiddenInUI(_ item: ClipboardItem) -> Bool {
+    if let contentVC = historyWindow?.window.contentViewController as? HistoryContentViewController {
+      return contentVC.hidesSensitiveContent(of: item)
+    }
+    return SensitiveContent.isMasked(item, detectsAutomatically: model.preferences.detectSensitiveContent)
+  }
+
+  private func reconcileSideEffectsAfterItemMutation(previous: ClipboardItem, updated: ClipboardItem) {
+    let wasEncrypted = SensitiveContent.shouldEncryptAtRest(previous)
+    let nowEncrypted = SensitiveContent.shouldEncryptAtRest(updated)
+
+    if let prevAsset = previous.assetPath, prevAsset != updated.assetPath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: prevAsset)
+    }
+    if let prevPreview = previous.linkPreviewDetails?.imagePath,
+       prevPreview != updated.linkPreviewDetails?.imagePath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: prevPreview)
+    }
+    if let prevFavicon = previous.linkPreviewDetails?.faviconPath,
+       prevFavicon != updated.linkPreviewDetails?.faviconPath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: prevFavicon)
+    }
+
+    if nowEncrypted {
+      linkPreviewTasksByItemID[updated.id]?.cancel()
+      linkPreviewTasksByItemID[updated.id] = nil
+      pendingLinkPreviewModelUpdatesByItemID[updated.id] = nil
+
+      if updated.kind == .image {
+        ImageDragFiles.removeAll()
+        if isItemHiddenInUI(updated), let currentAsset = updated.assetPath {
+          ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: currentAsset)
+        }
+      }
+
+      if updated.kind == .file && !updated.filePaths.isEmpty {
+        filePreviewCache.removePreviews(forFilePaths: Set(updated.filePaths))
+        if !wasEncrypted || isItemHiddenInUI(updated) {
+          for path in updated.filePaths {
+            ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
+          }
+        }
+      }
+
+      if updated.kind == .link, isItemHiddenInUI(updated) {
+        if let imgPath = updated.linkPreviewDetails?.imagePath {
+          ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: imgPath)
+        }
+        if let favPath = updated.linkPreviewDetails?.faviconPath {
+          ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: favPath)
+        }
+      }
+
+      if !wasEncrypted {
+        HistoryRowTextCache.removeAll()
+      }
     }
   }
 
@@ -2025,8 +2187,10 @@ final class AppCoordinator: ObservableObject {
       var updated = item
       updated.title = title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
       updated = updated.rebuildingSearchText(tagNames: model.tagNames(for: updated.tags))
-      try historyStore.upsert(updated)
-      model.replace(updated)
+      let convertsAssets = !(updated.kind == .image && isImageRecognitionPending(for: updated.id))
+      let saved = try historyStore.saveAndReconcileItem(updated, convertingExternalAssets: convertsAssets)
+      reconcileSideEffectsAfterItemMutation(previous: item, updated: saved)
+      model.replace(saved)
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -2059,10 +2223,15 @@ final class AppCoordinator: ObservableObject {
       if updated.kind != .link || updated.contentKey != previousContentKey {
         removeLinkPreviewFiles(for: updated)
         updated.linkPreviewDetails = nil
+        linkPreviewTasksByItemID[item.id]?.cancel()
+        linkPreviewTasksByItemID[item.id] = nil
+        pendingLinkPreviewModelUpdatesByItemID[item.id] = nil
       }
       updated = updated.rebuildingSearchText(tagNames: model.tagNames(for: updated.tags))
-      try historyStore.upsert(updated)
-      model.replace(updated)
+      let convertsAssets = !(updated.kind == .image && isImageRecognitionPending(for: updated.id))
+      let saved = try historyStore.saveAndReconcileItem(updated, convertingExternalAssets: convertsAssets)
+      reconcileSideEffectsAfterItemMutation(previous: item, updated: saved)
+      model.replace(saved)
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -2094,10 +2263,15 @@ final class AppCoordinator: ObservableObject {
       if updated.kind != .link || updated.contentKey != previousContentKey {
         removeLinkPreviewFiles(for: updated)
         updated.linkPreviewDetails = nil
+        linkPreviewTasksByItemID[item.id]?.cancel()
+        linkPreviewTasksByItemID[item.id] = nil
+        pendingLinkPreviewModelUpdatesByItemID[item.id] = nil
       }
       updated = updated.rebuildingSearchText(tagNames: model.tagNames(for: updated.tags))
-      try historyStore.upsert(updated)
-      model.replace(updated)
+      let convertsAssets = !(updated.kind == .image && isImageRecognitionPending(for: updated.id))
+      let saved = try historyStore.saveAndReconcileItem(updated, convertingExternalAssets: convertsAssets)
+      reconcileSideEffectsAfterItemMutation(previous: item, updated: saved)
+      model.replace(saved)
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -2300,7 +2474,12 @@ final class AppCoordinator: ObservableObject {
       }
 
       do {
-        let data = try Data(contentsOf: assetURL)
+        let data = try ImageAssetStore.readAssetData(
+          at: assetURL,
+          role: .image,
+          ownerClipID: item.id,
+          requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+        )
         try data.write(to: destinationURL, options: .atomic)
       } catch {
         self?.model.lastError = error.localizedDescription
@@ -2313,6 +2492,7 @@ final class AppCoordinator: ObservableObject {
   func loadLinkPreviewIfNeeded(for item: ClipboardItem) {
     guard model.preferences.showPreviewForLinks,
           item.kind == .link,
+          !SensitiveContent.shouldEncryptAtRest(item),
           item.linkPreviewDetails == nil,
           pendingLinkPreviewModelUpdatesByItemID[item.id] == nil else {
       return
@@ -2429,12 +2609,49 @@ final class AppCoordinator: ObservableObject {
       return
     }
 
+    let normalizedURL = ClipboardItem.normalizedLinkContentKey(for: url)
+    let wasAlreadyEncrypted = SensitiveContent.shouldEncryptAtRest(updated)
+    var candidate = updated
+    candidate.linkPreviewDetails = LinkPreviewDetails(
+      url: normalizedURL,
+      title: preview?.title,
+      description: preview?.description,
+      imagePath: nil,
+      faviconPath: nil,
+      fetchedAt: Date()
+    )
+    let encryptAssets = SensitiveContent.shouldEncryptAtRest(candidate)
+
+    if !wasAlreadyEncrypted && encryptAssets && !updated.isKeptByUser && updated.sensitivity != .notSensitive {
+      let lifetime = model.preferences.sensitiveContentLifetime
+      if lifetime == ContentLifetime.dontSave {
+        return
+      }
+      if lifetime > 0, let previewExpiry = ContentLifetime.expiryDate(for: lifetime, from: updated.copiedAt) {
+        if let existingExpiry = updated.expiresAt {
+          updated.expiresAt = min(existingExpiry, previewExpiry)
+        } else {
+          updated.expiresAt = previewExpiry
+        }
+      }
+    }
+
     do {
       removeLinkPreviewFiles(for: updated)
-      let imagePath = try writeLinkPreviewImage(preview?.image, itemID: updated.id, suffix: "preview")
-      let faviconPath = try writeLinkPreviewImage(preview?.favicon, itemID: updated.id, suffix: "favicon")
+      let imagePath = try writeLinkPreviewImage(
+        preview?.image,
+        itemID: updated.id,
+        role: .linkPreview,
+        encrypted: encryptAssets
+      )
+      let faviconPath = try writeLinkPreviewImage(
+        preview?.favicon,
+        itemID: updated.id,
+        role: .linkFavicon,
+        encrypted: encryptAssets
+      )
       updated.linkPreviewDetails = LinkPreviewDetails(
-        url: ClipboardItem.normalizedLinkContentKey(for: url),
+        url: normalizedURL,
         title: preview?.title,
         description: preview?.description,
         imagePath: imagePath,
@@ -2442,8 +2659,11 @@ final class AppCoordinator: ObservableObject {
         fetchedAt: Date()
       )
       updated = updated.rebuildingSearchText(tagNames: model.tagNames(for: updated.tags))
-      try historyStore.upsert(updated)
-      scheduleLinkPreviewModelUpdate(updated)
+      let saved = try historyStore.saveAndReconcileItem(updated, convertingExternalAssets: false)
+      if saved.expiresAt != nil {
+        deleteExpiredItems()
+      }
+      scheduleLinkPreviewModelUpdate(saved)
     } catch {
       model.lastError = error.localizedDescription
     }
@@ -2482,15 +2702,23 @@ final class AppCoordinator: ObservableObject {
     supportDirectory.appendingPathComponent("LinkPreviews", isDirectory: true)
   }
 
-  private func writeLinkPreviewImage(_ image: NSImage?, itemID: UUID, suffix: String) throws -> String? {
+  private func writeLinkPreviewImage(
+    _ image: NSImage?,
+    itemID: UUID,
+    role: AssetRole,
+    encrypted: Bool
+  ) throws -> String? {
     guard let image,
           let data = pngData(from: image) else {
       return nil
     }
 
-    try fileManager.createDirectory(at: linkPreviewsDirectory, withIntermediateDirectories: true)
-    let url = linkPreviewsDirectory.appendingPathComponent("\(itemID.uuidString)-\(suffix).png")
-    try data.write(to: url, options: .atomic)
+    let url = try historyStore.writeManagedAsset(
+      pngData: data,
+      role: role,
+      clipID: itemID,
+      encrypted: encrypted
+    )
     return url.path
   }
 
@@ -2508,17 +2736,80 @@ final class AppCoordinator: ObservableObject {
     (try? historyStore.loadingFormatting(of: item)) ?? item
   }
 
+  private nonisolated static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
+    let standardized = directoryURL.standardizedFileURL
+    if standardized.path == "/" || standardized.path.isEmpty {
+      return standardized
+    }
+    var st = stat()
+    if stat(standardized.path, &st) == 0 {
+      return standardized.resolvingSymlinksInPath().standardizedFileURL
+    }
+    let parent = canonicalDirectoryURL(standardized.deletingLastPathComponent())
+    return parent
+      .appendingPathComponent(standardized.lastPathComponent, isDirectory: true)
+      .standardizedFileURL
+  }
+
+  private nonisolated static func canonicalFilePath(_ path: String) -> String {
+    let url = URL(fileURLWithPath: path, isDirectory: false)
+    var st = stat()
+    if Darwin.lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK {
+      return url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+    let parent = canonicalDirectoryURL(url.deletingLastPathComponent())
+    return parent
+      .appendingPathComponent(url.lastPathComponent, isDirectory: false)
+      .standardizedFileURL
+      .path
+  }
+
+  private func isContainedInManagedDirectory(_ fileURL: URL, directory: URL) -> Bool {
+    let parentURL = fileURL.deletingLastPathComponent()
+    var parentStat = stat()
+    guard Darwin.lstat(parentURL.path, &parentStat) == 0,
+          (parentStat.st_mode & S_IFMT) == S_IFDIR else {
+      return false
+    }
+    let canonicalDirPrefix = Self.canonicalDirectoryURL(directory).path + "/"
+    let canonicalCandidatePath = Self.canonicalFilePath(fileURL.path)
+    return canonicalCandidatePath.hasPrefix(canonicalDirPrefix)
+      && Self.canonicalDirectoryURL(parentURL).path == Self.canonicalDirectoryURL(directory).path
+  }
+
+  private func scrubManagedDirectoryFiles(at directory: URL) {
+    var dirStat = stat()
+    guard Darwin.lstat(directory.path, &dirStat) == 0,
+          (dirStat.st_mode & S_IFMT) == S_IFDIR,
+          let entries = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+          ) else {
+      return
+    }
+    for entry in entries {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: entry.path)
+      ImageAssetStore.secureUnlink(at: entry)
+    }
+  }
+
   private func removeLinkPreviewFiles(for item: ClipboardItem) {
     guard let details = item.linkPreviewDetails else {
       return
     }
 
     [details.imagePath, details.faviconPath].forEach { path in
-      guard let path else {
+      guard let path, !path.isEmpty else {
         return
       }
 
-      try? fileManager.removeItem(atPath: path)
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
+      let fileURL = URL(fileURLWithPath: path, isDirectory: false)
+      guard isContainedInManagedDirectory(fileURL, directory: linkPreviewsDirectory) else {
+        return
+      }
+      ImageAssetStore.secureUnlink(at: fileURL)
     }
   }
 
@@ -2530,16 +2821,26 @@ final class AppCoordinator: ObservableObject {
   /// has a file of its own, but a file another item still names is kept
   /// anyway, and nothing outside the images folder is ever deleted.
   private func removeAssetFiles(for deletedItems: [ClipboardItem], remainingItems: [ClipboardItem]) {
+    if deletedItems.contains(where: { $0.kind == .image || $0.assetPath != nil }) {
+      ImageDragFiles.removeAll()
+    }
     let deletedPaths = Set(deletedItems.compactMap(\.assetPath))
     guard !deletedPaths.isEmpty else {
       return
     }
 
-    let remainingPaths = Set(remainingItems.compactMap(\.assetPath))
-    let imagesDirectoryPath = imagesDirectory.standardizedFileURL.path + "/"
-    for path in deletedPaths.subtracting(remainingPaths)
-    where URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(imagesDirectoryPath) {
-      try? fileManager.removeItem(atPath: path)
+    let remainingCanonicalPaths = Set(remainingItems.compactMap(\.assetPath).map(Self.canonicalFilePath))
+    for path in deletedPaths {
+      let canonicalPath = Self.canonicalFilePath(path)
+      guard !remainingCanonicalPaths.contains(canonicalPath) else {
+        continue
+      }
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
+      let fileURL = URL(fileURLWithPath: path, isDirectory: false)
+      guard isContainedInManagedDirectory(fileURL, directory: imagesDirectory) else {
+        continue
+      }
+      ImageAssetStore.secureUnlink(at: fileURL)
     }
   }
 
@@ -2551,7 +2852,8 @@ final class AppCoordinator: ObservableObject {
   /// changed in the last few minutes is kept, since a capture, a link preview
   /// or an import writes the file before it saves the item.
   private func removeOrphanedStoredFiles() {
-    guard !isHistoryArchiveOperationRunning else {
+    guard !isHistoryArchiveOperationRunning,
+          historyStore.lockState == .unlocked else {
       return
     }
 
@@ -2608,7 +2910,8 @@ final class AppCoordinator: ObservableObject {
             continue
           }
 
-          if fileURL.pathExtension.lowercased() == "enc" {
+          ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: fileURL.path)
+          if fileURL.pathExtension.lowercased() == "enc" || ImageAssetStore.isEncryptedAssetFile(at: fileURL) {
             ImageAssetStore.secureUnlink(at: fileURL)
           } else {
             try? fileManager.removeItem(at: fileURL)
@@ -2624,18 +2927,27 @@ final class AppCoordinator: ObservableObject {
       return
     }
 
-    let remainingFilePaths = Set(remainingItems.flatMap(\.filePaths))
-    filePreviewCache.removePreviews(forFilePaths: deletedFilePaths.subtracting(remainingFilePaths))
+    let remainingCanonicalPaths = Set(remainingItems.flatMap(\.filePaths).map(Self.canonicalFilePath))
+    let removedPaths = Set(
+      deletedFilePaths.filter { !remainingCanonicalPaths.contains(Self.canonicalFilePath($0)) }
+    )
+    guard !removedPaths.isEmpty else {
+      return
+    }
+    filePreviewCache.removePreviews(forFilePaths: removedPaths)
+    for path in removedPaths {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
+    }
   }
 
   private func pruneFilePreviewCache() {
     filePreviewCache.prune {
       var keptFilePaths = Set<String>()
-      for item in model.items {
+      for item in model.items where !SensitiveContent.shouldEncryptAtRest(item) {
         keptFilePaths.formUnion(item.filePaths)
       }
       if let trashedItems = try? historyStore.fetchTrashedItems() {
-        for item in trashedItems {
+        for item in trashedItems where !SensitiveContent.shouldEncryptAtRest(item) {
           keptFilePaths.formUnion(item.filePaths)
         }
       }
@@ -2955,6 +3267,17 @@ final class AppCoordinator: ObservableObject {
   
   @discardableResult
   func loadHistory(sweepsCaches: Bool = true) -> Bool {
+    guard historyStore.lockState == .unlocked else {
+      model.tags = []
+      model.items = []
+      model.trashedItems = []
+      model.selectedItemID = nil
+      model.selectedItemIDs = []
+      model.selectedItemIDsInSelectionOrder = []
+      model.lastError = Self.lockedStoreErrorMessage(for: historyStore.lockState)
+      return false
+    }
+
     do {
       model.tags = try historyStore.fetchTags()
       model.items = try historyStore.fetchAll()
@@ -3002,6 +3325,9 @@ final class AppCoordinator: ObservableObject {
     kernelBootTime: TimeInterval = AppCoordinator.systemBootTime().timeIntervalSince1970,
     uptimeRelativeBootTime: TimeInterval = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime).timeIntervalSince1970
   ) {
+    guard historyStore.lockState == .unlocked else {
+      return
+    }
     // The first launch after updating from a build that stored only the uptime
     // estimate falls back to it. The estimate is never earlier than the real
     // boot time, so the one-sided check below still ignores time spent asleep,
@@ -3133,6 +3459,11 @@ extension AppCoordinator: PasteboardMonitorDelegate {
     didCapture item: ClipboardItem,
     updatedItems: [ClipboardItem]
   ) {
+    if item.kind == .image,
+       SensitiveContent.shouldEncryptAtRest(item),
+       model.items.contains(where: { $0.id == item.id && !SensitiveContent.shouldEncryptAtRest($0) }) {
+      ImageDragFiles.removeAll()
+    }
     updatedItems.forEach(model.replace)
     // Copying the content of an item in the Trash brings that item back.
     if model.trashedItems.contains(where: { $0.id == item.id }) {
@@ -3153,18 +3484,57 @@ extension AppCoordinator: PasteboardMonitorDelegate {
     didRecognize content: RecognizedImageContent,
     inItemWithID itemID: ClipboardItem.ID
   ) {
-    // The item may have been deleted while its image was read.
-    guard var item = model.items.first(where: { $0.id == itemID }),
-          item.text != content.text || item.qrCodeText != content.qrCodeText else {
-      return
-    }
-
-    item.text = content.text
-    item.qrCodeText = content.qrCodeText
-    item = item.rebuildingSearchText(tagNames: model.tagNames(for: item.tags))
     do {
-      try historyStore.upsert(item)
-      model.replace(item)
+      let outcome = try historyStore.finalizeRecognizedImage(
+        id: itemID,
+        content: content,
+        sensitiveContentLifetime: model.preferences.sensitiveContentLifetime
+      )
+
+      let upgradedImageToEncrypted = outcome.updated?.kind == .image
+        && outcome.updated.map(SensitiveContent.shouldEncryptAtRest) == true
+        && !(outcome.previous.map(SensitiveContent.shouldEncryptAtRest) ?? false)
+      if outcome.purged || upgradedImageToEncrypted {
+        ImageDragFiles.removeAll()
+      }
+
+      if let oldPath = outcome.previous?.assetPath,
+         outcome.purged
+           || oldPath != outcome.updated?.assetPath
+           || (outcome.updated.map(isItemHiddenInUI) == true) {
+        ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldPath)
+      }
+
+      if let prev = outcome.previous,
+         prev.kind == .file,
+         outcome.purged || outcome.updated.map(SensitiveContent.shouldEncryptAtRest) == true {
+        filePreviewCache.removePreviews(forFilePaths: Set(prev.filePaths))
+        if outcome.purged || (outcome.updated.map(isItemHiddenInUI) ?? true) {
+          for path in prev.filePaths {
+            ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
+          }
+        }
+      }
+
+      if outcome.purged {
+        model.remove([itemID])
+        HistoryRowTextCache.removeAll()
+        deleteExpiredItems()
+        return
+      }
+
+      if let updated = outcome.updated {
+        if outcome.isTrashed {
+          if model.isShowingTrash {
+            model.replace(updated)
+          }
+        } else {
+          model.replace(updated)
+        }
+        if updated.expiresAt != nil {
+          deleteExpiredItems()
+        }
+      }
     } catch {
       model.lastError = error.localizedDescription
     }

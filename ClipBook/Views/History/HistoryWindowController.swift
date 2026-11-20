@@ -176,6 +176,14 @@ final class HistoryContentViewController: NSViewController {
   /// history is read-only. The actions that use items stay in the menu,
   /// disabled, so the menu shows what a license brings back.
   func isMenuActionAvailable(_ action: Selector, representedObject: Any?) -> Bool {
+    if (action == #selector(showInFinderMenuItem(_:))
+        || action == #selector(openInAssociatedApplicationMenuItem(_:))
+        || action == #selector(openWithMenuItem(_:))),
+       let item = representedObject as? ClipboardItem,
+       item.hasEncryptedImageAsset {
+      return false
+    }
+
     guard coordinator.isHistoryReadOnly else {
       return true
     }
@@ -2312,8 +2320,8 @@ final class HistoryContentViewController: NSViewController {
   }
 
   @discardableResult
-  private func copyText(_ text: String) -> Bool {
-    let didCopy = coordinator.copyText(text)
+  private func copyText(_ text: String, isConcealed: Bool = false) -> Bool {
+    let didCopy = coordinator.copyText(text, isConcealed: isConcealed)
     showCopySuccessIndicatorIfNeeded(didCopy)
     return didCopy
   }
@@ -2441,6 +2449,10 @@ final class HistoryContentViewController: NSViewController {
     SensitiveContent.isMasked(item, detectsAutomatically: model.preferences.detectSensitiveContent)
   }
 
+  func canMarkAsNotSensitive(_ item: ClipboardItem) -> Bool {
+    isSensitiveContentMasked(in: item) || SensitiveContent.shouldEncryptAtRest(item)
+  }
+
   // An item with content to hide, marked by the user or found by the app, becomes one
   // the user wants shown, and any other item becomes one the user wants hidden.
   private func toggleSensitive(_ item: ClipboardItem) {
@@ -2448,7 +2460,7 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    let isSensitive = !isSensitiveContentMasked(in: item)
+    let isSensitive = !canMarkAsNotSensitive(item)
     listPaneView.setRevealsSensitiveContent(false, of: item)
     coordinator.setSensitive(isSensitive, for: item)
   }
@@ -3336,7 +3348,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       + copyTextFromQRCodeCommands(for: item, section: 1) + [
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + [
       showInFinderCommand(for: item, shortcut: preferences.showInFinderShortcut, section: 2),
       openInAssociatedApplicationCommand(for: item, section: 2),
       openWithCommand(for: item, section: 2),
@@ -3374,7 +3390,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       + copyTextFromQRCodeCommands(for: item, section: 1) + [
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + [
       settingsCommand(section: 3, shortcut: preferences.openSettingsShortcut),
       deleteCommand(for: item, shortcut: preferences.deleteItemShortcut, section: 4),
       deleteAllCommand(section: 4)
@@ -3408,7 +3428,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       },
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + [
       settingsCommand(section: 3, shortcut: preferences.openSettingsShortcut),
       deleteCommand(for: item, shortcut: preferences.deleteItemShortcut, section: 4),
       deleteAllCommand(section: 4)
@@ -3421,7 +3445,14 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
     appIcon: NSImage,
     preferences: AppPreferences
   ) -> [CommandPaletteCommand] {
-    pasteCommandPair(
+    let openCommands: [CommandPaletteCommand] = item.hasEncryptedImageAsset
+      ? []
+      : [
+          openInAssociatedApplicationCommand(for: item, section: 2),
+          openWithCommand(for: item, section: 2)
+        ]
+
+    return pasteCommandPair(
       title: L10n.string("Paste to %@", appName),
       pasteAndDeleteTitle: L10n.string("Paste to %@ & Delete", appName),
       shortcut: preferences.pasteSelectedShortcut,
@@ -3445,9 +3476,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       saveImageAsFileCommand(for: item, section: 1),
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
-      openInAssociatedApplicationCommand(for: item, section: 2),
-      openWithCommand(for: item, section: 2),
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + openCommands + [
       settingsCommand(section: 4, shortcut: preferences.openSettingsShortcut),
       deleteCommand(for: item, shortcut: preferences.deleteItemShortcut, section: 5),
       deleteAllCommand(section: 5)
@@ -3896,7 +3929,10 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       return
     }
 
-    copyText(text)
+    let isConcealed = SensitiveContent.shouldEncryptAtRest(item)
+      || (item.sensitivity != .notSensitive
+          && SensitiveContent.detectsBodySecretAtRest(kind: .text, text: text, qrCodeText: nil, html: nil))
+    copyText(text, isConcealed: isConcealed)
   }
 
   private func copyTextFromImage(_ item: ClipboardItem) {
@@ -3914,7 +3950,10 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       return
     }
 
-    copyText(text)
+    let isConcealed = SensitiveContent.shouldEncryptAtRest(item)
+      || (item.sensitivity != .notSensitive
+          && SensitiveContent.detectsBodySecretAtRest(kind: .text, text: text, qrCodeText: nil, html: nil))
+    copyText(text, isConcealed: isConcealed)
   }
 
   private func saveImageAsFileCommand(for item: ClipboardItem, section: Int) -> CommandPaletteCommand {
@@ -3966,12 +4005,41 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
     shortcut: String?,
     section: Int
   ) -> [CommandPaletteCommand] {
-    guard item.kind.canHoldSensitiveContent else {
+    guard item.kind.canHoldSensitiveContent || item.kind == .image || item.kind == .file else {
       return []
     }
 
-    guard isSensitiveContentMasked(in: item) else {
-      return [
+    var commands: [CommandPaletteCommand] = []
+    if isSensitiveContentMasked(in: item) {
+      let hidesContent = hidesSensitiveContent(of: item)
+      commands.append(
+        command(
+          title: hidesContent
+            ? L10n.string("Show Sensitive Content")
+            : L10n.string("Hide Sensitive Content"),
+          shortcut: shortcut,
+          systemImageName: hidesContent ? "eye" : "eye.slash",
+          section: section,
+          isAvailableInReadOnlyHistory: true
+        ) { [weak self] in
+          self?.toggleSensitiveContentVisibility(of: item)
+        }
+      )
+    }
+
+    if canMarkAsNotSensitive(item) {
+      commands.append(
+        command(
+          title: L10n.string("Mark as Not Sensitive"),
+          shortcut: nil,
+          systemImageName: "lock.open",
+          section: section
+        ) { [weak self] in
+          self?.toggleSensitive(item)
+        }
+      )
+    } else {
+      commands.append(
         command(
           title: L10n.string("Mark as Sensitive"),
           shortcut: nil,
@@ -3980,31 +4048,10 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
         ) { [weak self] in
           self?.toggleSensitive(item)
         }
-      ]
+      )
     }
 
-    let hidesContent = hidesSensitiveContent(of: item)
-    return [
-      command(
-        title: hidesContent
-          ? L10n.string("Show Sensitive Content")
-          : L10n.string("Hide Sensitive Content"),
-        shortcut: shortcut,
-        systemImageName: hidesContent ? "eye" : "eye.slash",
-        section: section,
-        isAvailableInReadOnlyHistory: true
-      ) { [weak self] in
-        self?.toggleSensitiveContentVisibility(of: item)
-      },
-      command(
-        title: L10n.string("Mark as Not Sensitive"),
-        shortcut: nil,
-        systemImageName: "lock.open",
-        section: section
-      ) { [weak self] in
-        self?.toggleSensitive(item)
-      }
-    ]
+    return commands
   }
 
   private func transformCommand(for item: ClipboardItem, shortcut: String?, section: Int) -> CommandPaletteCommand {

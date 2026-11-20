@@ -1110,7 +1110,14 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         [assetPath, linkPreviewDetails?.imagePath, linkPreviewDetails?.faviconPath].compactMap { $0 }
     }
 
+    var hasEncryptedImageAsset: Bool {
+        kind == .image && assetPath?.lowercased().hasSuffix(".enc") == true
+    }
+
     var quickLookURL: URL? {
+        if hasEncryptedImageAsset {
+            return nil
+        }
         if let assetURL {
             return assetURL
         }
@@ -1293,8 +1300,25 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         if let imageWidth, let imageHeight {
             return (imageWidth, imageHeight)
         }
-        guard let assetURL,
-              let source = CGImageSourceCreateWithURL(assetURL as CFURL, nil),
+        guard let assetURL else {
+            return nil
+        }
+        if hasEncryptedImageAsset {
+            guard let data = try? ImageAssetStore.readAssetData(
+                at: assetURL,
+                role: .image,
+                ownerClipID: id,
+                requiresEncryption: SensitiveContent.shouldEncryptAtRest(self)
+            ),
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+            let width = properties[kCGImagePropertyPixelWidth] as? Int,
+            let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+                return nil
+            }
+            return (width, height)
+        }
+        guard let source = CGImageSourceCreateWithURL(assetURL as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
               let height = properties[kCGImagePropertyPixelHeight] as? Int else {

@@ -102,7 +102,8 @@ final class ItemPreviewDialogController: NSViewController {
   // tall the details bar is before the view hierarchy exists.
   private lazy var detailsView = ItemPreviewDetailsView(
     item: item,
-    style: presentation == .sheet ? .floating : .docked
+    style: presentation == .sheet ? .floating : .docked,
+    hidesSensitiveContent: sensitiveContent.hidesContent
   )
   // The web page preview of a link, and the two views layered over it while it
   // loads or when it fails to.
@@ -403,7 +404,7 @@ final class ItemPreviewDialogController: NSViewController {
     }
     // The details are rebuilt unconditionally, because values such as the copy
     // count and the last copy date change without the preview content changing.
-    detailsView.update(item: item)
+    detailsView.update(item: item, hidesSensitiveContent: sensitiveContent.hidesContent)
 
     // Metadata changes such as toggling the favorite state must not rebuild the
     // content view, otherwise the preview scrolls back to the top.
@@ -619,7 +620,7 @@ final class ItemPreviewDialogController: NSViewController {
     toolbar.setEditing(false)
     editingTextView = nil
     // The details were following the editor, so they go back to the item.
-    detailsView.update(item: item)
+    detailsView.update(item: item, hidesSensitiveContent: sensitiveContent.hidesContent)
 
     guard !closesWhenEditingEnds else {
       closesWhenEditingEnds = false
@@ -739,24 +740,36 @@ final class ItemPreviewDialogController: NSViewController {
       )
     }
 
+    if item.kind == .image {
+      return .text(Self.withStyledMask(Self.plainTextContent(SensitiveContent.wholeMask)))
+    }
+
     // The page of a link would show what its address hides, so a link with hidden
     // content is previewed as text, like the other kinds.
     if item.kind == .richText,
        let rtfData = item.rtfData,
        let attributedText = NSAttributedString(rtf: rtfData, documentAttributes: nil) {
-      return .text(Self.withStyledMask(SensitiveContent.maskedAttributedText(
+      let maskedAttributed = SensitiveContent.maskedAttributedText(
         attributedText,
         for: item,
         detectsAutomatically: detectsSensitiveContent
-      )))
+      )
+      if SensitiveContent.maskRanges(in: maskedAttributed.string).isEmpty {
+        return .text(Self.withStyledMask(Self.plainTextContent(SensitiveContent.wholeMask)))
+      }
+      return .text(Self.withStyledMask(maskedAttributed))
     }
 
-    return .text(Self.withStyledMask(Self.plainTextContent(SensitiveContent.maskedText(
+    let masked = SensitiveContent.maskedText(
       item.previewText,
       for: item,
       detectsAutomatically: detectsSensitiveContent,
       characterLimit: SensitiveContent.previewCharacterLimit
-    ))))
+    )
+    let displayMasked = (item.kind == .file && SensitiveContent.maskRanges(in: masked).isEmpty)
+      ? SensitiveContent.wholeMask
+      : masked
+    return .text(Self.withStyledMask(Self.plainTextContent(displayMasked)))
   }
 
   // The dots that stand for hidden content are drawn smaller and spread apart, so they do
@@ -787,7 +800,13 @@ final class ItemPreviewDialogController: NSViewController {
 
     switch item.kind {
     case .image:
-      if let imageURL = item.assetURL, let image = NSImage(contentsOf: imageURL) {
+      if let imageURL = item.assetURL,
+         let image = ImageAssetStore.loadImage(
+           at: imageURL,
+           role: .image,
+           ownerClipID: item.id,
+           requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+         ) {
         return .image(image)
       }
       return .text(plainTextContent(item.previewText))

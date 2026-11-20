@@ -850,6 +850,486 @@ enum ViewsAndWindowsTests {
             #expect(multiFields.contains { $0.stringValue == L10n.string("Files") })
         }
 
+        private static func makeRuntimeSecret(tag: String) -> String {
+            ["sk", "-proj-", tag, "-", String(repeating: "h7J3pQ5w", count: 4)].joined()
+        }
+
+        @MainActor
+        private static func allDescendants(in root: NSView) -> [NSView] {
+            var visited = Set<ObjectIdentifier>()
+            var ordered: [NSView] = []
+            func walk(_ view: NSView) {
+                let id = ObjectIdentifier(view)
+                guard visited.insert(id).inserted else { return }
+                ordered.append(view)
+                if #available(macOS 26.0, *),
+                   let glassView = view as? NSGlassEffectView,
+                   let contentView = glassView.contentView {
+                    walk(contentView)
+                }
+                for subview in view.subviews {
+                    walk(subview)
+                }
+            }
+            walk(root)
+            return ordered
+        }
+
+        @MainActor
+        private static func drainDelayedPerforms(_ targets: [AnyObject]) {
+            withExtendedLifetime(targets) {
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+                for target in targets {
+                    NSObject.cancelPreviousPerformRequests(withTarget: target)
+                    if let controller = target as? NSViewController, controller.isViewLoaded {
+                        NSObject.cancelPreviousPerformRequests(withTarget: controller.view)
+                    }
+                }
+            }
+        }
+
+        @Test
+        @MainActor
+        func rowViewsMaskInlineSecretItemTitlesPreserveHumanTitlesHideSensitiveFileDetailsAndSkipFilePreviewCacheWrites() async throws {
+            TestSupport.ensureAppKitInitialized()
+            let secretToken = Self.makeRuntimeSecret(tag: "row-title")
+            #expect(SensitiveContent.shouldEncryptAtRest(.fixture(kind: .text, text: secretToken)))
+
+            // 1. Human title "Production Webhook" stays visible on a .sensitive row while inline secret tokens in itemTitle are masked.
+            let humanTitledRow = HistoryItemRowTextView(frame: Self.rowFrame)
+            let humanItem = ClipboardItem.fixture(
+                kind: .text,
+                title: "Production Webhook",
+                text: "Secret body \(secretToken)",
+                sensitivity: .sensitive
+            )
+            humanTitledRow.configureForTest(item: humanItem)
+            let humanLabels = Self.labels(of: humanTitledRow)
+            let webhookLabel = try #require(humanLabels.first { $0.text == "Production Webhook" })
+            #expect(!webhookLabel.hidesSensitiveContent)
+
+            let inlineSecretTitleRow = HistoryItemRowTextView(frame: Self.rowFrame)
+            let inlineSecretTitleItem = ClipboardItem.fixture(
+                kind: .text,
+                title: "Webhook \(secretToken)",
+                text: "Benign body"
+            )
+            #expect(SensitiveContent.shouldEncryptAtRest(inlineSecretTitleItem))
+            inlineSecretTitleRow.configureForTest(item: inlineSecretTitleItem)
+            let maskedTitleLabels = Self.labels(of: inlineSecretTitleRow)
+            #expect(!maskedTitleLabels.contains { $0.text.contains(secretToken) })
+            let maskedHeaderLabel = try #require(maskedTitleLabels.first { $0.text.contains(SensitiveContent.inlineMask) })
+            #expect(maskedHeaderLabel.hidesSensitiveContent)
+
+            // 2. Sensitive single and multi-file rows hide folder/file names/tooltips/preview strip when hidden, and write zero FilePreviewCache files even when revealed!
+            try await TestSupport.withTemporaryDirectory { tempDir in
+                let cacheDir = tempDir.appendingPathComponent("FilePreviews", isDirectory: true)
+                let previewCache = FilePreviewCache(directory: cacheDir)
+                let secretFolder = tempDir.appendingPathComponent("VaultFolderAlpha", isDirectory: true)
+                try FileManager.default.createDirectory(at: secretFolder, withIntermediateDirectories: true)
+                let secretImage1 = secretFolder.appendingPathComponent("secret-card-one.png")
+                let secretImage2 = secretFolder.appendingPathComponent("secret-card-two.png")
+                let pngData = try TestSupport.makePNGData(pixelWidth: 40, pixelHeight: 40)
+                try pngData.write(to: secretImage1)
+                try pngData.write(to: secretImage2)
+                defer {
+                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: secretImage1.path)
+                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: secretImage2.path)
+                }
+
+                let singleSensitiveFile = ClipboardItem.fixture(
+                    kind: .file,
+                    text: nil,
+                    filePaths: [secretImage1.path],
+                    byteSize: pngData.count,
+                    sensitivity: .sensitive
+                )
+                let fileRow = HistoryItemRowFileView(frame: Self.rowFrame)
+                fileRow.filePreviewCache = previewCache
+                fileRow.configure(
+                    item: singleSensitiveFile,
+                    quickPasteIndex: 1,
+                    tableWidth: 480,
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: false
+                )
+                let hiddenFileLabels = Self.labels(of: fileRow)
+                #expect(!hiddenFileLabels.contains { $0.text.contains("secret-card-one.png") })
+                #expect(!hiddenFileLabels.contains { $0.text.contains("VaultFolderAlpha") })
+                let hiddenFileTooltips = Self.allDescendants(in: fileRow).compactMap(\.toolTip)
+                #expect(!hiddenFileTooltips.contains { $0.contains("secret-card-one") || $0.contains("VaultFolderAlpha") })
+
+                let multiSensitiveFiles = ClipboardItem.fixture(
+                    kind: .file,
+                    text: nil,
+                    filePaths: [secretImage1.path, secretImage2.path],
+                    byteSize: pngData.count * 2,
+                    sensitivity: .sensitive
+                )
+                let filesRow = HistoryItemRowFilesView(frame: Self.rowFrame)
+                filesRow.filePreviewCache = previewCache
+                filesRow.configure(
+                    item: multiSensitiveFiles,
+                    quickPasteIndex: 1,
+                    tableWidth: 480,
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: false
+                )
+                filesRow.layoutSubtreeIfNeeded()
+                let hiddenMultiImageViews = Self.allDescendants(in: filesRow)
+                    .compactMap { $0 as? NSImageView }
+                    .filter { !$0.isHidden && $0.superview != nil }
+                let hiddenPreviewStripViews = hiddenMultiImageViews.filter { $0.wantsLayer && $0.layer?.cornerRadius == 4 }
+                // Only the type icon box symbols (document symbol + lock badge) are visible; the trailing preview strip is omitted and has zero file-name tooltips.
+                let hiddenMultiTooltips = Self.allDescendants(in: filesRow).compactMap(\.toolTip)
+                #expect(!hiddenMultiTooltips.contains { $0.contains("secret-card") })
+                #expect(hiddenMultiImageViews.count <= 2)
+                #expect(hiddenPreviewStripViews.isEmpty)
+
+                filesRow.configure(
+                    item: multiSensitiveFiles,
+                    quickPasteIndex: 1,
+                    tableWidth: 480,
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: true
+                )
+                filesRow.layoutSubtreeIfNeeded()
+                let revealedMultiImageViews = Self.allDescendants(in: filesRow)
+                    .compactMap { $0 as? NSImageView }
+                    .filter { !$0.isHidden && $0.superview != nil }
+                let revealedPreviewStripViews = revealedMultiImageViews.filter { $0.wantsLayer && $0.layer?.cornerRadius == 4 }
+                #expect(revealedPreviewStripViews.count == 2)
+                #expect(revealedMultiImageViews.count == hiddenMultiImageViews.count + 2)
+
+                // Revealing the sensitive .file row decodes via in-memory ImageAssetThumbnailLoader without writing anything to FilePreviews/!
+                fileRow.configure(
+                    item: singleSensitiveFile,
+                    quickPasteIndex: 1,
+                    tableWidth: 480,
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: true
+                )
+                fileRow.layoutSubtreeIfNeeded()
+                try? await Task.sleep(for: .milliseconds(150))
+                let cacheEntries = (try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)) ?? []
+                #expect(cacheEntries.isEmpty, "Sensitive .file rows must never write thumbnails or metadata to FilePreviewCache on disk")
+            }
+        }
+
+        @Test
+        @MainActor
+        func historyTileViewRendersPlaceholderWhenHiddenAndClearsScreenshotBackToPlaceholderWhenRehidden() async throws {
+            TestSupport.ensureAppKitInitialized()
+            let secretToken = Self.makeRuntimeSecret(tag: "tile")
+
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { store.close() }
+
+                let pngData = try TestSupport.makePNGData(pixelWidth: 64, pixelHeight: 48, color: .systemBlue)
+                let imageID = UUID()
+                let encURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: imageID, encrypted: true)
+                var item = ClipboardItem.fixture(
+                    id: imageID,
+                    kind: .image,
+                    title: "Key \(secretToken)",
+                    text: "OCR \(secretToken)",
+                    assetPath: encURL.path,
+                    sensitivity: .sensitive
+                )
+                item.imageWidth = 64
+                item.imageHeight = 48
+
+                let tileView = HistoryTileView(frame: NSRect(x: 0, y: 0, width: 180, height: 150))
+                tileView.configure(
+                    item: item,
+                    quickPasteIndex: 1,
+                    detectsSensitiveContent: true,
+                    hidesSensitiveContent: true
+                )
+                tileView.layoutSubtreeIfNeeded()
+
+                @MainActor
+                func tilePictureImageView() throws -> NSImageView {
+                    let imageViews = Self.allDescendants(in: tileView).compactMap { $0 as? NSImageView }
+                    return try #require(imageViews.first { $0.image != nil })
+                }
+
+                let hiddenFields = Self.allDescendants(in: tileView).compactMap { $0 as? NSTextField }
+                #expect(!hiddenFields.contains { $0.stringValue.contains(secretToken) })
+                #expect(hiddenFields.contains { $0.stringValue.contains(SensitiveContent.inlineMask) })
+                #expect(tileView.toolTip == nil)
+                #expect(try tilePictureImageView().image?.isTemplate == true)
+
+                // Reveal the same item (isSameItem == true) and wait for the encrypted screenshot to decode.
+                tileView.configure(
+                    item: item,
+                    quickPasteIndex: 1,
+                    detectsSensitiveContent: true,
+                    hidesSensitiveContent: false
+                )
+                tileView.layoutSubtreeIfNeeded()
+                let decodedShown = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    Self.allDescendants(in: tileView)
+                        .compactMap { $0 as? NSImageView }
+                        .contains { $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) > 20 }
+                }
+                #expect(decodedShown)
+
+                // Re-hide the same item (isSameItem == true): screenshot must immediately clear back to the template placeholder!
+                tileView.configure(
+                    item: item,
+                    quickPasteIndex: 1,
+                    detectsSensitiveContent: true,
+                    hidesSensitiveContent: true
+                )
+                tileView.layoutSubtreeIfNeeded()
+                let nonTemplatePicturesAfterRehide = Self.allDescendants(in: tileView)
+                    .compactMap { $0 as? NSImageView }
+                    .filter { $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) > 20 }
+                #expect(nonTemplatePicturesAfterRehide.isEmpty, "Re-hiding a tile must clear the decoded screenshot back to placeholder")
+                #expect(try tilePictureImageView().image?.isTemplate == true)
+                #expect(tileView.toolTip == nil)
+            }
+        }
+
+        @Test
+        @MainActor
+        func contextMenuAndPreviewToolbarExposeSensitivityActionsAndOmitOpenActionsOnEncryptedImagesWithoutDuplication() throws {
+            TestSupport.ensureAppKitInitialized()
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+
+            let secretToken = Self.makeRuntimeSecret(tag: "menus")
+            let pngData = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 24)
+
+            let plainImgID = UUID()
+            let plainImgURL = try harness.historyStore.writeManagedAsset(pngData: pngData, role: .image, clipID: plainImgID, encrypted: false)
+            let plainImg = ClipboardItem.fixture(id: plainImgID, kind: .image, text: nil, assetPath: plainImgURL.path)
+
+            let encImgID = UUID()
+            let encImgURL = try harness.historyStore.writeManagedAsset(pngData: pngData, role: .image, clipID: encImgID, encrypted: true)
+            let encImg = ClipboardItem.fixture(id: encImgID, kind: .image, text: "Token \(secretToken)", assetPath: encImgURL.path)
+            #expect(encImg.hasEncryptedImageAsset)
+            #expect(encImg.quickLookURL == nil)
+            #expect(!plainImg.hasEncryptedImageAsset)
+
+            let tempFileA = harness.supportDirectory.appendingPathComponent("doc-a.txt")
+            let tempFileB = harness.supportDirectory.appendingPathComponent("doc-b.txt")
+            try Data("a".utf8).write(to: tempFileA)
+            try Data("b".utf8).write(to: tempFileB)
+            let singleFile = ClipboardItem.fixture(kind: .file, text: nil, filePaths: [tempFileA.path])
+            let multiFile = ClipboardItem.fixture(kind: .file, text: nil, filePaths: [tempFileA.path, tempFileB.path], sensitivity: .sensitive)
+
+            try harness.seedHistory([plainImg, encImg, singleFile, multiFile])
+            let vc = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { Self.drainDelayedPerforms([vc]) }
+            let menuBuilder = HistoryItemContextMenu(target: vc, availableTags: [], preferences: harness.model.preferences)
+
+            // 1. Context menu checks on plain .png vs encrypted .enc image (including detectSensitiveContent == false!) and .file items.
+            let plainImgMenuTitles = Self.allItems(in: menuBuilder.makeMenu(for: plainImg)).map(\.title)
+            #expect(plainImgMenuTitles.contains(L10n.string("Mark as Sensitive")))
+            #expect(plainImgMenuTitles.contains { $0.hasPrefix("Open") })
+
+            let encImgMenu = menuBuilder.makeMenu(for: encImg)
+            let encImgItems = Self.allItems(in: encImgMenu)
+            let encImgTitles = encImgItems.map(\.title)
+            #expect(encImgTitles.contains(L10n.string("Show Sensitive Content")))
+            #expect(encImgTitles.contains(L10n.string("Mark as Not Sensitive")))
+            #expect(!encImgItems.contains { $0.action == #selector(HistoryContentViewController.openInAssociatedApplicationMenuItem(_:)) })
+            #expect(!encImgTitles.contains(L10n.string("Open With")))
+
+            // Even when detectSensitiveContent == false, canMarkAsNotSensitive still offers single-click "Mark as Not Sensitive" on rest-secret items!
+            harness.model.preferences.detectSensitiveContent = false
+            let unmaskedAutoMenuBuilder = HistoryItemContextMenu(target: vc, availableTags: [], preferences: harness.model.preferences)
+            let encUnmaskedTitles = Self.allItems(in: unmaskedAutoMenuBuilder.makeMenu(for: encImg)).map(\.title)
+            #expect(encUnmaskedTitles.contains(L10n.string("Mark as Not Sensitive")))
+            harness.model.preferences.detectSensitiveContent = true
+
+            let singleFileTitles = Self.allItems(in: menuBuilder.makeMenu(for: singleFile)).map(\.title)
+            #expect(singleFileTitles.contains(L10n.string("Mark as Sensitive")))
+            let multiFileTitles = Self.allItems(in: menuBuilder.makeMenu(for: multiFile)).map(\.title)
+            #expect(multiFileTitles.contains(L10n.string("Show Sensitive Content")))
+            #expect(multiFileTitles.contains(L10n.string("Mark as Not Sensitive")))
+
+            // 2. ItemPreviewToolbar identifiers & ItemPreviewActionsMenu deduplication ("Save as File...", "Show in Finder", "Open in ...").
+            let moreID = NSToolbarItem.Identifier("ItemPreviewToolbarMoreActions")
+            let openID = NSToolbarItem.Identifier("ItemPreviewToolbarOpenInApplication")
+            let saveID = NSToolbarItem.Identifier("ItemPreviewToolbarSaveAsFile")
+            let finderID = NSToolbarItem.Identifier("ItemPreviewToolbarShowInFinder")
+            let eyeID = NSToolbarItem.Identifier("ItemPreviewToolbarSensitiveContent")
+
+            func toolbarIdentifiers(for item: ClipboardItem) -> [NSToolbarItem.Identifier] {
+                let controller = ItemPreviewDialogController(
+                    item: item,
+                    maximumContentSize: NSSize(width: 800, height: 600),
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: false,
+                    loadFormatting: { $0 }
+                )
+                defer { Self.drainDelayedPerforms([controller]) }
+                return withExtendedLifetime(controller) {
+                    let toolbar = controller.makeToolbar()
+                    return toolbar.delegate?.toolbarDefaultItemIdentifiers?(toolbar) ?? []
+                }
+            }
+
+            let plainImgToolbar = toolbarIdentifiers(for: plainImg)
+            #expect(plainImgToolbar.contains(saveID))
+            #expect(plainImgToolbar.contains(moreID))
+            #expect(plainImgToolbar.contains(openID))
+
+            let encImgToolbar = toolbarIdentifiers(for: encImg)
+            #expect(encImgToolbar.contains(eyeID))
+            #expect(encImgToolbar.contains(saveID))
+            #expect(encImgToolbar.contains(moreID))
+            #expect(!encImgToolbar.contains(openID), "Encrypted .enc image must omit Open in Application toolbar item")
+
+            let singleFileToolbar = toolbarIdentifiers(for: singleFile)
+            #expect(singleFileToolbar.contains(finderID))
+            #expect(singleFileToolbar.contains(moreID))
+            #expect(singleFileToolbar.contains(openID))
+
+            let multiFileToolbar = toolbarIdentifiers(for: multiFile)
+            #expect(multiFileToolbar.contains(eyeID))
+            #expect(multiFileToolbar.contains(moreID))
+
+            var dismissCount = 0
+            let actionsMenu = ItemPreviewActionsMenu(
+                makeItemMenu: { menuBuilder.makeMenu(for: $0) },
+                dismissPreview: { dismissCount += 1 }
+            )
+            let plainImgMoreTitles = Self.allItems(in: actionsMenu.makeMenu(for: plainImg)).map(\.title)
+            #expect(plainImgMoreTitles.contains(L10n.string("Mark as Sensitive")))
+            #expect(!plainImgMoreTitles.contains(L10n.string("Save as File...")))
+            #expect(!plainImgMoreTitles.contains { $0.hasPrefix("Open in ") })
+
+            let singleFileMoreMenu = actionsMenu.makeMenu(for: singleFile)
+            let singleFileMoreItems = Self.allItems(in: singleFileMoreMenu)
+            let singleFileMoreTitles = singleFileMoreItems.map(\.title)
+            #expect(singleFileMoreTitles.contains(L10n.string("Mark as Sensitive")))
+            #expect(!singleFileMoreTitles.contains(L10n.string("Show in Finder")))
+            #expect(!singleFileMoreTitles.contains { $0.hasPrefix("Open in ") })
+
+            // Clicking "Mark as Sensitive" inside More Actions mutates in place without dismissing the preview!
+            let sensitiveMoreItem = try #require(singleFileMoreItems.first { $0.title == L10n.string("Mark as Sensitive") })
+            NSApp.sendAction(try #require(sensitiveMoreItem.action), to: sensitiveMoreItem.target, from: sensitiveMoreItem)
+            #expect(dismissCount == 0)
+            #expect(harness.currentItem(singleFile.id)?.sensitivity == .sensitive)
+        }
+
+        @Test
+        @MainActor
+        func itemPreviewDialogToolbarAndDetailsHideVisualImageAndFileMetadataAndRevealOnUpdate() throws {
+            TestSupport.ensureAppKitInitialized()
+            let secretToken = Self.makeRuntimeSecret(tag: "preview-dialog")
+
+            try TestSupport.withTemporaryHistoryStore { store, supportDir in
+                let pngData = try TestSupport.makePNGData(pixelWidth: 80, pixelHeight: 60, color: .systemGreen)
+                let encImgID = UUID()
+                let encImgURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: encImgID, encrypted: true)
+                var encImageItem = ClipboardItem.fixture(
+                    id: encImgID,
+                    kind: .image,
+                    text: "Secret \(secretToken)",
+                    assetPath: encImgURL.path,
+                    sensitivity: .sensitive
+                )
+                encImageItem.imageWidth = 80
+                encImageItem.imageHeight = 60
+
+                // 1. Encrypted .image in ItemPreviewDialogController hides screenshot while hidden and decodes .enc when revealed!
+                let imageDialog = ItemPreviewDialogController(
+                    item: encImageItem,
+                    maximumContentSize: NSSize(width: 800, height: 600),
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: false,
+                    loadFormatting: { $0 }
+                )
+                defer { Self.drainDelayedPerforms([imageDialog]) }
+                _ = imageDialog.view
+                imageDialog.view.layoutSubtreeIfNeeded()
+
+                @MainActor
+                func hasDecodedPreviewPicture(in root: NSView) -> Bool {
+                    Self.allDescendants(in: root)
+                        .compactMap { $0 as? NSImageView }
+                        .contains { !$0.isHidden && $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) >= 60 }
+                }
+                #expect(!hasDecodedPreviewPicture(in: imageDialog.view), "Hidden .enc image preview must not show the screenshot")
+
+                imageDialog.update(item: encImageItem, revealsSensitiveContent: true)
+                imageDialog.view.layoutSubtreeIfNeeded()
+                #expect(hasDecodedPreviewPicture(in: imageDialog.view), "Revealing .enc image preview must decode and display screenshot")
+
+                // 2. Sensitive single image .file across ItemPreviewDialogController, ItemPreviewToolbar, and ItemPreviewDetailsView (.docked + .list).
+                let secretFolder = supportDir.appendingPathComponent("PrivateVaultDir", isDirectory: true)
+                try FileManager.default.createDirectory(at: secretFolder, withIntermediateDirectories: true)
+                let secretFileURL = secretFolder.appendingPathComponent("passport-scan.png")
+                try pngData.write(to: secretFileURL)
+
+                let sensitiveFileItem = ClipboardItem.fixture(
+                    kind: .file,
+                    text: nil,
+                    filePaths: [secretFileURL.path],
+                    byteSize: pngData.count,
+                    sensitivity: .sensitive
+                )
+
+                let fileDialog = ItemPreviewDialogController(
+                    item: sensitiveFileItem,
+                    maximumContentSize: NSSize(width: 800, height: 600),
+                    detectsSensitiveContent: true,
+                    revealsSensitiveContent: false,
+                    loadFormatting: { $0 }
+                )
+                let closeAccessory = fileDialog.makeCloseAccessory()
+                defer { Self.drainDelayedPerforms([fileDialog, closeAccessory]) }
+                _ = fileDialog.view
+                fileDialog.view.layoutSubtreeIfNeeded()
+                closeAccessory.view.layoutSubtreeIfNeeded()
+
+                #expect(!hasDecodedPreviewPicture(in: fileDialog.view), "Hidden sensitive image .file must not show visual image preview")
+                let hiddenAccessoryFields = Self.allDescendants(in: closeAccessory.view).compactMap { $0 as? NSTextField }
+                #expect(hiddenAccessoryFields.contains { $0.stringValue == ItemPreviewDetailsView.typeName(for: sensitiveFileItem) })
+                #expect(!hiddenAccessoryFields.contains { !$0.isHidden && ($0.stringValue.contains("passport-scan.png") || $0.stringValue.contains("PrivateVaultDir")) })
+                let hiddenAccessoryTooltips = Self.allDescendants(in: closeAccessory.view).compactMap(\.toolTip)
+                #expect(!hiddenAccessoryTooltips.contains { $0.contains("passport-scan") || $0.contains("PrivateVaultDir") })
+
+                let dockedDetails = ItemPreviewDetailsView(
+                    item: sensitiveFileItem,
+                    style: .docked,
+                    hidesSensitiveContent: true
+                )
+                dockedDetails.arrangement = .list
+                dockedDetails.frame = NSRect(x: 0, y: 0, width: 320, height: 180)
+                dockedDetails.layoutSubtreeIfNeeded()
+
+                let hiddenDetailsFields = Self.allDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
+                #expect(hiddenDetailsFields.contains { $0.stringValue == SensitiveContent.wholeMask })
+                #expect(!hiddenDetailsFields.contains { $0.stringValue.contains("passport-scan") || $0.stringValue.contains("PrivateVaultDir") })
+                let hiddenDetailsTooltips = Self.allDescendants(in: dockedDetails).compactMap(\.toolTip)
+                #expect(!hiddenDetailsTooltips.contains { $0.contains("passport-scan") || $0.contains("PrivateVaultDir") })
+
+                // Reveal sensitive .file (as Cmd+U does) and verify visual preview + filename + path + tooltip appear!
+                fileDialog.update(item: sensitiveFileItem, revealsSensitiveContent: true)
+                fileDialog.view.layoutSubtreeIfNeeded()
+                closeAccessory.view.layoutSubtreeIfNeeded()
+                #expect(hasDecodedPreviewPicture(in: fileDialog.view))
+                let revealedAccessoryFields = Self.allDescendants(in: closeAccessory.view).compactMap { $0 as? NSTextField }
+                #expect(revealedAccessoryFields.contains { !$0.isHidden && $0.stringValue == "passport-scan.png" })
+                #expect(revealedAccessoryFields.contains { !$0.isHidden && $0.stringValue.contains("PrivateVaultDir") })
+
+                dockedDetails.update(item: sensitiveFileItem, hidesSensitiveContent: false)
+                dockedDetails.layoutSubtreeIfNeeded()
+                let expectedAbbrevPath = (secretFileURL.path as NSString).abbreviatingWithTildeInPath
+                let revealedDetailsFields = Self.allDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
+                #expect(revealedDetailsFields.contains { $0.stringValue == expectedAbbrevPath })
+                let revealedDetailsTooltips = Self.allDescendants(in: dockedDetails).compactMap(\.toolTip)
+                #expect(revealedDetailsTooltips.contains(expectedAbbrevPath))
+            }
+        }
+
         @MainActor
         private static func collectLabels(in root: NSView) -> [HistoryFixedTextColorLabel] {
             var results: [HistoryFixedTextColorLabel] = []
@@ -1018,6 +1498,149 @@ extension SharedProcessStateTests {
             historyWindow.saveWindowFrame()
             #expect(harness.model.preferences.historyWindowX == 222)
             #expect(harness.model.preferences.historyWindowY == 333)
+        }
+
+        @Test
+        @MainActor
+        func commandPaletteAndCmdUShortcutHandleImageAndFileSensitivityAndEncryptedOpenGuards() throws {
+            TestSupport.ensureAppKitInitialized()
+
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            harness.model.preferences.hideOnFocusLoss = false
+
+            let secretToken = ["sk", "-proj-cmd-", String(repeating: "d4F6gH8j", count: 4)].joined()
+            let pngData = try TestSupport.makePNGData(pixelWidth: 48, pixelHeight: 36)
+
+            let plainImgID = UUID()
+            let plainImgURL = try harness.historyStore.writeManagedAsset(pngData: pngData, role: .image, clipID: plainImgID, encrypted: false)
+            let plainImg = ClipboardItem.fixture(
+                id: plainImgID,
+                kind: .image,
+                text: nil,
+                assetPath: plainImgURL.path,
+                copiedAt: Date(timeIntervalSince1970: 1_700_000_500)
+            )
+
+            let encImgID = UUID()
+            let encImgURL = try harness.historyStore.writeManagedAsset(pngData: pngData, role: .image, clipID: encImgID, encrypted: true)
+            let encImg = ClipboardItem.fixture(
+                id: encImgID,
+                kind: .image,
+                text: "Secret \(secretToken)",
+                assetPath: encImgURL.path,
+                copiedAt: Date(timeIntervalSince1970: 1_700_000_400)
+            )
+
+            let realFileA = harness.supportDirectory.appendingPathComponent("alpha.txt")
+            let realFileB = harness.supportDirectory.appendingPathComponent("beta.txt")
+            try Data("alpha".utf8).write(to: realFileA)
+            try Data("beta".utf8).write(to: realFileB)
+
+            let singleFile = ClipboardItem.fixture(
+                kind: .file,
+                text: nil,
+                filePaths: [realFileA.path],
+                copiedAt: Date(timeIntervalSince1970: 1_700_000_300)
+            )
+            let missingFile = ClipboardItem.fixture(
+                kind: .file,
+                text: nil,
+                filePaths: [harness.supportDirectory.appendingPathComponent("missing.txt").path],
+                copiedAt: Date(timeIntervalSince1970: 1_700_000_200),
+                sensitivity: .sensitive
+            )
+            let multiFile = ClipboardItem.fixture(
+                kind: .file,
+                text: nil,
+                filePaths: [realFileA.path, realFileB.path],
+                copiedAt: Date(timeIntervalSince1970: 1_700_000_100)
+            )
+
+            try harness.seedHistory([plainImg, encImg, singleFile, missingFile, multiFile])
+
+            let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
+            historyWindow.window.alphaValue = 0
+            historyWindow.show()
+            defer {
+                if let sheet = historyWindow.window.attachedSheet {
+                    historyWindow.window.endSheet(sheet)
+                }
+                historyWindow.window.orderOut(nil)
+            }
+
+            func findTableView(in root: NSView) -> NSTableView? {
+                if let tv = root as? NSTableView {
+                    return tv
+                }
+                for sub in root.subviews {
+                    if let found = findTableView(in: sub) {
+                        return found
+                    }
+                }
+                return nil
+            }
+
+            func allTextValues(in root: NSView) -> [String] {
+                var strings: [String] = []
+                if let tf = root as? NSTextField {
+                    strings.append(tf.stringValue)
+                }
+                for sub in root.subviews {
+                    strings.append(contentsOf: allTextValues(in: sub))
+                }
+                return strings
+            }
+
+            func paletteCommandTitles(selecting item: ClipboardItem) throws -> [String] {
+                harness.model.selectedItemID = item.id
+                harness.model.selectedItemIDs = [item.id]
+                harness.model.selectedItemIDsInSelectionOrder = [item.id]
+
+                historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 40, modifiers: [.command]))
+                let sheet = try #require(historyWindow.window.attachedSheet as? CommandPaletteSheetWindow)
+                defer { historyWindow.window.endSheet(sheet) }
+
+                let contentView = try #require(sheet.contentView)
+                contentView.layoutSubtreeIfNeeded()
+                let tableView = try #require(findTableView(in: contentView))
+                let column = tableView.tableColumns.first
+                var titles: [String] = []
+                for row in 0..<tableView.numberOfRows {
+                    if let cellView = tableView.delegate?.tableView?(tableView, viewFor: column, row: row) {
+                        titles.append(contentsOf: allTextValues(in: cellView))
+                    }
+                }
+                return titles
+            }
+
+            // 1. Plain .png image includes Mark as Sensitive AND Open With...
+            let plainImgTitles = try paletteCommandTitles(selecting: plainImg)
+            #expect(plainImgTitles.contains(L10n.string("Mark as Sensitive")))
+            #expect(plainImgTitles.contains(L10n.string("Open With...")))
+
+            // 2. Encrypted .enc image includes Show Sensitive Content + Mark as Not Sensitive and OMITS Open in ... / Open With...!
+            let encImgTitles = try paletteCommandTitles(selecting: encImg)
+            #expect(encImgTitles.contains(L10n.string("Show Sensitive Content")))
+            #expect(encImgTitles.contains(L10n.string("Mark as Not Sensitive")))
+            #expect(!encImgTitles.contains(L10n.string("Open With...")))
+            #expect(!encImgTitles.contains { $0.hasPrefix("Open in ") })
+
+            // 3. Cmd+U (keyCode 32, .command) toggles Show Sensitive Content -> Hide Sensitive Content on the selected .enc image!
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let revealedEncImgTitles = try paletteCommandTitles(selecting: encImg)
+            #expect(revealedEncImgTitles.contains(L10n.string("Hide Sensitive Content")))
+
+            // 4. Single .file, missing .file, and multiple .file Command Palette builders all expose sensitivity commands!
+            let singleFileTitles = try paletteCommandTitles(selecting: singleFile)
+            #expect(singleFileTitles.contains(L10n.string("Mark as Sensitive")))
+
+            let missingFileTitles = try paletteCommandTitles(selecting: missingFile)
+            #expect(missingFileTitles.contains(L10n.string("Show Sensitive Content")))
+            #expect(missingFileTitles.contains(L10n.string("Mark as Not Sensitive")))
+
+            let multiFileTitles = try paletteCommandTitles(selecting: multiFile)
+            #expect(multiFileTitles.contains(L10n.string("Mark as Sensitive")))
         }
     }
 

@@ -2,10 +2,123 @@ import AppKit
 import CryptoKit
 import Darwin
 import Foundation
+import os
 
 nonisolated final class ImageAssetStore: Sendable {
     static let encryptedMagic = Data("CBENC01\0".utf8)
     static let minimumEncryptedFileLength = 36
+
+    private struct RegisteredKeysEntry: Sendable {
+        let ownerID: UUID
+        let keys: ClipBookDerivedKeys
+    }
+
+    private static let keyRegistry = OSAllocatedUnfairLock<[String: RegisteredKeysEntry]>(initialState: [:])
+
+    static func registerKeys(_ keys: ClipBookDerivedKeys, forSupportDirectory url: URL, ownerID: UUID) {
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        keyRegistry.withLock { registry in
+            registry[resolvedPath] = RegisteredKeysEntry(ownerID: ownerID, keys: keys)
+        }
+    }
+
+    static func unregisterKeys(forSupportDirectory url: URL, ownerID: UUID) {
+        let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalPath = canonicalDirectoryURL(url).path
+        keyRegistry.withLock { registry in
+            if registry[resolvedPath]?.ownerID == ownerID {
+                registry.removeValue(forKey: resolvedPath)
+            }
+            if canonicalPath != resolvedPath, registry[canonicalPath]?.ownerID == ownerID {
+                registry.removeValue(forKey: canonicalPath)
+            }
+        }
+    }
+
+    static func isEncryptedAssetFile(at url: URL) -> Bool {
+        url.pathExtension.lowercased() == "enc" || hasMagic(encryptedMagic, at: url)
+    }
+
+    static func readAssetData(
+        at url: URL,
+        role: AssetRole,
+        ownerClipID: UUID,
+        requiresEncryption: Bool = false
+    ) throws -> Data {
+        if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        var leafStat = stat()
+        if Darwin.lstat(url.path, &leafStat) == 0, (leafStat.st_mode & S_IFMT) != S_IFREG {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        let isEncryptedFile = isEncryptedAssetFile(at: url)
+        if requiresEncryption && !isEncryptedFile {
+            throw HistoryStoreError.authenticationFailed
+        }
+        if !isEncryptedFile {
+            return try readNonSymlinkRegularFileData(at: url)
+        }
+
+        let parentURL = url.deletingLastPathComponent()
+        if (try? parentURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        var parentStat = stat()
+        guard Darwin.lstat(parentURL.path, &parentStat) == 0,
+              (parentStat.st_mode & S_IFMT) == S_IFDIR else {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        let expectedSubdir = (role == .image) ? "Images" : "LinkPreviews"
+        guard parentURL.lastPathComponent == expectedSubdir else {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        let supportDirURL = parentURL.deletingLastPathComponent()
+        let supportDirPath = supportDirURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let expectedParentPath = URL(fileURLWithPath: supportDirPath, isDirectory: true)
+            .appendingPathComponent(expectedSubdir, isDirectory: true)
+            .standardizedFileURL
+            .path
+        guard parentURL.resolvingSymlinksInPath().standardizedFileURL.path == expectedParentPath else {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        guard let entry = keyRegistry.withLock({ $0[supportDirPath] }) else {
+            throw HistoryStoreError.encryptionKeyUnavailable(.notFound)
+        }
+
+        let store = ImageAssetStore(supportDirectory: URL(fileURLWithPath: supportDirPath, isDirectory: true))
+        return try store.readPNGData(
+            at: url,
+            role: role,
+            clipID: ownerClipID,
+            keys: entry.keys,
+            requiresEncryption: true
+        )
+    }
+
+    static func loadImage(
+        at url: URL,
+        role: AssetRole,
+        ownerClipID: UUID,
+        requiresEncryption: Bool = false
+    ) -> NSImage? {
+        guard let data = try? readAssetData(
+            at: url,
+            role: role,
+            ownerClipID: ownerClipID,
+            requiresEncryption: requiresEncryption
+        ) else {
+            return nil
+        }
+        return NSImage(data: data)
+    }
 
     let supportDirectory: URL
 
@@ -384,6 +497,47 @@ nonisolated final class ImageAssetStore: Sendable {
 
     private static func hasEncryptedMagic(_ data: Data) -> Bool {
         data.count >= encryptedMagic.count && data.prefix(encryptedMagic.count) == encryptedMagic
+    }
+
+    private static func hasMagic(_ magic: Data, at url: URL) -> Bool {
+        guard !magic.isEmpty else {
+            return false
+        }
+        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            return false
+        }
+        defer {
+            _ = Darwin.close(fd)
+        }
+
+        var fileStat = stat()
+        guard Darwin.fstat(fd, &fileStat) == 0,
+              (fileStat.st_mode & S_IFMT) == S_IFREG,
+              Int(clamping: fileStat.st_size) >= magic.count else {
+            return false
+        }
+
+        var header = [UInt8](repeating: 0, count: magic.count)
+        let bytesRead: Int = header.withUnsafeMutableBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+            var total = 0
+            while total < magic.count {
+                let result = Darwin.read(fd, baseAddress.advanced(by: total), magic.count - total)
+                if result > 0 {
+                    total += result
+                } else if result == 0 {
+                    break
+                } else if errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+            return total
+        }
+
+        return bytesRead == magic.count && Data(header) == magic
     }
 
     private static func sameFileLocation(_ lhs: URL, _ rhs: URL) -> Bool {

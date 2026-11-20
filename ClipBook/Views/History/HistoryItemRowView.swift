@@ -1174,7 +1174,15 @@ class HistoryItemRowView: NSTableCellView {
   }
 
   func makeItemTitleLabel(text: String) -> HistoryFixedTextColorLabel {
-    let field = makeLabel(text: text, font: HistoryRow.makeItemTitleFont(), textColor: .labelColor, hidesSensitiveContent: false)
+    let masked = (hidesSensitiveContent
+      ? configuredItem.map { SensitiveContent.maskedTitle(text, for: $0, detectsAutomatically: detectsSensitiveContent) }
+      : nil) ?? text
+    let field = makeLabel(
+      text: masked,
+      font: HistoryRow.makeItemTitleFont(),
+      textColor: .labelColor,
+      hidesSensitiveContent: masked != text
+    )
     registerSelectionTitleField(field)
     return field
   }
@@ -1232,7 +1240,7 @@ class HistoryItemRowView: NSTableCellView {
 
   /// The item's content as the row shows it: with its sensitive parts replaced by dots
   /// until the user asks to see them.
-  private func contentText(_ text: String) -> String {
+  func contentText(_ text: String) -> String {
     guard hidesSensitiveContent, let configuredItem else {
       return text
     }
@@ -1369,6 +1377,9 @@ class HistoryItemRowView: NSTableCellView {
     guard let filePath = item.filePaths.first else {
       return false
     }
+    if SensitiveContent.shouldEncryptAtRest(item) {
+      return ClipboardItem.isImageFile(at: filePath)
+    }
 
     return filePreviewCache?.isImageFile(at: filePath) ?? ClipboardItem.isImageFile(at: filePath)
   }
@@ -1384,6 +1395,35 @@ class HistoryItemRowView: NSTableCellView {
     targetSize: CGSize,
     completion: ((NSImage) -> Void)?
   ) -> NSImage {
+    if hidesSensitiveContent {
+      return NSWorkspace.shared.icon(forFile: filePath)
+    }
+
+    if let item = configuredItem, SensitiveContent.shouldEncryptAtRest(item) {
+      guard ClipboardItem.isImageFile(at: filePath) else {
+        return NSWorkspace.shared.icon(forFile: filePath)
+      }
+      let scale = window?.backingScaleFactor
+        ?? NSApp.keyWindow?.backingScaleFactor
+        ?? NSScreen.main?.backingScaleFactor
+        ?? 2
+      let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(
+        forDisplaySize: targetSize,
+        scale: scale
+      )
+      let url = URL(fileURLWithPath: filePath)
+      let cached = ImageAssetThumbnailLoader.shared.thumbnail(
+        for: url,
+        maximumPixelSize: maximumPixelSize
+      ) { [weak self] image in
+        guard let self, !self.hidesSensitiveContent, let image else {
+          return
+        }
+        completion?(image)
+      }
+      return cached ?? NSWorkspace.shared.icon(forFile: filePath)
+    }
+
     guard let filePreviewCache else {
       if ClipboardItem.isImageFile(at: filePath), let image = NSImage(contentsOfFile: filePath) {
         return image
@@ -1392,17 +1432,22 @@ class HistoryItemRowView: NSTableCellView {
       return NSWorkspace.shared.icon(forFile: filePath)
     }
 
-    return filePreviewCache.image(forFileAt: filePath, targetSize: targetSize) { image in
+    return filePreviewCache.image(forFileAt: filePath, targetSize: targetSize) { [weak self] image in
+      guard let self, !self.hidesSensitiveContent else {
+        return
+      }
       completion?(image)
     }
   }
 
   func imageDimensions(forFileAt filePath: String) -> (width: Int, height: Int)? {
-    guard filePreviewCache?.isImageFile(at: filePath) ?? ClipboardItem.isImageFile(at: filePath) else {
+    let usesDiskPreviewCache = !(configuredItem.map(SensitiveContent.shouldEncryptAtRest) ?? false)
+    guard (usesDiskPreviewCache ? filePreviewCache?.isImageFile(at: filePath) : nil)
+            ?? ClipboardItem.isImageFile(at: filePath) else {
       return nil
     }
 
-    if let displaySize = filePreviewCache?.displaySizeForImageFile(at: filePath) {
+    if usesDiskPreviewCache, let displaySize = filePreviewCache?.displaySizeForImageFile(at: filePath) {
       return (Int(displaySize.width.rounded()), Int(displaySize.height.rounded()))
     }
 

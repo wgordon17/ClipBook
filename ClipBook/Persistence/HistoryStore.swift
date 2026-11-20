@@ -12,6 +12,20 @@ nonisolated protocol HistoryStore: Sendable {
     func flushPendingFreePageRelease()
     func close()
 
+    func computeImageDigest(forPNGData pngData: Data) -> String
+    func writeManagedAsset(
+        pngData: Data,
+        role: AssetRole,
+        clipID: UUID,
+        encrypted: Bool,
+        preferredPlainExtension: String?
+    ) throws -> URL
+    func finalizeRecognizedImage(
+        id: UUID,
+        content: RecognizedImageContent,
+        sensitiveContentLifetime: Int
+    ) throws -> (updated: ClipboardItem?, previous: ClipboardItem?, isTrashed: Bool, purged: Bool)
+
     /// The items in the history. Items in the Trash are left out of this and
     /// of every other fetch unless it says otherwise.
     func fetchAll() throws -> [ClipboardItem]
@@ -82,6 +96,21 @@ nonisolated protocol HistoryStore: Sendable {
 }
 
 nonisolated extension HistoryStore {
+    func writeManagedAsset(
+        pngData: Data,
+        role: AssetRole,
+        clipID: UUID,
+        encrypted: Bool
+    ) throws -> URL {
+        try writeManagedAsset(
+            pngData: pngData,
+            role: role,
+            clipID: clipID,
+            encrypted: encrypted,
+            preferredPlainExtension: nil
+        )
+    }
+
     func fetchItem(kind: ClipboardKind, contentKey: String) throws -> ClipboardItem? {
         try fetchItem(kind: kind, contentKey: contentKey, htmlDigest: nil)
     }

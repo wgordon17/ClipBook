@@ -225,7 +225,14 @@ final class OnboardingModel: ObservableObject {
       return
     }
 
-    if item.kind == .image, let url = item.assetURL, let image = NSImage(contentsOf: url) {
+    if item.kind == .image,
+       let url = item.assetURL,
+       let image = ImageAssetStore.loadImage(
+         at: url,
+         role: .image,
+         ownerClipID: item.id,
+         requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+       ) {
       window.makeFirstResponder(nil)
       withAnimation(.easeOut(duration: 0.2)) {
         pastedImage = image
