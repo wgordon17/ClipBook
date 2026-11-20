@@ -1,6 +1,6 @@
 import Foundation
 
-struct Tag: Identifiable, Codable, Hashable {
+nonisolated struct Tag: Identifiable, Codable, Hashable, Sendable {
     var id: Int
     var name: String
     var color: String

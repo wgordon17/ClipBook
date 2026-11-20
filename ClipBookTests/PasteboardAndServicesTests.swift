@@ -460,10 +460,10 @@ enum PasteboardAndServicesTests {
         let monitor: PasteboardMonitor
         let delegate = MockMonitorDelegate()
         let clock: MutableClock
-        let store: SQLiteHistoryStore
+        let store: GRDBHistoryStore
         let pasteboard: NSPasteboard
 
-        init(monitor: PasteboardMonitor, clock: MutableClock, store: SQLiteHistoryStore, pasteboard: NSPasteboard) {
+        init(monitor: PasteboardMonitor, clock: MutableClock, store: GRDBHistoryStore, pasteboard: NSPasteboard) {
             self.monitor = monitor
             self.clock = clock
             self.store = store
@@ -502,7 +502,11 @@ enum PasteboardAndServicesTests {
         _ body: (MonitorFixture) async throws -> T
     ) async throws -> T {
         try await TestSupport.withTemporaryDirectory { supportDirectory in
-            let store = SQLiteHistoryStore(directory: supportDirectory)
+            let store = GRDBHistoryStore(
+                directory: supportDirectory,
+                keyProvider: InMemoryDatabaseKeyProvider()
+            )
+            defer { store.close() }
             return try await TestSupport.withUniquePasteboard { pasteboard in
                 let clock = MutableClock(Date(timeIntervalSince1970: clockStart))
                 let monitor = PasteboardMonitor(
@@ -512,6 +516,7 @@ enum PasteboardAndServicesTests {
                     pasteboard: pasteboard,
                     now: { clock.current }
                 )
+                defer { monitor.stop() }
                 if let configurePreferences {
                     var preferences = AppPreferences()
                     configurePreferences(&preferences)

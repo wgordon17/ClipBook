@@ -592,19 +592,36 @@ struct UpstreamInteropContractTests {
         )
 
         try TestSupport.withTemporaryDirectory { supportDirectory in
+            let fileManager = FileManager.default
+            let keyProvider = InMemoryDatabaseKeyProvider()
             let clipAID = UUID()
             let clipBID = UUID()
             let clipCID = UUID()
             let clipARtfData = Data(#"{\rtf1\ansi\b Initial Fork Clip A\b0}"#.utf8)
             let clipAHtml = "<b>Initial Fork Clip A</b>"
+
+            let sourcePreviewURL = supportDirectory.appendingPathComponent("b-preview.png")
+            let sourceFaviconURL = supportDirectory.appendingPathComponent("b-favicon.ico")
+            try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xAA]).write(to: sourcePreviewURL)
+            try Data([0x00, 0x00, 0x01, 0x00, 0x01, 0x00]).write(to: sourceFaviconURL)
+
             var createdTagID = 0
+            let clipBPreviewFetchedAt = Date(timeIntervalSince1970: 1_700_000_210)
+            let clipBSequenceID = Date(timeIntervalSince1970: 1_700_000_200)
+            let clipBExpiresAt = Date(timeIntervalSince1970: 1_700_003_800)
+
+            var clipA: ClipboardItem!
+            var clipB: ClipboardItem!
+            var clipC: ClipboardItem!
 
             do {
-                let store = SQLiteHistoryStore(directory: supportDirectory)
+                let store = GRDBHistoryStore(directory: supportDirectory, keyProvider: keyProvider)
+                defer { store.close() }
+
                 let tag = try store.createTag(name: "InteropTag", color: "#3366FF")
                 createdTagID = tag.id
 
-                var clipA = ClipboardItem.fixture(
+                clipA = ClipboardItem.fixture(
                     id: clipAID,
                     kind: .richText,
                     title: "Initial Title A",
@@ -617,21 +634,20 @@ struct UpstreamInteropContractTests {
                 )
                 clipA.tagOrders = [tag.id: 4]
 
-                let clipBPreviewFetchedAt = Date(timeIntervalSince1970: 1_700_000_210)
-                let clipBSequenceID = Date(timeIntervalSince1970: 1_700_000_200)
-                let clipBExpiresAt = Date(timeIntervalSince1970: 1_700_003_800)
-                var clipB = ClipboardItem.fixture(
+                clipB = ClipboardItem.fixture(
                     id: clipBID,
                     kind: .link,
                     text: "https://example.com/b",
                     qrCodeText: "https://qr.example/b",
+                    filePaths: ["/Users/alice/Documents/notes.txt"],
                     copiedAt: Date(timeIntervalSince1970: 1_700_000_200),
+                    isFavorite: true,
                     linkPreviewDetails: LinkPreviewDetails(
                         url: "https://example.com/b",
                         title: "Example B",
                         description: "Preview summary",
-                        imagePath: "LinkPreviews/b-preview.png",
-                        faviconPath: "LinkPreviews/b-favicon.png",
+                        imagePath: sourcePreviewURL.path,
+                        faviconPath: sourceFaviconURL.path,
                         fetchedAt: clipBPreviewFetchedAt
                     ),
                     copySequenceID: clipBSequenceID,
@@ -641,7 +657,7 @@ struct UpstreamInteropContractTests {
                 )
                 clipB.expiresAt = clipBExpiresAt
 
-                let clipC = ClipboardItem.fixture(
+                clipC = ClipboardItem.fixture(
                     id: clipCID,
                     kind: .image,
                     text: nil,
@@ -650,6 +666,29 @@ struct UpstreamInteropContractTests {
                     copiedAt: Date(timeIntervalSince1970: 1_700_000_150),
                     byteSize: 512
                 )
+
+                // Lock ClipboardItem Codable wire schema for v0-v4 migration & v1 archives (28 keys).
+                let wireEncoder = JSONEncoder()
+                wireEncoder.dateEncodingStrategy = .iso8601
+                let wireDecoder = JSONDecoder()
+                wireDecoder.dateDecodingStrategy = .iso8601
+                var unionOfEncodedKeys: Set<String> = []
+                for candidate in [clipA!, clipB!, clipC!] {
+                    let encoded = try wireEncoder.encode(candidate)
+                    let rawJSON = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+                    let rowKeys = Set(rawJSON.keys)
+                    #expect(rowKeys.isSubset(of: UpstreamInteropStubs.expectedClipboardItemKeys))
+                    unionOfEncodedKeys.formUnion(rowKeys)
+                    if let previewJSON = rawJSON["linkPreviewDetails"] as? [String: Any] {
+                        #expect(Set(previewJSON.keys) == UpstreamInteropStubs.expectedArchiveLinkPreviewDetailsKeys)
+                    }
+                    let decodedStub = try wireDecoder.decode(
+                        UpstreamInteropStubs.UpstreamClipboardItemStub.self,
+                        from: encoded
+                    )
+                    #expect(decodedStub.id == candidate.id)
+                }
+                #expect(unionOfEncodedKeys == UpstreamInteropStubs.expectedClipboardItemKeys)
 
                 try store.upsert(clipA)
                 try store.upsert(clipB)
@@ -667,29 +706,16 @@ struct UpstreamInteropContractTests {
                 #expect(sqlite3_open(dbPath, &rawDB) == SQLITE_OK)
                 let db = try #require(rawDB)
 
-                func execSQL(_ sql: String) throws {
-                    var errorMessage: UnsafeMutablePointer<CChar>?
-                    let rc = sqlite3_exec(db, sql, nil, nil, &errorMessage)
-                    if rc != SQLITE_OK {
-                        let message = errorMessage.map { String(cString: $0) } ?? "SQLite error \(rc)"
-                        sqlite3_free(errorMessage)
-                        Issue.record("SQL failed (\(sql)): \(message)")
-                        throw HistoryStoreError.stepFailed(message)
-                    }
-                }
-
-                try execSQL("PRAGMA foreign_keys = OFF;")
-
-                // 1. PRAGMA user_version == 4
+                // 1. PRAGMA user_version == 5
                 do {
                     var stmt: OpaquePointer?
                     #expect(sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK)
                     defer { sqlite3_finalize(stmt) }
                     #expect(sqlite3_step(stmt) == SQLITE_ROW)
-                    #expect(sqlite3_column_int(stmt, 0) == 4)
+                    #expect(sqlite3_column_int(stmt, 0) == 5)
                 }
 
-                // 2. Only `clips` and `tags` user tables exist.
+                // 2. Normalized v5 tables exist (`clips`, `clip_contents`, `clip_tags`, `tags`, `store_metadata`).
                 do {
                     var stmt: OpaquePointer?
                     let sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';"
@@ -701,202 +727,76 @@ struct UpstreamInteropContractTests {
                             tables.insert(String(cString: namePtr))
                         }
                     }
-                    #expect(tables == ["clips", "tags"])
+                    #expect(tables == ["clips", "clip_contents", "clip_tags", "tags", "store_metadata"])
                 }
 
-                // 3. Exact column names and types on `clips` and `tags`.
-                func tableColumns(_ table: String) -> [(name: String, type: String)] {
-                    var stmt: OpaquePointer?
-                    guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else {
-                        return []
-                    }
-                    defer { sqlite3_finalize(stmt) }
-                    var cols: [(String, String)] = []
-                    while sqlite3_step(stmt) == SQLITE_ROW {
-                        let name = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
-                        let type = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
-                        cols.append((name, type))
-                    }
-                    return cols
-                }
-
-                let clipsColumns = tableColumns("clips")
-                let expectedClipsColumns = [
-                    ("id", "TEXT"),
-                    ("kind", "TEXT"),
-                    ("copiedAt", "REAL"),
-                    ("favorite", "INTEGER"),
-                    ("sourceApp", "TEXT"),
-                    ("searchText", "TEXT"),
-                    ("contentKey", "TEXT"),
-                    ("payload", "BLOB"),
-                    ("html", "TEXT"),
-                    ("rtf", "BLOB"),
-                    ("deletedAt", "REAL"),
-                    ("expiresAt", "REAL")
-                ]
-                #expect(clipsColumns.map(\.name) == expectedClipsColumns.map(\.0))
-                #expect(clipsColumns.map(\.type) == expectedClipsColumns.map(\.1))
-
-                let tagsColumns = tableColumns("tags")
-                let expectedTagsColumns = [
-                    ("id", "INTEGER"),
-                    ("name", "TEXT"),
-                    ("color", "TEXT")
-                ]
-                #expect(tagsColumns.map(\.name) == expectedTagsColumns.map(\.0))
-                #expect(tagsColumns.map(\.type) == expectedTagsColumns.map(\.1))
-
-                // 4. Decode every `clips.payload` via `UpstreamClipboardItemStub` and verify `html`/`rtf` columns.
-                let decoder = JSONDecoder()
-                decoder.dateDecodingStrategy = .iso8601
-                var decodedByID: [UUID: UpstreamInteropStubs.UpstreamClipboardItemStub] = [:]
-                var unionOfPayloadKeys: Set<String> = []
-                var storedFormattingByID: [UUID: (html: String?, rtf: Data?)] = [:]
-
+                // 3. `clips` omits `payload`, `html`, `rtf`, and `searchText` (`SEC-006`), so legacy Upstream
+                //    `SELECT payload FROM clips` fails `sqlite3_prepare_v2` cleanly before `removeOrphanedStoredFiles()` can run.
                 do {
-                    var stmt: OpaquePointer?
-                    #expect(sqlite3_prepare_v2(db, "SELECT payload, html, rtf FROM clips;", -1, &stmt, nil) == SQLITE_OK)
-                    defer { sqlite3_finalize(stmt) }
-                    while sqlite3_step(stmt) == SQLITE_ROW {
-                        let bytes = try #require(sqlite3_column_blob(stmt, 0))
-                        let length = Int(sqlite3_column_bytes(stmt, 0))
-                        let payloadData = Data(bytes: bytes, count: length)
-                        let rawJSON = try #require(try JSONSerialization.jsonObject(with: payloadData) as? [String: Any])
-                        let rowKeys = Set(rawJSON.keys)
-                        #expect(rowKeys.isSubset(of: UpstreamInteropStubs.expectedClipboardItemKeys))
-                        unionOfPayloadKeys.formUnion(rowKeys)
-                        if let previewJSON = rawJSON["linkPreviewDetails"] as? [String: Any] {
-                            #expect(Set(previewJSON.keys) == UpstreamInteropStubs.expectedArchiveLinkPreviewDetailsKeys)
+                    var infoStmt: OpaquePointer?
+                    #expect(sqlite3_prepare_v2(db, "PRAGMA table_info(clips);", -1, &infoStmt, nil) == SQLITE_OK)
+                    defer { sqlite3_finalize(infoStmt) }
+                    var clipColumnNames: Set<String> = []
+                    while sqlite3_step(infoStmt) == SQLITE_ROW {
+                        if let colPtr = sqlite3_column_text(infoStmt, 1) {
+                            clipColumnNames.insert(String(cString: colPtr))
                         }
-
-                        let stub = try decoder.decode(
-                            UpstreamInteropStubs.UpstreamClipboardItemStub.self,
-                            from: payloadData
-                        )
-                        decodedByID[stub.id] = stub
-
-                        let htmlCol = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
-                        let rtfCol: Data?
-                        if let rtfPtr = sqlite3_column_blob(stmt, 2) {
-                            rtfCol = Data(bytes: rtfPtr, count: Int(sqlite3_column_bytes(stmt, 2)))
-                        } else {
-                            rtfCol = nil
-                        }
-                        storedFormattingByID[stub.id] = (htmlCol, rtfCol)
                     }
+                    #expect(!clipColumnNames.contains("payload"))
+                    #expect(!clipColumnNames.contains("html"))
+                    #expect(!clipColumnNames.contains("rtf"))
+                    #expect(!clipColumnNames.contains("searchText"))
+
+                    var legacyPayloadStmt: OpaquePointer?
+                    let prepareRC = sqlite3_prepare_v2(db, "SELECT payload FROM clips;", -1, &legacyPayloadStmt, nil)
+                    defer { sqlite3_finalize(legacyPayloadStmt) }
+                    #expect(prepareRC == SQLITE_ERROR)
+                    let errMessage = String(cString: sqlite3_errmsg(db))
+                    #expect(errMessage.localizedCaseInsensitiveContains("payload"))
+
+                    var legacyBatchStmt: OpaquePointer?
+                    let batchPrepareRC = sqlite3_prepare_v2(db, "SELECT payload, html, rtf FROM clips;", -1, &legacyBatchStmt, nil)
+                    defer { sqlite3_finalize(legacyBatchStmt) }
+                    #expect(batchPrepareRC == SQLITE_ERROR)
                 }
-
-                #expect(
-                    unionOfPayloadKeys
-                        == UpstreamInteropStubs.expectedClipboardItemKeys.subtracting(["rtfData", "html"])
-                )
-
-                var updatedClipA = try #require(decodedByID[clipAID])
-                #expect(updatedClipA.title == "Initial Title A")
-                #expect(updatedClipA.hasFormatting == true)
-                #expect(updatedClipA.htmlDigest != nil)
-                #expect(updatedClipA.tagOrders == [createdTagID: 4])
-                #expect(storedFormattingByID[clipAID]?.html == clipAHtml)
-                #expect(storedFormattingByID[clipAID]?.rtf == clipARtfData)
-
-                let decodedClipC = try #require(decodedByID[clipCID])
-                #expect(decodedClipC.assetPath == "Images/\(clipCID.uuidString).png")
-                #expect(decodedClipC.imageDigest == "sha256-clip-c")
-
-                let decodedClipB = try #require(decodedByID[clipBID])
-                #expect(decodedClipB.sensitivity == ItemSensitivity.sensitive.rawValue)
-                #expect(decodedClipB.expiresAt == Date(timeIntervalSince1970: 1_700_003_800))
-                #expect(
-                    decodedClipB.linkPreviewDetails
-                        == UpstreamInteropStubs.UpstreamLinkPreviewDetailsStub(
-                            url: "https://example.com/b",
-                            title: "Example B",
-                            description: "Preview summary",
-                            imagePath: "LinkPreviews/b-preview.png",
-                            faviconPath: "LinkPreviews/b-favicon.png",
-                            fetchedAt: Date(timeIntervalSince1970: 1_700_000_210)
-                        )
-                )
-                #expect(decodedClipB.copySequenceID == Date(timeIntervalSince1970: 1_700_000_200))
-                #expect(decodedClipB.copySequenceOrder == 2)
-                #expect(decodedClipB.favoriteOrder == 1)
-                #expect(decodedClipB.qrCodeText == "https://qr.example/b")
-
-                // 5. Simulate Upstream INSERT ... ON CONFLICT on clip A, DELETE on clip B, and VACUUM.
-                updatedClipA.text = "Updated By Upstream Clip A"
-                updatedClipA.searchText = "Updated By Upstream Clip A InteropTag TestApp"
-                let encoder = JSONEncoder()
-                encoder.dateEncodingStrategy = .iso8601
-                let updatedPayload = try encoder.encode(updatedClipA)
-
-                do {
-                    let upsertSQL = """
-                    INSERT INTO clips (id, kind, copiedAt, favorite, sourceApp, searchText, contentKey, payload, html, rtf, deletedAt, expiresAt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
-                    ON CONFLICT(id) DO UPDATE SET
-                        kind = excluded.kind,
-                        copiedAt = excluded.copiedAt,
-                        favorite = excluded.favorite,
-                        sourceApp = excluded.sourceApp,
-                        searchText = excluded.searchText,
-                        contentKey = excluded.contentKey,
-                        payload = excluded.payload;
-                    """
-                    var stmt: OpaquePointer?
-                    #expect(sqlite3_prepare_v2(db, upsertSQL, -1, &stmt, nil) == SQLITE_OK)
-                    defer { sqlite3_finalize(stmt) }
-                    sqlite3_bind_text(stmt, 1, clipAID.uuidString, -1, SQLITE_TRANSIENT)
-                    sqlite3_bind_text(stmt, 2, updatedClipA.kind.rawValue, -1, SQLITE_TRANSIENT)
-                    sqlite3_bind_double(stmt, 3, updatedClipA.copiedAt.timeIntervalSince1970)
-                    sqlite3_bind_int(stmt, 4, updatedClipA.isFavorite ? 1 : 0)
-                    sqlite3_bind_text(stmt, 5, updatedClipA.sourceAppName ?? "", -1, SQLITE_TRANSIENT)
-                    sqlite3_bind_text(stmt, 6, updatedClipA.searchText, -1, SQLITE_TRANSIENT)
-                    sqlite3_bind_text(stmt, 7, "text:Updated By Upstream Clip A", -1, SQLITE_TRANSIENT)
-                    _ = updatedPayload.withUnsafeBytes { buffer in
-                        sqlite3_bind_blob(stmt, 8, buffer.baseAddress, Int32(updatedPayload.count), SQLITE_TRANSIENT)
-                    }
-                    #expect(sqlite3_step(stmt) == SQLITE_DONE)
-                }
-
-                do {
-                    var stmt: OpaquePointer?
-                    #expect(sqlite3_prepare_v2(db, "DELETE FROM clips WHERE id IN (?, ?);", -1, &stmt, nil) == SQLITE_OK)
-                    defer { sqlite3_finalize(stmt) }
-                    sqlite3_bind_text(stmt, 1, clipBID.uuidString, -1, SQLITE_TRANSIENT)
-                    sqlite3_bind_text(stmt, 2, clipCID.uuidString, -1, SQLITE_TRANSIENT)
-                    #expect(sqlite3_step(stmt) == SQLITE_DONE)
-                }
-
-                try execSQL("VACUUM;")
             }
 
-            // Re-open with a fresh `SQLiteHistoryStore` after `rawDB` closed cleanly.
+            // Re-open with `GRDBHistoryStore` sharing the same key provider and verify round-trip fidelity.
             do {
-                let reopenedStore = SQLiteHistoryStore(directory: supportDirectory)
+                let reopenedStore = GRDBHistoryStore(directory: supportDirectory, keyProvider: keyProvider)
+                defer { reopenedStore.close() }
+
                 let items = try reopenedStore.fetchAll()
-                #expect(items.map(\.id) == [clipAID])
-                let reopenedClipA = try #require(items.first)
-                #expect(reopenedClipA.text == "Updated By Upstream Clip A")
+                #expect(items.map(\.id) == [clipBID, clipCID, clipAID])
+                let itemsByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+
+                let reopenedClipA = try #require(itemsByID[clipAID])
+                #expect(reopenedClipA.title == "Initial Title A")
+                #expect(reopenedClipA.text == "Initial Fork Clip A")
+                #expect(reopenedClipA.hasFormatting)
+                #expect(reopenedClipA.htmlDigest != nil)
                 #expect(reopenedClipA.tagOrders == [createdTagID: 4])
                 let hydratedClipA = try reopenedStore.loadingFormatting(of: reopenedClipA)
                 #expect(hydratedClipA.html == clipAHtml)
                 #expect(hydratedClipA.rtfData == clipARtfData)
-            }
 
-            do {
-                var checkDB: OpaquePointer?
-                defer {
-                    if let checkDB {
-                        sqlite3_close(checkDB)
-                    }
+                let reopenedClipB = try #require(itemsByID[clipBID])
+                #expect(reopenedClipB.sensitivity == .sensitive)
+                #expect(reopenedClipB.expiresAt == clipBExpiresAt)
+                #expect(reopenedClipB.copySequenceID == clipBSequenceID)
+                #expect(reopenedClipB.copySequenceOrder == 2)
+                #expect(reopenedClipB.favoriteOrder == 1)
+                #expect(reopenedClipB.qrCodeText == "https://qr.example/b")
+                #expect(reopenedClipB.linkPreviewDetails?.title == "Example B")
+                #expect(reopenedClipB.linkPreviewDetails?.imagePath?.hasSuffix(".enc") == true)
+                #expect(reopenedClipB.linkPreviewDetails?.faviconPath?.hasSuffix(".enc") == true)
+                if let encPreviewPath = reopenedClipB.linkPreviewDetails?.imagePath {
+                    #expect(fileManager.fileExists(atPath: encPreviewPath))
                 }
-                #expect(sqlite3_open(dbPath, &checkDB) == SQLITE_OK)
-                var stmt: OpaquePointer?
-                #expect(sqlite3_prepare_v2(checkDB, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK)
-                defer { sqlite3_finalize(stmt) }
-                #expect(sqlite3_step(stmt) == SQLITE_ROW)
-                #expect(sqlite3_column_int(stmt, 0) == 4)
+
+                let reopenedClipC = try #require(itemsByID[clipCID])
+                #expect(reopenedClipC.assetPath == "Images/\(clipCID.uuidString).png")
+                #expect(reopenedClipC.imageDigest == "sha256-clip-c")
             }
         }
     }
@@ -1089,7 +989,11 @@ struct UpstreamInteropContractTests {
             try archiveEncoder.encode(decodedTags).write(to: tagsURL, options: .atomic)
             try archiveEncoder.encode(decodedItems).write(to: historyURL, options: .atomic)
 
-            let destinationStore = SQLiteHistoryStore(directory: destSupport)
+            let destinationStore = GRDBHistoryStore(
+                directory: destSupport,
+                keyProvider: InMemoryDatabaseKeyProvider()
+            )
+            defer { destinationStore.close() }
             let importService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: destSupport)
             let importResult = try importService.import(from: archiveURL, into: destinationStore)
             #expect(importResult.itemCount == 3)

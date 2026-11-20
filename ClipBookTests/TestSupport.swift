@@ -37,7 +37,7 @@ struct RenderedViewSnapshot {
 final class TestCoordinatorHarness {
     let coordinator: AppCoordinator
     let model: AppModel
-    let historyStore: SQLiteHistoryStore
+    let historyStore: GRDBHistoryStore
     let preferencesStore: PreferencesStore
     let clipboardMonitor: PasteboardMonitor
     let globalShortcuts: GlobalShortcutService
@@ -51,7 +51,7 @@ final class TestCoordinatorHarness {
     init(
         coordinator: AppCoordinator,
         model: AppModel,
-        historyStore: SQLiteHistoryStore,
+        historyStore: GRDBHistoryStore,
         preferencesStore: PreferencesStore,
         clipboardMonitor: PasteboardMonitor,
         globalShortcuts: GlobalShortcutService,
@@ -75,7 +75,7 @@ final class TestCoordinatorHarness {
     /// Stores `items` and loads them into the model, as if they had been captured earlier.
     func seedHistory(_ items: [ClipboardItem]) throws {
         for item in items {
-            try historyStore.upsert(item)
+            try historyStore.saveAndReconcileItem(item, convertingExternalAssets: true)
         }
         coordinator.loadHistory()
     }
@@ -93,6 +93,8 @@ final class TestCoordinatorHarness {
         guard !isCleanedUp else { return }
         isCleanedUp = true
         coordinator.stopBackgroundWorkForTesting()
+        coordinator.cancelBackgroundMaintenance()
+        historyStore.close()
         pasteboard.releaseGlobally()
         TestSupport.removeDefaultsSuite(named: userDefaultsSuiteName)
         try? FileManager.default.removeItem(at: supportDirectory)
@@ -102,6 +104,8 @@ final class TestCoordinatorHarness {
         let suiteName = userDefaultsSuiteName
         let supportDir = supportDirectory
         if !isCleanedUp {
+            coordinator.cancelOrphanedFileSweeps(waitUntilDone: true)
+            historyStore.close()
             TestSupport.removeDefaultsSuite(named: suiteName)
             try? FileManager.default.removeItem(at: supportDir)
         }
@@ -249,9 +253,14 @@ enum TestSupport {
         return try await body(directory)
     }
 
-    static func withTemporaryHistoryStore<T>(_ body: (SQLiteHistoryStore, URL) throws -> T) throws -> T {
+    static func withTemporaryHistoryStore<T>(_ body: (GRDBHistoryStore, URL) throws -> T) throws -> T {
         try withTemporaryDirectory { directory in
-            try body(SQLiteHistoryStore(directory: directory), directory)
+            let store = GRDBHistoryStore(
+                directory: directory,
+                keyProvider: InMemoryDatabaseKeyProvider()
+            )
+            defer { store.close() }
+            return try body(store, directory)
         }
     }
 
@@ -268,7 +277,7 @@ enum TestSupport {
     }
 
     /// Removes the preferences of a test suite, and the empty property list that removing the domain leaves behind.
-    static func removeDefaultsSuite(named suiteName: String) {
+    nonisolated static func removeDefaultsSuite(named suiteName: String) {
         UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
         let propertyList = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Preferences/\(suiteName).plist")
@@ -296,7 +305,10 @@ enum TestSupport {
         userDefaults.removePersistentDomain(forName: suiteName)
 
         let pasteboard = NSPasteboard.withUniqueName()
-        let historyStore = SQLiteHistoryStore(directory: supportDirectory)
+        let historyStore = GRDBHistoryStore(
+            directory: supportDirectory,
+            keyProvider: InMemoryDatabaseKeyProvider()
+        )
         let preferencesStore = PreferencesStore(userDefaults: userDefaults)
 
         var initialPreferences = AppPreferences()

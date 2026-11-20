@@ -68,7 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       testDefaultsSuiteName = nil
     }
     preferencesStore = PreferencesStore(userDefaults: userDefaults)
-    historyStore = SQLiteHistoryStore(directory: supportDirectory)
+    historyStore = GRDBHistoryStore(directory: supportDirectory)
     model = AppModel()
     pasteService = PasteService { [historyStore] item in
       (try? historyStore.loadingFormatting(of: item)) ?? item
@@ -198,9 +198,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     coordinator.stop()
+    historyStore.close()
   }
 
   private func removeTestStorage() {
+    coordinator.cancelBackgroundMaintenance()
+    historyStore.close()
     if let testDefaultsSuiteName {
       UserDefaults(suiteName: testDefaultsSuiteName)?.removePersistentDomain(forName: testDefaultsSuiteName)
     }

@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftUI
 import AppKit
 import Carbon
@@ -58,6 +59,11 @@ final class AppCoordinator: ObservableObject {
   private var isTrialSheetPresented = false
   private static let retentionCheckInterval: TimeInterval = 60 * 60
   private static let orphanedStoredFileMinimumAge: TimeInterval = 10 * 60
+  private nonisolated let maintenanceQueue = DispatchQueue(
+    label: "com.ikryanov.clipbook.v2.maintenance",
+    qos: .utility
+  )
+  private nonisolated let orphanSweepGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
   private var retentionTimer: Timer?
   private var expiryTimer: Timer?
   private var isRetentionPromptPresented = false
@@ -194,14 +200,26 @@ final class AppCoordinator: ObservableObject {
     stopBackgroundWorkForTesting()
   }
 
-  /// Stops background tasks, timers, pasteboard polling, and global shortcuts
-  /// without saving window frames, applying preferences, or clearing history.
-  func stopBackgroundWorkForTesting() {
+  nonisolated func cancelOrphanedFileSweeps(waitUntilDone: Bool = true) {
+    orphanSweepGeneration.withLock { $0 &+= 1 }
+    if waitUntilDone {
+      maintenanceQueue.sync {}
+    }
+  }
+
+  func cancelBackgroundMaintenance() {
     cancelLinkPreviewTasks()
     retentionTimer?.invalidate()
     retentionTimer = nil
     expiryTimer?.invalidate()
     expiryTimer = nil
+    cancelOrphanedFileSweeps(waitUntilDone: true)
+  }
+
+  /// Stops background tasks, timers, pasteboard polling, and global shortcuts
+  /// without saving window frames, applying preferences, or clearing history.
+  func stopBackgroundWorkForTesting() {
+    cancelBackgroundMaintenance()
     clipboardMonitor.stop()
     globalShortcuts.unregisterAll()
   }
@@ -341,7 +359,7 @@ final class AppCoordinator: ObservableObject {
     }
     isHistoryArchiveOperationRunning = true
 
-    nonisolated(unsafe) let historyStore = self.historyStore
+    let historyStore = self.historyStore
     DispatchQueue.global(qos: .userInitiated).async {
       let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
       do {
@@ -385,7 +403,7 @@ final class AppCoordinator: ObservableObject {
     // stopped, so nothing else touches the store until it completes.
     nonisolated(unsafe) let fileManager = self.fileManager
     let supportDirectory = self.supportDirectory
-    nonisolated(unsafe) let historyStore = self.historyStore
+    let historyStore = self.historyStore
     let reportProgress: (ClipBookArchiveProgress) -> Void = { progressValue in
       DispatchQueue.main.async {
         progress(progressValue)
@@ -393,6 +411,7 @@ final class AppCoordinator: ObservableObject {
     }
     isHistoryArchiveOperationRunning = true
     clipboardMonitor.stop()
+    cancelOrphanedFileSweeps(waitUntilDone: true)
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
@@ -699,6 +718,7 @@ final class AppCoordinator: ObservableObject {
   /// Deletes the history for good, the Trash included, as clearing it on quit
   /// or after a restart is meant to leave nothing behind.
   func clearHistory() {
+    cancelOrphanedFileSweeps(waitUntilDone: false)
     do {
       let keepingItems = model.preferences.keepFavoritesOnClearHistory
       let deletedItems = model.items.filter { !keepingItems || !shouldKeepWhenClearingHistory($0) }
@@ -2531,16 +2551,31 @@ final class AppCoordinator: ObservableObject {
   /// changed in the last few minutes is kept, since a capture, a link preview
   /// or an import writes the file before it saves the item.
   private func removeOrphanedStoredFiles() {
+    guard !isHistoryArchiveOperationRunning else {
+      return
+    }
+
     nonisolated(unsafe) let fileManager = self.fileManager
-    nonisolated(unsafe) let historyStore = self.historyStore
+    let historyStore = self.historyStore
     let directories = [imagesDirectory, linkPreviewsDirectory]
     // The loaded items must all be among the files the store reports, or the
     // store was not read right and nothing is deleted.
     let loadedFileNames = Set(model.items.flatMap(\.storedFilePaths).map { URL(fileURLWithPath: $0).lastPathComponent })
     let minimumAge = Self.orphanedStoredFileMinimumAge
+    let orphanSweepGeneration = self.orphanSweepGeneration
+    let generation = orphanSweepGeneration.withLock {
+      $0 &+= 1
+      return $0
+    }
 
-    DispatchQueue.global(qos: .utility).async {
+    maintenanceQueue.async {
+      guard orphanSweepGeneration.withLock({ $0 == generation }) else {
+        return
+      }
       guard let referencedPaths = try? historyStore.fetchStoredFilePaths() else {
+        return
+      }
+      guard orphanSweepGeneration.withLock({ $0 == generation }) else {
         return
       }
 
@@ -2563,6 +2598,9 @@ final class AppCoordinator: ObservableObject {
         }
 
         for fileURL in fileURLs where !referencedFileNames.contains(fileURL.lastPathComponent) {
+          guard orphanSweepGeneration.withLock({ $0 == generation }) else {
+            return
+          }
           guard let values = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
                 values.isRegularFile == true,
                 let modifiedAt = values.contentModificationDate,
@@ -2570,7 +2608,11 @@ final class AppCoordinator: ObservableObject {
             continue
           }
 
-          try? fileManager.removeItem(at: fileURL)
+          if fileURL.pathExtension.lowercased() == "enc" {
+            ImageAssetStore.secureUnlink(at: fileURL)
+          } else {
+            try? fileManager.removeItem(at: fileURL)
+          }
         }
       }
     }
