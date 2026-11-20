@@ -193,6 +193,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     private(set) var hasRecognizedText: Bool = false
     private(set) var hasQRCodeText: Bool = false
     private(set) var isSVGText: Bool = false
+    private(set) var isCorruptPlaceholder: Bool = false
     var storedContentKey: Data? = nil
     private(set) var searchRevision: UInt64
 
@@ -314,6 +315,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         hasRecognizedText: Bool,
         hasQRCodeText: Bool,
         isSVGText: Bool,
+        isCorruptPlaceholder: Bool = false,
         storedContentKey: Data?,
         searchRevision: UInt64
     ) {
@@ -357,6 +359,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         self.hasRecognizedText = hasRecognizedText
         self.hasQRCodeText = hasQRCodeText
         self.isSVGText = isSVGText
+        self.isCorruptPlaceholder = isCorruptPlaceholder
         self.storedContentKey = storedContentKey
         self.searchRevision = searchRevision
     }
@@ -483,6 +486,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             && lhs.hasRecognizedText == rhs.hasRecognizedText
             && lhs.hasQRCodeText == rhs.hasQRCodeText
             && lhs.isSVGText == rhs.isSVGText
+            && lhs.isCorruptPlaceholder == rhs.isCorruptPlaceholder
             && lhs.storedContentKey == rhs.storedContentKey
     }
 
@@ -526,6 +530,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         hasher.combine(hasRecognizedText)
         hasher.combine(hasQRCodeText)
         hasher.combine(isSVGText)
+        hasher.combine(isCorruptPlaceholder)
         hasher.combine(storedContentKey)
     }
 
@@ -649,7 +654,8 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         sensitivity: ItemSensitivity?,
         expiresAt: Date?,
         deletedAt: Date?,
-        storedContentKey: Data?
+        storedContentKey: Data?,
+        isCorruptPlaceholder: Bool = false
     ) -> ClipboardItem {
         ClipboardItem(
             rawID: id,
@@ -692,6 +698,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             hasRecognizedText: hasRecognizedText,
             hasQRCodeText: hasQRCodeText,
             isSVGText: isSVGText,
+            isCorruptPlaceholder: isCorruptPlaceholder,
             storedContentKey: storedContentKey,
             searchRevision: Self.nextSearchRevision()
         )
@@ -739,6 +746,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             hasRecognizedText: hasRecognizedText,
             hasQRCodeText: hasQRCodeText,
             isSVGText: isSVGText,
+            isCorruptPlaceholder: isCorruptPlaceholder,
             storedContentKey: storedContentKey,
             searchRevision: searchRevision
         )
@@ -839,6 +847,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             hasRecognizedText: hasRecognizedText,
             hasQRCodeText: Self.computeHasNonWhitespaceText(qrCodeText),
             isSVGText: isSVGText,
+            isCorruptPlaceholder: isCorruptPlaceholder,
             storedContentKey: storedContentKey,
             searchRevision: searchRevision
         )
@@ -1098,6 +1107,10 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
 
     var hasEncryptedImageAsset: Bool {
         kind == .image && assetPath?.lowercased().hasSuffix(".enc") == true
+    }
+
+    var hasUnverifiedEncryptedImageAsset: Bool {
+        hasEncryptedImageAsset && sensitivity != .notSensitive
     }
 
     var quickLookURL: URL? {

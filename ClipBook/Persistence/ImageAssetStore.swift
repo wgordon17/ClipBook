@@ -8,18 +8,27 @@ nonisolated final class ImageAssetStore: Sendable {
     static let encryptedMagic = Data("CBENC01\0".utf8)
     static let minimumEncryptedFileLength = 36
 
+    nonisolated struct AssetConversionOutcome: Sendable {
+        let writtenURL: URL
+        let createdNewFile: Bool
+        let supersededManagedURL: URL?
+    }
+
     private struct RegisteredKeysEntry: Sendable {
         let ownerID: UUID
         let keys: ClipBookDerivedKeys
     }
 
-    private static let keyRegistry = OSAllocatedUnfairLock<[String: RegisteredKeysEntry]>(initialState: [:])
+    private static let keyRegistry = OSAllocatedUnfairLock<[String: [RegisteredKeysEntry]]>(initialState: [:])
 
     static func registerKeys(_ keys: ClipBookDerivedKeys, forSupportDirectory url: URL, ownerID: UUID) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
         keyRegistry.withLock { registry in
-            registry[resolvedPath] = RegisteredKeysEntry(ownerID: ownerID, keys: keys)
+            var entries = registry[resolvedPath] ?? []
+            entries.removeAll { $0.ownerID == ownerID }
+            entries.append(RegisteredKeysEntry(ownerID: ownerID, keys: keys))
+            registry[resolvedPath] = entries
         }
     }
 
@@ -27,12 +36,26 @@ nonisolated final class ImageAssetStore: Sendable {
         let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
         let canonicalPath = canonicalDirectoryURL(url).path
         keyRegistry.withLock { registry in
-            if registry[resolvedPath]?.ownerID == ownerID {
-                registry.removeValue(forKey: resolvedPath)
+            removeOwner(ownerID, forPath: resolvedPath, in: &registry)
+            if canonicalPath != resolvedPath {
+                removeOwner(ownerID, forPath: canonicalPath, in: &registry)
             }
-            if canonicalPath != resolvedPath, registry[canonicalPath]?.ownerID == ownerID {
-                registry.removeValue(forKey: canonicalPath)
-            }
+        }
+    }
+
+    private static func removeOwner(
+        _ ownerID: UUID,
+        forPath path: String,
+        in registry: inout [String: [RegisteredKeysEntry]]
+    ) {
+        guard var entries = registry[path] else {
+            return
+        }
+        entries.removeAll { $0.ownerID == ownerID }
+        if entries.isEmpty {
+            registry.removeValue(forKey: path)
+        } else {
+            registry[path] = entries
         }
     }
 
@@ -89,7 +112,7 @@ nonisolated final class ImageAssetStore: Sendable {
             throw HistoryStoreError.authenticationFailed
         }
 
-        guard let entry = keyRegistry.withLock({ $0[supportDirPath] }) else {
+        guard let entry = keyRegistry.withLock({ $0[supportDirPath]?.last }) else {
             throw HistoryStoreError.encryptionKeyUnavailable(.notFound)
         }
 
@@ -295,12 +318,12 @@ nonisolated final class ImageAssetStore: Sendable {
         return NSImage(data: data)
     }
 
-    func encryptAssetIfNeeded(
+    func stageEncryptedAssetIfNeeded(
         at path: String,
         role: AssetRole,
         clipID: UUID,
         keys: ClipBookDerivedKeys
-    ) throws -> String? {
+    ) throws -> AssetConversionOutcome? {
         guard !path.isEmpty else {
             return nil
         }
@@ -321,12 +344,17 @@ nonisolated final class ImageAssetStore: Sendable {
                     keys: keys,
                     requiresEncryption: true
                 )
-                return targetURL.path
+                return AssetConversionOutcome(
+                    writtenURL: targetURL,
+                    createdNewFile: false,
+                    supersededManagedURL: nil
+                )
             }
             // Same path with .enc extension but lacking valid CBENC01\0 magic fails closed.
             throw HistoryStoreError.authenticationFailed
         }
 
+        let targetPreexisted = Self.pathExistsNoFollow(targetURL)
         let plainData = try readPNGData(
             at: sourceURL,
             role: role,
@@ -342,19 +370,30 @@ nonisolated final class ImageAssetStore: Sendable {
             keys: keys
         )
 
-        if !Self.sameFileLocation(sourceURL, writtenURL) && isManagedAssetURL(sourceURL) {
-            Self.secureUnlink(at: sourceURL)
-        }
-
-        return writtenURL.path
+        return makeStagedWriteOutcome(
+            writtenURL: writtenURL,
+            sourceURL: sourceURL,
+            targetPreexisted: targetPreexisted
+        )
     }
 
-    func decryptAssetIfNeeded(
+    func encryptAssetIfNeeded(
         at path: String,
         role: AssetRole,
         clipID: UUID,
         keys: ClipBookDerivedKeys
     ) throws -> String? {
+        try Self.commitConversionOutcome(
+            stageEncryptedAssetIfNeeded(at: path, role: role, clipID: clipID, keys: keys)
+        )
+    }
+
+    func stageDecryptedAssetIfNeeded(
+        at path: String,
+        role: AssetRole,
+        clipID: UUID,
+        keys: ClipBookDerivedKeys
+    ) throws -> AssetConversionOutcome? {
         guard !path.isEmpty else {
             return nil
         }
@@ -368,37 +407,32 @@ nonisolated final class ImageAssetStore: Sendable {
         let isEncryptedSource = Self.hasEncryptedMagic(rawSourceData)
             || sourceURL.pathExtension.lowercased() == "enc"
 
-        if !isEncryptedSource {
-            let ext = Self.plainAssetExtension(preferred: sourceURL.pathExtension, magicBytes: rawSourceData)
-            let targetURL = self.targetURL(for: role, clipID: clipID, fileExtension: ext)
-            if Self.sameFileLocation(sourceURL, targetURL) {
-                return targetURL.path
-            }
-
-            let writtenURL = try writeAsset(
-                pngData: rawSourceData,
+        let plainData: Data
+        if isEncryptedSource {
+            plainData = try readPNGData(
+                at: sourceURL,
                 role: role,
                 clipID: clipID,
-                encrypted: false,
-                keys: nil,
-                preferredPlainExtension: ext
+                keys: keys,
+                requiresEncryption: true
             )
-            if !Self.sameFileLocation(sourceURL, writtenURL) && isManagedAssetURL(sourceURL) {
-                Self.secureUnlink(at: sourceURL)
-            }
-            return writtenURL.path
+        } else {
+            plainData = rawSourceData
         }
 
-        let decryptedData = try readPNGData(
-            at: sourceURL,
-            role: role,
-            clipID: clipID,
-            keys: keys,
-            requiresEncryption: true
-        )
-        let ext = Self.plainAssetExtension(preferred: sourceURL.pathExtension, magicBytes: decryptedData)
+        let ext = Self.plainAssetExtension(preferred: sourceURL.pathExtension, magicBytes: plainData)
+        let targetURL = self.targetURL(for: role, clipID: clipID, fileExtension: ext)
+        if !isEncryptedSource && Self.sameFileLocation(sourceURL, targetURL) {
+            return AssetConversionOutcome(
+                writtenURL: targetURL,
+                createdNewFile: false,
+                supersededManagedURL: nil
+            )
+        }
+
+        let targetPreexisted = Self.pathExistsNoFollow(targetURL)
         let writtenURL = try writeAsset(
-            pngData: decryptedData,
+            pngData: plainData,
             role: role,
             clipID: clipID,
             encrypted: false,
@@ -406,11 +440,50 @@ nonisolated final class ImageAssetStore: Sendable {
             preferredPlainExtension: ext
         )
 
-        if !Self.sameFileLocation(sourceURL, writtenURL) && isManagedAssetURL(sourceURL) {
-            Self.secureUnlink(at: sourceURL)
-        }
+        return makeStagedWriteOutcome(
+            writtenURL: writtenURL,
+            sourceURL: sourceURL,
+            targetPreexisted: targetPreexisted
+        )
+    }
 
-        return writtenURL.path
+    func decryptAssetIfNeeded(
+        at path: String,
+        role: AssetRole,
+        clipID: UUID,
+        keys: ClipBookDerivedKeys
+    ) throws -> String? {
+        try Self.commitConversionOutcome(
+            stageDecryptedAssetIfNeeded(at: path, role: role, clipID: clipID, keys: keys)
+        )
+    }
+
+    private func makeStagedWriteOutcome(
+        writtenURL: URL,
+        sourceURL: URL,
+        targetPreexisted: Bool
+    ) -> AssetConversionOutcome {
+        let sameLocation = Self.sameFileLocation(sourceURL, writtenURL)
+        return AssetConversionOutcome(
+            writtenURL: writtenURL,
+            createdNewFile: !targetPreexisted && !sameLocation,
+            supersededManagedURL: (!sameLocation && isManagedAssetURL(sourceURL)) ? sourceURL : nil
+        )
+    }
+
+    private static func commitConversionOutcome(_ outcome: AssetConversionOutcome?) -> String? {
+        guard let outcome else {
+            return nil
+        }
+        if let superseded = outcome.supersededManagedURL {
+            secureUnlink(at: superseded)
+        }
+        return outcome.writtenURL.path
+    }
+
+    private static func pathExistsNoFollow(_ url: URL) -> Bool {
+        var st = stat()
+        return Darwin.lstat(url.path, &st) == 0
     }
 
     static func secureUnlink(at url: URL) {

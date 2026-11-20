@@ -71,7 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     historyStore = GRDBHistoryStore(directory: supportDirectory)
     model = AppModel()
     pasteService = PasteService { [historyStore] item, scope in
-      (try? historyStore.loadingContent(of: item, scope: scope)) ?? item
+      try historyStore.loadingContent(of: item, scope: scope)
     }
     globalShortcuts = GlobalShortcutService(isEnabled: !Self.isRunningTests)
     updateService = Self.isRunningTests ? DisabledUpdateService() : SparkleUpdateService()
@@ -249,7 +249,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     item.button?.image = Self.statusBarImage(isPaused: model.isPaused || model.storeLockState != .unlocked)
     item.button?.imagePosition = .imageOnly
-    item.button?.toolTip = "ClipBook"
+    let statusLabel = model.storeLockState != .unlocked
+      ? "ClipBook — \(PersistenceErrorLocalization.statusTitle(for: model.storeLockState))"
+      : "ClipBook"
+    item.button?.toolTip = statusLabel
+    item.button?.setAccessibilityLabel(statusLabel)
     if model.preferences.openHistoryOnMenuBarIconClick {
       // A click toggles the history window, and the menu is attached only for
       // as long as a right-click or Control-click shows it. The action is sent
@@ -346,9 +350,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     menu.addItem(showHistoryItem)
 
+    if model.storeLockState != .unlocked {
+      menu.addItem(.separator())
+      let lockStatusItem = NSMenuItem(
+        title: PersistenceErrorLocalization.statusTitle(for: model.storeLockState),
+        action: nil,
+        keyEquivalent: ""
+      )
+      lockStatusItem.isEnabled = false
+      menu.addItem(lockStatusItem)
+      menu.addItem(
+        menuItem(
+          L10n.string("Unlock History..."),
+          action: #selector(retryUnlockHistory),
+          systemImage: "lock.open"
+        )
+      )
+      menu.addItem(.separator())
+    }
+
     let pauseItem = menuItem(
       model.isPaused ? L10n.string("Resume Clipboard Capture") : L10n.string("Pause Clipboard Capture"),
-      action: #selector(togglePaused)
+      action: #selector(togglePaused),
+      enabled: model.storeLockState == .unlocked
     )
     if let shortcut = KeyboardShortcutParser.menuItemKeyEquivalent(for: model.preferences.pauseShortcut) {
       pauseItem.keyEquivalent = shortcut.keyEquivalent
@@ -407,7 +431,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let pauseItem = menuItem(
       model.isPaused ? L10n.string("Resume") : L10n.string("Pause"),
       action: #selector(togglePaused),
-      systemImage: model.isPaused ? "play.fill" : "pause.fill"
+      systemImage: model.isPaused ? "play.fill" : "pause.fill",
+      enabled: model.storeLockState == .unlocked
     )
     if let shortcut = KeyboardShortcutParser.menuItemKeyEquivalent(for: model.preferences.pauseShortcut) {
       pauseItem.keyEquivalent = shortcut.keyEquivalent

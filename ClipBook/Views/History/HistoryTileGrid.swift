@@ -831,9 +831,19 @@ final class HistoryTileView: NSView {
     } else {
       title = rawTitle
     }
-    titleField.stringValue = title
+    SensitiveContent.applyMaskStyle(
+      to: titleField,
+      text: title,
+      hidesSensitiveContent: hidesSensitiveContent
+    )
     toolTip = hidesSensitiveContent ? nil : title
-    setAccessibilityLabel(title)
+    if hidesSensitiveContent {
+      let stripped = SensitiveContent.strippingMasks(from: title)
+      let baseLabel = stripped.isEmpty ? ItemPreviewDetailsView.typeName(for: item) : stripped
+      setAccessibilityLabel("\(baseLabel), \(L10n.string("Show Sensitive Content"))")
+    } else {
+      setAccessibilityLabel(title)
+    }
     favoriteView.isHidden = !item.isFavorite
     quickPasteField.stringValue = quickPasteIndex.map { "⌘\($0)" } ?? ""
     quickPasteField.isHidden = quickPasteIndex == nil
@@ -903,7 +913,7 @@ final class HistoryTileView: NSView {
       ? ImageAssetThumbnailLoader.ManagedAssetContext(
           role: .image,
           ownerClipID: item.id,
-          requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+          requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
         )
       : nil
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(

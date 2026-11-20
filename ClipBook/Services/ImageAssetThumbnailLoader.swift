@@ -21,6 +21,12 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     var completions: [@MainActor (NSImage?) -> Void]
   }
 
+  private struct NormalizedPathEntry {
+    let globalEpoch: UInt64
+    let evictionEpoch: UInt64
+    let normalizedPath: String
+  }
+
   static let shared = ImageAssetThumbnailLoader()
 
   private let cache = NSCache<NSString, NSImage>()
@@ -33,6 +39,7 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
   private var pendingDecodes: [String: PendingDecode] = [:]
   private var nextDecodeID: UInt64 = 0
   private var cachedKeysByPath: [String: Set<String>] = [:]
+  private var normalizedPathsByRawPath: [String: NormalizedPathEntry] = [:]
   private var globalEpoch: UInt64 = 0
   private var evictionEpoch: UInt64 = 0
   private var pathEvictionEpochs: [String: UInt64] = [:]
@@ -59,7 +66,7 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     assetContext: ManagedAssetContext? = nil,
     completion: @escaping @MainActor (NSImage?) -> Void
   ) -> NSImage? {
-    let normalizedPath = Self.normalizedFilePath(url.path)
+    let normalizedPath = cachedNormalizedFilePath(url.path)
     let contextKey: String
     if let assetContext {
       contextKey = "\n\(assetContext.role.rawValue)\n\(assetContext.ownerClipID.uuidString)\n\(assetContext.requiresEncryption ? 1 : 0)"
@@ -215,10 +222,37 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
       globalEpoch &+= 1
       evictionEpoch &+= 1
       cachedKeysByPath.removeAll()
+      normalizedPathsByRawPath.removeAll()
       pathEvictionEpochs.removeAll()
       directoryEvictionEpochs.removeAll()
       cache.removeAllObjects()
     }
+  }
+
+  private func cachedNormalizedFilePath(_ rawPath: String) -> String {
+    if let cached = lock.withLock({ () -> String? in
+      guard let entry = normalizedPathsByRawPath[rawPath],
+            entry.globalEpoch == globalEpoch,
+            entry.evictionEpoch == evictionEpoch else {
+        return nil
+      }
+      return entry.normalizedPath
+    }) {
+      return cached
+    }
+
+    let resolved = Self.normalizedFilePath(rawPath)
+    lock.withLock {
+      if normalizedPathsByRawPath.count >= 4_096 {
+        normalizedPathsByRawPath.removeAll(keepingCapacity: false)
+      }
+      normalizedPathsByRawPath[rawPath] = NormalizedPathEntry(
+        globalEpoch: globalEpoch,
+        evictionEpoch: evictionEpoch,
+        normalizedPath: resolved
+      )
+    }
+    return resolved
   }
 
   private func isEvicted(

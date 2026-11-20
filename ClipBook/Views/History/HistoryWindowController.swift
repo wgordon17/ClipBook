@@ -210,10 +210,22 @@ final class HistoryContentViewController: NSViewController {
     self.coordinator = coordinator
     super.init(nibName: nil, bundle: nil)
     listPaneView.filePreviewCache = coordinator.filePreviewCache
-    listPaneView.loadContent = { [weak coordinator] item, scope in
-      coordinator?.loadingContent(of: item, scope: scope) ?? item
-    }
+    listPaneView.loadContent = makeContentLoader()
     bindModel()
+  }
+
+  private func makeContentLoader() -> (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem {
+    { [weak self] item, scope in
+      guard let self else {
+        return item
+      }
+      do {
+        return try self.coordinator.loadingContent(of: item, scope: scope)
+      } catch {
+        self.model.lastError = PersistenceErrorLocalization.message(for: error)
+        throw error
+      }
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -499,6 +511,7 @@ final class HistoryContentViewController: NSViewController {
     reloadListOnChange(of: model.$selectedHistoryFilterTagIDs)
     reloadListOnChange(of: model.$selectedHistoryFilterSourceApplicationIDs)
     reloadListOnChange(of: model.$trashedItems)
+    reloadListOnChange(of: model.$storeLockState)
   }
 
   private func reloadListOnChange<Value>(of publisher: some Publisher<Value, Never>) {
@@ -548,7 +561,8 @@ final class HistoryContentViewController: NSViewController {
       arrangesEveryItem: isArrangedByTag,
       isShowingTrash: model.isShowingTrash,
       showsTiles: showsImageTiles,
-      showsCompactRows: model.preferences.compactHistory
+      showsCompactRows: model.preferences.compactHistory,
+      storeLockState: model.storeLockState
     ) { [weak self] firstItem in
       self?.model.selectedItemID = firstItem.id
       self?.model.selectedItemIDs = [firstItem.id]
@@ -1573,9 +1587,7 @@ final class HistoryContentViewController: NSViewController {
       detectsSensitiveContent: model.preferences.detectSensitiveContent,
       revealsSensitiveContent: listPaneView.revealsSensitiveContent(of: item),
       isReadOnly: coordinator.isHistoryReadOnly,
-      loadContent: { [weak coordinator] item, scope in
-        coordinator?.loadingContent(of: item, scope: scope) ?? item
-      }
+      loadContent: makeContentLoader()
     )
     dialogController.highlightsSyntax = model.preferences.highlightCodeSyntax
     let dialogWindow = NSWindow(contentViewController: dialogController)
@@ -2098,9 +2110,7 @@ final class HistoryContentViewController: NSViewController {
         isReadOnly: configuration.isReadOnly,
         presentation: .pane,
         showsPreview: showsPreview,
-        loadContent: { [weak coordinator] item, scope in
-          coordinator?.loadingContent(of: item, scope: scope) ?? item
-        }
+        loadContent: makeContentLoader()
       )
       controller.showsDetails = showsDetails
       controller.showsWebPages = showsWebPages
@@ -2896,6 +2906,10 @@ final class HistoryContentViewController: NSViewController {
 }
 
 extension HistoryContentViewController: HistoryDelegate {
+  func listPaneDidRequestUnlockHistory(_ pane: History) {
+    _ = coordinator.retryUnlockHistoryStore()
+  }
+
   func listPane(_ pane: History, didSelectItems items: [ClipboardItem], focusedItem: ClipboardItem?) {
     let selectedItemIDs = Set(items.map(\.id))
     let selectedItemIDsInSelectionOrder = items.map(\.id)
@@ -4129,45 +4143,54 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
   }
 
   private func copyTextFromQRCode(_ item: ClipboardItem) {
-    guard allowsUsingItems() else {
-      return
-    }
-
-    guard item.canCopyTextFromQRCode else {
-      model.lastError = L10n.string("%@ does not contain a QR code.", item.kind.title)
-      return
-    }
-
-    let item = coordinator.loadingContent(of: item, scope: .body)
-    guard let text = item.qrCodeText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-      model.lastError = L10n.string("No QR code was found in this image.")
-      return
-    }
-
-    let isConcealed = SensitiveContent.shouldEncryptAtRest(item)
-      || (item.sensitivity != .notSensitive
-          && SensitiveContent.detectsBodySecretAtRest(kind: .text, text: text, qrCodeText: nil, html: nil))
-    copyText(text, isConcealed: isConcealed)
+    copyRecognizedTextValue(
+      from: item,
+      canCopy: item.canCopyTextFromQRCode,
+      unsupportedMessage: L10n.string("%@ does not contain a QR code.", item.kind.title),
+      emptyMessage: L10n.string("No QR code was found in this image."),
+      extract: \.qrCodeText
+    )
   }
 
   private func copyTextFromImage(_ item: ClipboardItem) {
+    copyRecognizedTextValue(
+      from: item,
+      canCopy: item.canCopyTextFromImage,
+      unsupportedMessage: L10n.string("%@ does not contain image text.", item.kind.title),
+      emptyMessage: L10n.string("No text was found in this image."),
+      extract: \.text
+    )
+  }
+
+  private func copyRecognizedTextValue(
+    from item: ClipboardItem,
+    canCopy: Bool,
+    unsupportedMessage: @autoclosure () -> String,
+    emptyMessage: @autoclosure () -> String,
+    extract: (ClipboardItem) -> String?
+  ) {
     guard allowsUsingItems() else {
       return
     }
-
-    guard item.canCopyTextFromImage else {
-      model.lastError = L10n.string("%@ does not contain image text.", item.kind.title)
+    guard canCopy else {
+      model.lastError = unsupportedMessage()
       return
     }
 
-    let item = coordinator.loadingContent(of: item, scope: .body)
-    guard let text = item.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-      model.lastError = L10n.string("No text was found in this image.")
+    let loadedItem: ClipboardItem
+    do {
+      loadedItem = try coordinator.loadingContent(of: item, scope: .body)
+    } catch {
+      model.lastError = PersistenceErrorLocalization.message(for: error)
+      return
+    }
+    guard let text = extract(loadedItem)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+      model.lastError = emptyMessage()
       return
     }
 
-    let isConcealed = SensitiveContent.shouldEncryptAtRest(item)
-      || (item.sensitivity != .notSensitive
+    let isConcealed = SensitiveContent.shouldEncryptAtRest(loadedItem)
+      || (loadedItem.sensitivity != .notSensitive
           && SensitiveContent.detectsBodySecretAtRest(kind: .text, text: text, qrCodeText: nil, html: nil))
     copyText(text, isConcealed: isConcealed)
   }
@@ -4221,7 +4244,10 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
     shortcut: String?,
     section: Int
   ) -> [CommandPaletteCommand] {
-    guard item.kind.canHoldSensitiveContent || item.kind == .image || item.kind == .file else {
+    guard item.kind.canHoldSensitiveContent
+            || item.kind == .image
+            || item.kind == .file
+            || item.kind == .color else {
       return []
     }
 

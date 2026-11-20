@@ -32,6 +32,13 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     let size: CGSize
   }
 
+  private struct InFlightEntry {
+    let id: UInt64
+    let canonicalPath: String
+    let startGlobalEpoch: UInt64
+    let startPathEpoch: UInt64
+  }
+
   private let directory: URL
   private let fileManager: FileManager
   private let encoder = JSONEncoder()
@@ -41,8 +48,8 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
   private let imageCache = NSCache<NSString, NSImage>()
   private var globalEpoch: UInt64 = 0
   private var pathEpochs: [String: UInt64] = [:]
-  private var pendingKeys: Set<String> = []
-  private var inFlightPathsByKey: [String: String] = [:]
+  private var nextGenerationID: UInt64 = 0
+  private var inFlightByKey: [String: InFlightEntry] = [:]
   private var displaySizeCache: [String: CachedDisplaySize] = [:]
   private var imageFileCache: [String: Bool] = [:]
 
@@ -59,8 +66,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     // Only picture thumbnails are worth caching. A file icon comes from the system
     // quickly, while encoding it for the disk cache takes hundreds of milliseconds
     // for every icon, since it carries every size the system has for it.
-    let canonicalFilePath = Self.canonicalPath(filePath)
-    guard isImageFile(at: canonicalFilePath) else {
+    guard let canonicalFilePath = resolveImageCanonicalPath(filePath) else {
       return fallbackImage(forFileAt: filePath)
     }
 
@@ -91,23 +97,42 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
   // remembered per path. The extension settles it without touching the disk;
   // only a file without one is asked for its content type.
   func isImageFile(at filePath: String) -> Bool {
+    let pathExtension = URL(fileURLWithPath: filePath).pathExtension
+    if !pathExtension.isEmpty, let type = UTType(filenameExtension: pathExtension) {
+      return type.conforms(to: .image)
+    }
+
     let canonicalFilePath = Self.canonicalPath(filePath)
+    return isExtensionlessImageFile(canonicalFilePath: canonicalFilePath)
+  }
+
+  private func resolveImageCanonicalPath(_ filePath: String) -> String? {
+    let pathExtension = URL(fileURLWithPath: filePath).pathExtension
+    if !pathExtension.isEmpty, let type = UTType(filenameExtension: pathExtension) {
+      guard type.conforms(to: .image) else {
+        return nil
+      }
+      return Self.canonicalPath(filePath)
+    }
+
+    let canonicalFilePath = Self.canonicalPath(filePath)
+    guard isExtensionlessImageFile(canonicalFilePath: canonicalFilePath) else {
+      return nil
+    }
+    return canonicalFilePath
+  }
+
+  private func isExtensionlessImageFile(canonicalFilePath: String) -> Bool {
     if let isImage = pendingLock.withLock({ imageFileCache[canonicalFilePath] }) {
       return isImage
     }
 
     let fileURL = URL(fileURLWithPath: canonicalFilePath)
-    let isImage: Bool
-    let pathExtension = fileURL.pathExtension
-    if !pathExtension.isEmpty, let type = UTType(filenameExtension: pathExtension) {
-      isImage = type.conforms(to: .image)
-    } else if let type = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType {
-      isImage = type.conforms(to: .image)
-    } else {
+    guard let type = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType else {
       // A missing file is not remembered as a non-image: it may appear later.
       return false
     }
-
+    let isImage = type.conforms(to: .image)
     pendingLock.withLock {
       imageFileCache[canonicalFilePath] = isImage
     }
@@ -115,8 +140,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
   }
 
   func displaySizeForImageFile(at filePath: String) -> CGSize? {
-    let canonicalFilePath = Self.canonicalPath(filePath)
-    guard isImageFile(at: canonicalFilePath),
+    guard let canonicalFilePath = resolveImageCanonicalPath(filePath),
           let signature = sourceSignature(forFileAt: canonicalFilePath) else {
       return nil
     }
@@ -178,14 +202,31 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
   }
 
   func prune(keepingFilePaths makeFilePaths: () -> Set<String>) {
+    let hasWork: Bool = pendingLock.withLock {
+      if !inFlightByKey.isEmpty {
+        return true
+      }
+      guard let entries = try? fileManager.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil,
+        options: []
+      ) else {
+        return false
+      }
+      return !entries.isEmpty
+    }
+    guard hasWork else {
+      return
+    }
+
     let rawKeptPaths = makeFilePaths()
     let canonicalKeptPaths = Set(rawKeptPaths.map(Self.canonicalPath))
 
     pendingLock.withLock {
-      for (_, inFlightPath) in inFlightPathsByKey where !canonicalKeptPaths.contains(inFlightPath) {
-        pathEpochs[inFlightPath, default: 0] &+= 1
-        displaySizeCache.removeValue(forKey: inFlightPath)
-        imageFileCache.removeValue(forKey: inFlightPath)
+      for (_, entry) in inFlightByKey where !canonicalKeptPaths.contains(entry.canonicalPath) {
+        pathEpochs[entry.canonicalPath, default: 0] &+= 1
+        displaySizeCache.removeValue(forKey: entry.canonicalPath)
+        imageFileCache.removeValue(forKey: entry.canonicalPath)
       }
       compactPathEpochsIfNeeded()
 
@@ -228,8 +269,6 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     pendingLock.withLock {
       globalEpoch &+= 1
       pathEpochs.removeAll()
-      pendingKeys.removeAll()
-      inFlightPathsByKey.removeAll()
       displaySizeCache.removeAll()
       imageFileCache.removeAll()
       imageCache.removeAllObjects()
@@ -252,20 +291,34 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       return nil
     }
 
+    let (startGlobalEpoch, startPathEpoch): (UInt64, UInt64) = pendingLock.withLock {
+      (globalEpoch, pathEpochs[canonicalFilePath] ?? 0)
+    }
+
+    guard let metadata = readMetadata(key: key),
+          metadata.matches(canonicalSourcePath: canonicalFilePath, signature: signature, targetSize: targetSize) else {
+      return nil
+    }
+
+    if let cached = pendingLock.withLock({ () -> NSImage? in
+      guard globalEpoch == startGlobalEpoch,
+            (pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
+        return nil
+      }
+      return imageCache.object(forKey: key as NSString)
+    }) {
+      return cached
+    }
+
+    guard let image = NSImage(contentsOf: imageURL(forKey: key)) else {
+      return nil
+    }
+
     return pendingLock.withLock {
-      guard let metadata = readMetadata(key: key),
-            metadata.matches(canonicalSourcePath: canonicalFilePath, signature: signature, targetSize: targetSize) else {
+      guard globalEpoch == startGlobalEpoch,
+            (pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
         return nil
       }
-
-      if let image = imageCache.object(forKey: key as NSString) {
-        return image
-      }
-
-      guard let image = NSImage(contentsOf: imageURL(forKey: key)) else {
-        return nil
-      }
-
       imageCache.setObject(image, forKey: key as NSString)
       return image
     }
@@ -285,6 +338,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
 
     let fileURL = URL(fileURLWithPath: canonicalFilePath)
     let maximumPixelSize = max(Int(max(targetSize.width, targetSize.height).rounded()), 1) * 2
+    let generationID = startState.id
     let startGlobalEpoch = startState.globalEpoch
     let startPathEpoch = startState.pathEpoch
 
@@ -293,35 +347,81 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         return
       }
 
-      defer { self.endGeneration(forKey: key) }
+      defer { self.endGeneration(forKey: key, id: generationID) }
+
+      guard self.isGenerationValid(
+        canonicalFilePath: canonicalFilePath,
+        startGlobalEpoch: startGlobalEpoch,
+        startPathEpoch: startPathEpoch
+      ) else {
+        return
+      }
 
       guard let data = Self.thumbnailPNGData(from: fileURL, maximumPixelSize: maximumPixelSize),
             let image = NSImage(data: data) else {
         return
       }
 
-      let didPersist: Bool = self.pendingLock.withLock {
-        guard self.globalEpoch == startGlobalEpoch,
-              (self.pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
-          return false
-        }
-
-        do {
-          try self.writeCachedImageDataLocked(
-            data,
-            canonicalFilePath: canonicalFilePath,
-            targetSize: targetSize,
-            signature: signature,
-            key: key
-          )
-          self.imageCache.setObject(image, forKey: key as NSString)
-          return true
-        } catch {
-          return false
-        }
+      guard self.isGenerationValid(
+        canonicalFilePath: canonicalFilePath,
+        startGlobalEpoch: startGlobalEpoch,
+        startPathEpoch: startPathEpoch
+      ) else {
+        return
       }
 
-      guard didPersist else {
+      let targetImageURL = self.imageURL(forKey: key)
+      let targetMetadataURL = self.metadataURL(forKey: key)
+      var stagedImageURL: URL? = nil
+      var stagedMetadataURL: URL? = nil
+      let cleanupStagedFiles = {
+        if let stagedImageURL {
+          ImageAssetStore.secureUnlink(at: stagedImageURL)
+        }
+        if let stagedMetadataURL {
+          ImageAssetStore.secureUnlink(at: stagedMetadataURL)
+        }
+        _ = Darwin.rmdir(self.directory.path)
+      }
+      do {
+        try self.fileManager.createDirectory(at: self.directory, withIntermediateDirectories: true)
+        let tempImage = try Self.stageTempFile0600(data, for: targetImageURL, in: self.directory)
+        stagedImageURL = tempImage
+        let metadata = Metadata(
+          sourcePath: canonicalFilePath,
+          modificationTime: signature.modificationTime,
+          fileSize: signature.fileSize,
+          targetWidth: Int(targetSize.width.rounded()),
+          targetHeight: Int(targetSize.height.rounded())
+        )
+        let metadataData = try self.encoder.encode(metadata)
+        let tempMetadata = try Self.stageTempFile0600(metadataData, for: targetMetadataURL, in: self.directory)
+        stagedMetadataURL = tempMetadata
+
+        let didPersist: Bool = self.pendingLock.withLock {
+          guard self.globalEpoch == startGlobalEpoch,
+                (self.pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
+            return false
+          }
+          guard Darwin.rename(tempImage.path, targetImageURL.path) == 0 else {
+            return false
+          }
+          stagedImageURL = nil
+          guard Darwin.rename(tempMetadata.path, targetMetadataURL.path) == 0 else {
+            ImageAssetStore.secureUnlink(at: targetImageURL)
+            return false
+          }
+          stagedMetadataURL = nil
+          self.imageCache.setObject(image, forKey: key as NSString)
+          return true
+        }
+
+        if !didPersist {
+          cleanupStagedFiles()
+          return
+        }
+      } catch {
+        cleanupStagedFiles()
         return
       }
 
@@ -330,10 +430,11 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
           guard let self else {
             return
           }
-          let isStillValid = self.pendingLock.withLock {
-            self.globalEpoch == startGlobalEpoch
-              && (self.pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch
-          }
+          let isStillValid = self.isGenerationValid(
+            canonicalFilePath: canonicalFilePath,
+            startGlobalEpoch: startGlobalEpoch,
+            startPathEpoch: startPathEpoch
+          )
           if isStillValid {
             completion(image)
           }
@@ -342,31 +443,21 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     }
   }
 
+  private func isGenerationValid(
+    canonicalFilePath: String,
+    startGlobalEpoch: UInt64,
+    startPathEpoch: UInt64
+  ) -> Bool {
+    pendingLock.withLock {
+      globalEpoch == startGlobalEpoch && (pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch
+    }
+  }
+
   private func fallbackImage(forFileAt filePath: String) -> NSImage {
     NSWorkspace.shared.icon(forFile: filePath)
   }
 
-  private func writeCachedImageDataLocked(
-    _ data: Data,
-    canonicalFilePath: String,
-    targetSize: CGSize,
-    signature: SourceSignature,
-    key: String
-  ) throws {
-    try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-    try Self.writeAtomically0600(data, to: imageURL(forKey: key), in: directory)
-    let metadata = Metadata(
-      sourcePath: canonicalFilePath,
-      modificationTime: signature.modificationTime,
-      fileSize: signature.fileSize,
-      targetWidth: Int(targetSize.width.rounded()),
-      targetHeight: Int(targetSize.height.rounded())
-    )
-    let metadataData = try encoder.encode(metadata)
-    try Self.writeAtomically0600(metadataData, to: metadataURL(forKey: key), in: directory)
-  }
-
-  private static func writeAtomically0600(_ data: Data, to destinationURL: URL, in directoryURL: URL) throws {
+  private static func stageTempFile0600(_ data: Data, for destinationURL: URL, in directoryURL: URL) throws -> URL {
     let tempURL = directoryURL.appendingPathComponent(
       ".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)",
       isDirectory: false
@@ -397,9 +488,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       guard Darwin.close(fd) == 0 else {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
       }
-      guard Darwin.rename(tempURL.path, destinationURL.path) == 0 else {
-        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-      }
+      return tempURL
     } catch {
       if fdOpen {
         _ = Darwin.close(fd)
@@ -557,20 +646,31 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
   private func beginGeneration(
     forKey key: String,
     canonicalFilePath: String
-  ) -> (started: Bool, globalEpoch: UInt64, pathEpoch: UInt64) {
+  ) -> (started: Bool, id: UInt64, globalEpoch: UInt64, pathEpoch: UInt64) {
     pendingLock.withLock {
-      guard pendingKeys.insert(key).inserted else {
-        return (false, 0, 0)
+      let currentPathEpoch = pathEpochs[canonicalFilePath] ?? 0
+      if let existing = inFlightByKey[key],
+         existing.startGlobalEpoch == globalEpoch,
+         existing.startPathEpoch == currentPathEpoch {
+        return (false, 0, 0, 0)
       }
-      inFlightPathsByKey[key] = canonicalFilePath
-      return (true, globalEpoch, pathEpochs[canonicalFilePath] ?? 0)
+      nextGenerationID &+= 1
+      let id = nextGenerationID
+      inFlightByKey[key] = InFlightEntry(
+        id: id,
+        canonicalPath: canonicalFilePath,
+        startGlobalEpoch: globalEpoch,
+        startPathEpoch: currentPathEpoch
+      )
+      return (true, id, globalEpoch, currentPathEpoch)
     }
   }
 
-  private func endGeneration(forKey key: String) {
+  private func endGeneration(forKey key: String, id: UInt64) {
     pendingLock.withLock {
-      _ = pendingKeys.remove(key)
-      inFlightPathsByKey.removeValue(forKey: key)
+      if inFlightByKey[key]?.id == id {
+        inFlightByKey.removeValue(forKey: key)
+      }
     }
   }
 

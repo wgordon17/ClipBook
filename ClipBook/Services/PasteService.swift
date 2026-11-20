@@ -9,11 +9,11 @@ final class PasteService {
   private let pasteboard: NSPasteboard
   // History items come without their body and formatting; this reads the
   // required scope for the one item being pasted or copied.
-  private let loadContent: (ClipboardItem, ClipboardContentScope) -> ClipboardItem
+  private let loadContent: (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem
 
   init(
     pasteboard: NSPasteboard = .general,
-    loadContent: @escaping (ClipboardItem, ClipboardContentScope) -> ClipboardItem = { item, _ in item }
+    loadContent: @escaping (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem = { item, _ in item }
   ) {
     self.pasteboard = pasteboard
     self.loadContent = loadContent
@@ -142,8 +142,11 @@ final class PasteService {
   }
   
   func copy(_ item: ClipboardItem, variant: PasteVariant) throws {
-    pasteboard.clearContents()
-    var isConcealed = SensitiveContent.shouldEncryptAtRest(item)
+    if item.isCorruptPlaceholder {
+      _ = try loadContent(item, .body)
+      throw HistoryStoreError.authenticationFailed
+    }
+    var isConcealed = SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
 
     switch variant {
     case .plainText:
@@ -153,9 +156,12 @@ final class PasteService {
         hydratedItem = item
       } else {
         let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
-        hydratedItem = loadContent(item, scope)
+        hydratedItem = try loadContent(item, scope)
       }
-      isConcealed = isConcealed || SensitiveContent.shouldEncryptAtRest(hydratedItem)
+      isConcealed = isConcealed
+        || SensitiveContent.shouldEncryptAtRest(hydratedItem)
+        || hydratedItem.hasUnverifiedEncryptedImageAsset
+      pasteboard.clearContents()
       guard pasteboard.setString(hydratedItem.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }
@@ -163,10 +169,13 @@ final class PasteService {
       guard !item.filePaths.isEmpty else {
         throw PasteServiceError.unsupportedItem
       }
+      pasteboard.clearContents()
       pasteboard.setString(item.filePaths.joined(separator: "\n"), forType: .string)
     default:
       let writtenItem = try writeItem(item)
-      isConcealed = isConcealed || SensitiveContent.shouldEncryptAtRest(writtenItem)
+      isConcealed = isConcealed
+        || SensitiveContent.shouldEncryptAtRest(writtenItem)
+        || writtenItem.hasUnverifiedEncryptedImageAsset
     }
     // Marked after the item is written so `writeObjects` for images and files
     // does not leave the ghost marker on a separate, empty first pasteboard item.
@@ -205,10 +214,11 @@ final class PasteService {
               at: url,
               role: .image,
               ownerClipID: item.id,
-              requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+              requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
             ) else {
         throw PasteServiceError.unsupportedItem
       }
+      pasteboard.clearContents()
       // Image assets are stored as PNG. Write the raw bytes directly and promise
       // TIFF lazily: decoding and re-encoding the image up front is expensive for
       // large images and would delay the synthetic Cmd+V, while most target apps
@@ -223,10 +233,12 @@ final class PasteService {
       guard !urls.isEmpty else {
         throw PasteServiceError.unsupportedItem
       }
+      pasteboard.clearContents()
       pasteboard.writeObjects(urls as [NSURL])
       return item
     case .richText:
-      let item = loadContent(item, .full)
+      let item = try loadContent(item, .full)
+      pasteboard.clearContents()
       if let rtfData = item.rtfData {
         pasteboard.setData(rtfData, forType: .rtf)
       }
@@ -239,7 +251,8 @@ final class PasteService {
       return item
     default:
       let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
-      let item = loadContent(item, scope)
+      let item = try loadContent(item, scope)
+      pasteboard.clearContents()
       guard pasteboard.setString(item.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }

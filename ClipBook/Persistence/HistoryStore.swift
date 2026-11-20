@@ -8,6 +8,7 @@ nonisolated enum StoreLockState: Equatable, Sendable {
 
 nonisolated protocol HistoryStore: Sendable {
     var lockState: StoreLockState { get }
+    var isOpen: Bool { get }
     func retryUnlock() throws
     func flushPendingFreePageRelease()
     func close()
@@ -93,6 +94,10 @@ nonisolated protocol HistoryStore: Sendable {
 }
 
 nonisolated extension HistoryStore {
+    var isOpen: Bool {
+        lockState == .unlocked
+    }
+
     func writeManagedAsset(
         pngData: Data,
         role: AssetRole,

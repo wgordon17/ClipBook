@@ -442,8 +442,13 @@ final class ItemPreviewDetailsView: NSView {
     // replacing their views each time is far slower than updating their values.
     if !fieldViews.isEmpty, fieldsArrangement == arrangement, shapes == fieldShapes {
       for (field, views) in zip(fields, fieldValueViews) {
-        views.valueField.stringValue = field.value
         views.valueField.lineBreakMode = field.lineBreakMode
+        Self.configureValueField(
+          views.valueField,
+          value: field.value,
+          showsToolTip: field.showsToolTip,
+          hidesSensitiveContent: hidesSensitiveContent
+        )
         views.iconView?.image = field.icon
         if arrangement == .inline {
           views.iconView?.setAccessibilityLabel(field.showsToolTip ? field.value : nil)
@@ -484,7 +489,8 @@ final class ItemPreviewDetailsView: NSView {
           icon: field.icon,
           showsToolTip: field.showsToolTip,
           lineBreakMode: field.lineBreakMode,
-          isShaded: index.isMultiple(of: 2)
+          isShaded: index.isMultiple(of: 2),
+          hidesSensitiveContent: hidesSensitiveContent
         )
         if let key = field.key {
           valueFieldsByKey[key] = rowView.valueField
@@ -503,7 +509,7 @@ final class ItemPreviewDetailsView: NSView {
         separatorViews.append(separatorView)
       }
 
-      let views = Self.makeFieldView(field)
+      let views = Self.makeFieldView(field, hidesSensitiveContent: hidesSensitiveContent)
       if let key = field.key {
         valueFieldsByKey[key] = views.valueField
       }
@@ -513,14 +519,35 @@ final class ItemPreviewDetailsView: NSView {
     }
   }
 
-  private static func makeFieldView(_ field: Field) -> FieldValueViews {
+  fileprivate static func configureValueField(
+    _ valueField: NSTextField,
+    value: String,
+    showsToolTip: Bool,
+    hidesSensitiveContent: Bool
+  ) {
+    let isMaskedField = hidesSensitiveContent && !showsToolTip && !SensitiveContent.maskRanges(in: value).isEmpty
+    SensitiveContent.applyMaskStyle(
+      to: valueField,
+      text: value,
+      hidesSensitiveContent: isMaskedField
+    )
+    valueField.setAccessibilityLabel(isMaskedField ? L10n.string("Show Sensitive Content") : nil)
+  }
+
+  private static func makeFieldView(_ field: Field, hidesSensitiveContent: Bool) -> FieldValueViews {
     // The value is the prominent line and the title the quieter caption
     // under it.
-    let valueField = NSTextField(labelWithString: field.value)
+    let valueField = NSTextField(labelWithString: "")
     valueField.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
     valueField.textColor = .labelColor
     valueField.alignment = .natural
     valueField.lineBreakMode = .byTruncatingTail
+    configureValueField(
+      valueField,
+      value: field.value,
+      showsToolTip: field.showsToolTip,
+      hidesSensitiveContent: hidesSensitiveContent
+    )
 
     let titleField = NSTextField(labelWithString: field.title)
     titleField.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
@@ -750,18 +777,25 @@ private final class ItemPreviewDetailsListRowView: NSView {
     icon: NSImage?,
     showsToolTip: Bool,
     lineBreakMode: NSLineBreakMode,
-    isShaded: Bool
+    isShaded: Bool,
+    hidesSensitiveContent: Bool
   ) {
     titleField = NSTextField(labelWithString: title)
     titleField.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
     titleField.textColor = .secondaryLabelColor
     titleField.lineBreakMode = .byTruncatingTail
 
-    valueField = NSTextField(labelWithString: value)
+    valueField = NSTextField(labelWithString: "")
     valueField.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     valueField.textColor = .labelColor
     valueField.alignment = .right
     valueField.lineBreakMode = lineBreakMode
+    ItemPreviewDetailsView.configureValueField(
+      valueField,
+      value: value,
+      showsToolTip: showsToolTip,
+      hidesSensitiveContent: hidesSensitiveContent
+    )
 
     if let icon {
       let iconView = NSImageView()

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 
 /// What the user said about an item, which always wins over what the app
@@ -61,6 +62,57 @@ nonisolated enum SensitiveContent {
         let precedingCharacter = (attributedText.string as NSString)
             .rangeOfComposedCharacterSequence(at: range.location - 1)
         attributedText.addAttribute(.kern, value: maskSpacing, range: precedingCharacter)
+    }
+
+    @MainActor
+    static func applyMaskStyle(
+        to textField: NSTextField,
+        text: String,
+        hidesSensitiveContent: Bool
+    ) {
+        guard hidesSensitiveContent, text.utf8.contains(0x97) else {
+            textField.stringValue = text
+            return
+        }
+        let ranges = maskRanges(in: text)
+        guard !ranges.isEmpty else {
+            textField.stringValue = text
+            return
+        }
+
+        let font = textField.font ?? .systemFont(ofSize: NSFont.systemFontSize)
+        let color = textField.textColor ?? .labelColor
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = textField.alignment
+        paragraphStyle.lineBreakMode = textField.lineBreakMode
+        let baseAttributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        let attributed = NSMutableAttributedString(string: text, attributes: baseAttributes)
+        for range in ranges {
+            attributed.addAttributes(maskAttributes(for: font), range: range)
+            attributed.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+            addSpacing(beforeMaskAt: range, in: attributed)
+        }
+        textField.attributedStringValue = attributed
+    }
+
+    static func strippingMasks(from text: String) -> String {
+        guard text.utf8.contains(0x97) else {
+            return text
+        }
+        let ranges = maskRanges(in: text)
+        guard !ranges.isEmpty else {
+            return text
+        }
+        let mutable = NSMutableString(string: text)
+        for range in ranges.reversed() {
+            mutable.replaceCharacters(in: range, with: "")
+        }
+        return (mutable as String).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Where the dots that stand for hidden content are in a text that was
@@ -175,9 +227,9 @@ nonisolated enum SensitiveContent {
         guard SensitiveContentDetector.mayContainSecret(in: previewText) else {
             return false
         }
-        return !detectedSecrets(
+        return !SensitiveContentDetector.secrets(
             in: searchedText(previewText, limit: previewCharacterLimit),
-            for: item
+            detectsPasswordLikeText: item.kind == .text || item.kind == .richText
         ).isEmpty
     }
 
@@ -234,11 +286,24 @@ nonisolated enum SensitiveContent {
         guard let text, !text.isEmpty else {
             return false
         }
-        if text.utf16.count > maxEncryptionScanUTF16Length {
+        let utf16Count = text.utf16.count
+        if utf16Count > maxEncryptionScanUTF16Length {
             return true
         }
         guard SensitiveContentDetector.mayContainSecret(in: text) else {
             return false
+        }
+        if utf16Count <= previewCharacterLimit {
+            let key = restVerdictCacheKey(for: text, detectsPasswordLikeText: detectsPasswordLikeText)
+            if let cached = restVerdictCache.object(forKey: key) {
+                return cached.containsSecret
+            }
+            let hasSecret = !SensitiveContentDetector.secrets(
+                in: text,
+                detectsPasswordLikeText: detectsPasswordLikeText
+            ).isEmpty
+            restVerdictCache.setObject(hasSecret ? .yes : .no, forKey: key)
+            return hasSecret
         }
         return !SensitiveContentDetector.secrets(
             in: text,
@@ -333,21 +398,14 @@ nonisolated enum SensitiveContent {
         detectsAutomatically: Bool,
         characterLimit: Int = itemCharacterLimit
     ) -> String {
-        if item.sensitivity == .sensitive {
-            return wholeMask
-        }
-
-        guard item.kind.canHoldSensitiveContent || item.kind == .image || item.kind == .file else {
-            return text
-        }
-
         switch item.sensitivity {
         case .sensitive:
             return wholeMask
         case .notSensitive:
             return text
         case .none:
-            guard detectsAutomatically else {
+            guard detectsAutomatically,
+                  item.kind.canHoldSensitiveContent || item.kind == .image || item.kind == .file else {
                 return text
             }
 
@@ -397,17 +455,6 @@ nonisolated enum SensitiveContent {
         for item: ClipboardItem,
         detectsAutomatically: Bool
     ) -> NSAttributedString {
-        if item.sensitivity == .sensitive {
-            let attributes = attributedText.length > 0
-                ? attributedText.attributes(at: 0, effectiveRange: nil)
-                : [:]
-            return NSAttributedString(string: wholeMask, attributes: attributes)
-        }
-
-        guard item.kind.canHoldSensitiveContent else {
-            return attributedText
-        }
-
         switch item.sensitivity {
         case .sensitive:
             let attributes = attributedText.length > 0
@@ -417,7 +464,7 @@ nonisolated enum SensitiveContent {
         case .notSensitive:
             return attributedText
         case .none:
-            guard detectsAutomatically else {
+            guard detectsAutomatically, item.kind.canHoldSensitiveContent else {
                 return attributedText
             }
 
@@ -444,6 +491,51 @@ nonisolated enum SensitiveContent {
         cache.totalCostLimit = 8_000_000
         return cache
     }()
+
+    private nonisolated final class CachedRestVerdict: Sendable {
+        static let yes = CachedRestVerdict(true)
+        static let no = CachedRestVerdict(false)
+
+        let containsSecret: Bool
+
+        private init(_ containsSecret: Bool) {
+            self.containsSecret = containsSecret
+        }
+    }
+
+    nonisolated(unsafe) private static let restVerdictCache: NSCache<NSString, CachedRestVerdict> = {
+        let cache = NSCache<NSString, CachedRestVerdict>()
+        cache.countLimit = 4_000
+        return cache
+    }()
+
+    private static func restVerdictCacheKey(for text: String, detectsPasswordLikeText: Bool) -> NSString {
+        var hasher = SHA256()
+        var flag: UInt8 = detectsPasswordLikeText ? 1 : 0
+        withUnsafeBytes(of: &flag) { hasher.update(bufferPointer: $0) }
+        var utf8Count = text.utf8.count
+        withUnsafeBytes(of: &utf8Count) { hasher.update(bufferPointer: $0) }
+        var copy = text
+        copy.withUTF8 { hasher.update(bufferPointer: UnsafeRawBufferPointer($0)) }
+        let digest = hasher.finalize()
+        return digest.withUnsafeBytes { bytes -> NSString in
+            var hex = [UInt8](repeating: 0, count: 64)
+            let alphabet: StaticString = "0123456789abcdef"
+            alphabet.withUTF8Buffer { lut in
+                for i in 0..<32 {
+                    let b = bytes[i]
+                    hex[i * 2] = lut[Int(b >> 4)]
+                    hex[i * 2 + 1] = lut[Int(b & 0x0F)]
+                }
+            }
+            return String(decoding: hex, as: UTF8.self) as NSString
+        }
+    }
+
+    nonisolated static func removeAll() {
+        cache.removeAllObjects()
+        restVerdictCache.removeAllObjects()
+    }
 
     private nonisolated final class CachedSecrets: Sendable {
         let secrets: [SensitiveContentDetector.Secret]

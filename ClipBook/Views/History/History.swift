@@ -16,6 +16,11 @@ protocol HistoryDelegate: AnyObject {
   func listPane(_ pane: History, moveItems itemIDs: [UUID], before targetItemID: UUID?)
   /// The user clicked the eye of an item whose content is hidden or shown for now.
   func listPane(_ pane: History, didRequestTogglingSensitiveContentVisibilityOf item: ClipboardItem)
+  func listPaneDidRequestUnlockHistory(_ pane: History)
+}
+
+extension HistoryDelegate {
+  func listPaneDidRequestUnlockHistory(_ pane: History) {}
 }
 
 enum HistoryMultipleSelectionChange {
@@ -34,7 +39,7 @@ final class History: NSView {
   var filePreviewCache: FilePreviewCache?
   /// Reads the stored content of an item for the requested scope when dragging
   /// a row out of the history.
-  var loadContent: ((ClipboardItem, ClipboardContentScope) -> ClipboardItem)?
+  var loadContent: ((ClipboardItem, ClipboardContentScope) throws -> ClipboardItem)?
 
   var items: [ClipboardItem] = []
   var availableTags: [Tag] = [] {
@@ -176,6 +181,12 @@ final class History: NSView {
     message: L10n.string("Deleted items stay here for a while, so you can put them back."),
     symbolName: "trash"
   )
+  private lazy var lockedHistoryView = LockedHistoryView { [weak self] in
+    guard let self else {
+      return
+    }
+    self.delegate?.listPaneDidRequestUnlockHistory(self)
+  }
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     configure()
@@ -256,6 +267,7 @@ final class History: NSView {
     isShowingTrash: Bool = false,
     showsTiles: Bool = false,
     showsCompactRows: Bool = false,
+    storeLockState: StoreLockState = .unlocked,
     onSelectFirstItem: @escaping (ClipboardItem) -> Void
   ) {
     let previousItems = self.items
@@ -332,9 +344,18 @@ final class History: NSView {
     // the window's automatic titlebar separator lose the scroll view it tracks,
     // and a permanent separator line appears above the empty view.
     let isSearchActive = !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    emptyListView.isHidden = !items.isEmpty || isSearchActive || isShowingTrash
-    emptyTrashView.isHidden = !items.isEmpty || isSearchActive || !isShowingTrash
-    emptySearchResultsView.isHidden = !items.isEmpty || !isSearchActive
+    if storeLockState != .unlocked {
+      lockedHistoryView.update(for: storeLockState)
+      lockedHistoryView.isHidden = false
+      emptyListView.isHidden = true
+      emptyTrashView.isHidden = true
+      emptySearchResultsView.isHidden = true
+    } else {
+      lockedHistoryView.isHidden = true
+      emptyListView.isHidden = !items.isEmpty || isSearchActive || isShowingTrash
+      emptyTrashView.isHidden = !items.isEmpty || isSearchActive || !isShowingTrash
+      emptySearchResultsView.isHidden = !items.isEmpty || !isSearchActive
+    }
     syncSelection(
       selectedItemID: selectedItemID,
       selectedItemIDs: selectedItemIDs,
@@ -1259,11 +1280,14 @@ final class History: NSView {
     emptySearchResultsView.isHidden = true
     emptyTrashView.translatesAutoresizingMaskIntoConstraints = false
     emptyTrashView.isHidden = true
+    lockedHistoryView.translatesAutoresizingMaskIntoConstraints = false
+    lockedHistoryView.isHidden = true
 
     addSubview(scrollView)
     addSubview(emptyListView)
     addSubview(emptySearchResultsView)
     addSubview(emptyTrashView)
+    addSubview(lockedHistoryView)
 
     NSLayoutConstraint.activate([
       scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 0),
@@ -1283,7 +1307,11 @@ final class History: NSView {
       emptyTrashView.leadingAnchor.constraint(equalTo: leadingAnchor),
       emptyTrashView.trailingAnchor.constraint(equalTo: trailingAnchor),
       emptyTrashView.topAnchor.constraint(equalTo: topAnchor),
-      emptyTrashView.bottomAnchor.constraint(equalTo: bottomAnchor)
+      emptyTrashView.bottomAnchor.constraint(equalTo: bottomAnchor),
+      lockedHistoryView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      lockedHistoryView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      lockedHistoryView.topAnchor.constraint(equalTo: topAnchor),
+      lockedHistoryView.bottomAnchor.constraint(equalTo: bottomAnchor)
     ])
   }
 
@@ -1546,20 +1574,25 @@ final class History: NSView {
   private func dragPayload(forRow row: Int, modifierFlags: NSEvent.ModifierFlags) -> HistoryRowDragPayload? {
     guard !isReadOnly,
           tableRows.indices.contains(row),
-          case .item(let item, _) = tableRows[row] else {
+          case .item(let item, _) = tableRows[row],
+          !item.isCorruptPlaceholder else {
       return nil
     }
 
     let asPlainText = preferDraggingAsPlainText != modifierFlags.contains(.option)
     let draggedItem: ClipboardItem
-    switch item.kind {
-    case .file, .image:
-      draggedItem = item
-    case .richText where !asPlainText:
-      draggedItem = loadContent?(item, .full) ?? item
-    default:
-      let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
-      draggedItem = loadContent?(item, scope) ?? item
+    do {
+      switch item.kind {
+      case .file, .image:
+        draggedItem = item
+      case .richText where !asPlainText:
+        draggedItem = try loadContent?(item, .full) ?? item
+      default:
+        let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
+        draggedItem = try loadContent?(item, scope) ?? item
+      }
+    } catch {
+      return nil
     }
     return HistoryItemDragging.payload(for: draggedItem, asPlainText: asPlainText)
   }
@@ -1579,6 +1612,68 @@ final class History: NSView {
     default:
       return
     }
+  }
+}
+
+private final class LockedHistoryView: NSView {
+  private let imageView = NSImageView()
+  private let titleField = NSTextField(labelWithString: "")
+  private let messageField = NSTextField(wrappingLabelWithString: "")
+  private let unlockButton = NSButton(title: "", target: nil, action: nil)
+  private let onUnlock: () -> Void
+
+  init(onUnlock: @escaping () -> Void) {
+    self.onUnlock = onUnlock
+    super.init(frame: .zero)
+
+    imageView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 48, weight: .regular)
+    imageView.contentTintColor = .secondaryLabelColor
+
+    titleField.font = .systemFont(ofSize: NSFont.systemFontSize + 8, weight: .semibold)
+    titleField.textColor = .secondaryLabelColor
+    titleField.alignment = .center
+
+    messageField.textColor = .secondaryLabelColor
+    messageField.alignment = .center
+
+    unlockButton.bezelStyle = .rounded
+    unlockButton.target = self
+    unlockButton.action = #selector(unlockClicked)
+
+    let stack = NSStackView(views: [imageView, titleField, messageField, unlockButton])
+    stack.orientation = .vertical
+    stack.spacing = 8
+    stack.setCustomSpacing(14, after: messageField)
+    stack.alignment = .centerX
+    stack.translatesAutoresizingMaskIntoConstraints = false
+
+    addSubview(stack)
+
+    NSLayoutConstraint.activate([
+      imageView.widthAnchor.constraint(equalToConstant: 56),
+      imageView.heightAnchor.constraint(equalToConstant: 56),
+      stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+      stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+      stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 24),
+      stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -24)
+    ])
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func update(for state: StoreLockState) {
+    let title = PersistenceErrorLocalization.statusTitle(for: state)
+    imageView.image = NSImage(systemSymbolName: "lock", accessibilityDescription: title)
+    titleField.stringValue = title
+    messageField.stringValue = PersistenceErrorLocalization.statusMessage(for: state)
+    unlockButton.title = L10n.string("Unlock History")
+  }
+
+  @objc private func unlockClicked() {
+    onUnlock()
   }
 }
 

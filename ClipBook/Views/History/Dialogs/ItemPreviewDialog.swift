@@ -77,16 +77,31 @@ final class ItemPreviewDialogController: NSViewController {
     let hasFormatting: Bool
     let htmlDigest: String?
     let scope: ClipboardContentScope
-    let text: String?
-    let qrCodeText: String?
-    let html: String?
-    let rtfData: Data?
+    let hydratedItem: ClipboardItem
+
+    func applyingHeaderMetadata(from header: ClipboardItem) -> ClipboardItem {
+      var merged = hydratedItem
+      if merged.isFavorite != header.isFavorite {
+        merged.isFavorite = header.isFavorite
+      }
+      merged.favoriteOrder = header.favoriteOrder
+      merged.copyCount = header.copyCount
+      merged.copiedAt = header.copiedAt
+      merged.firstCopiedAt = header.firstCopiedAt
+      merged.sensitivity = header.sensitivity
+      merged.expiresAt = header.expiresAt
+      merged.deletedAt = header.deletedAt
+      merged.copySequenceID = header.copySequenceID
+      merged.copySequenceOrder = header.copySequenceOrder
+      merged.storedContentKey = header.storedContentKey ?? merged.storedContentKey
+      return merged
+    }
   }
 
   private(set) var item: ClipboardItem
   private var resolvedItem: ClipboardItem
   private var cachedBody: CachedBody?
-  private let loadContent: (ClipboardItem, ClipboardContentScope) -> ClipboardItem
+  private let loadContent: (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem
   private let detectsSensitiveContent: Bool
   // Whether the user asked to see the hidden content of the item for now.
   private(set) var revealsSensitiveContent: Bool
@@ -252,7 +267,7 @@ final class ItemPreviewDialogController: NSViewController {
     isReadOnly: Bool = false,
     presentation: Presentation = .sheet,
     showsPreview: Bool = true,
-    loadContent: @escaping (ClipboardItem, ClipboardContentScope) -> ClipboardItem = { item, _ in item }
+    loadContent: @escaping (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem = { item, _ in item }
   ) {
     self.item = item
     self.isReadOnly = isReadOnly
@@ -270,7 +285,7 @@ final class ItemPreviewDialogController: NSViewController {
         for: item,
         cachedBody: &initialCachedBody,
         loadContent: loadContent
-      )
+      ).item
     } else {
       initialResolved = item
     }
@@ -304,10 +319,16 @@ final class ItemPreviewDialogController: NSViewController {
   private static func resolveHydratedItem(
     for header: ClipboardItem,
     cachedBody: inout CachedBody?,
-    loadContent: (ClipboardItem, ClipboardContentScope) -> ClipboardItem
-  ) -> ClipboardItem {
+    loadContent: (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem
+  ) -> (item: ClipboardItem, didAuthenticate: Bool) {
+    if header.isCorruptPlaceholder {
+      cachedBody = nil
+      _ = try? loadContent(header, .body)
+      return (header, false)
+    }
+
     guard let scope = requiredScope(for: header) else {
-      return header
+      return (header, true)
     }
 
     let isSatisfiedInMemory: Bool
@@ -320,7 +341,7 @@ final class ItemPreviewDialogController: NSViewController {
       isSatisfiedInMemory = header.isContentLoaded && header.isFormattingLoaded
     }
     if isSatisfiedInMemory {
-      return header
+      return (header, true)
     }
 
     if let cachedBody,
@@ -329,35 +350,31 @@ final class ItemPreviewDialogController: NSViewController {
        cachedBody.hasFormatting == header.hasFormatting,
        cachedBody.htmlDigest == header.htmlDigest,
        cachedBody.scope >= scope {
-      return header.withLoadedContent(
-        text: cachedBody.text,
-        qrCodeText: cachedBody.qrCodeText,
-        html: cachedBody.html,
-        rtfData: cachedBody.rtfData,
-        scope: cachedBody.scope
-      )
+      return (cachedBody.applyingHeaderMetadata(from: header), true)
     }
 
-    let hydrated = loadContent(header, scope)
-    let effectiveCachedScope: ClipboardContentScope = (hydrated.isFormattingLoaded && scope < .full)
-      ? .full
-      : scope
-    cachedBody = CachedBody(
-      id: header.id,
-      searchRevision: header.searchRevision,
-      hasFormatting: header.hasFormatting,
-      htmlDigest: header.htmlDigest,
-      scope: effectiveCachedScope,
-      text: hydrated.text,
-      qrCodeText: hydrated.qrCodeText,
-      html: hydrated.html,
-      rtfData: hydrated.rtfData
-    )
-    return hydrated
+    do {
+      let hydrated = try loadContent(header, scope)
+      let effectiveCachedScope: ClipboardContentScope = (hydrated.isFormattingLoaded && scope < .full)
+        ? .full
+        : scope
+      cachedBody = CachedBody(
+        id: header.id,
+        searchRevision: header.searchRevision,
+        hasFormatting: header.hasFormatting,
+        htmlDigest: header.htmlDigest,
+        scope: effectiveCachedScope,
+        hydratedItem: hydrated
+      )
+      return (hydrated, true)
+    } catch {
+      cachedBody = nil
+      return (header, false)
+    }
   }
 
   private func resolveHydratedItem(for header: ClipboardItem) -> ClipboardItem {
-    Self.resolveHydratedItem(for: header, cachedBody: &cachedBody, loadContent: loadContent)
+    Self.resolveHydratedItem(for: header, cachedBody: &cachedBody, loadContent: loadContent).item
   }
 
   func makeToolbar() -> NSToolbar {
@@ -402,7 +419,7 @@ final class ItemPreviewDialogController: NSViewController {
 
   override func loadView() {
     // Nothing is built for a preview the pane hides.
-    let content = presentation == .sheet || showsPreview ? makeContent(for: item) : nil
+    let content = presentation == .sheet || showsPreview ? makeContent(for: resolvedItem) : nil
     let contentSize = content.map(dialogContentSize(for:)) ?? Self.minimumContentSize
     let rootView = ItemPreviewKeyHandlingView(
       frame: NSRect(origin: .zero, size: contentSize)
@@ -505,9 +522,7 @@ final class ItemPreviewDialogController: NSViewController {
     detailsView.update(item: item, hidesSensitiveContent: sensitiveContent.hidesContent)
 
     if presentation == .pane && !showsPreview {
-      self.resolvedItem = item
-      toolbar.update(item: item, sensitiveContent: sensitiveContent)
-      installPaneContentView(for: nil)
+      clearHiddenPanePreview()
       return
     }
 
@@ -532,11 +547,11 @@ final class ItemPreviewDialogController: NSViewController {
     }
 
     guard presentation == .sheet else {
-      installPaneContentView(for: makeContent(for: item))
+      installPaneContentView(for: makeContent(for: nextResolvedItem))
       return
     }
 
-    let content = makeContent(for: item)
+    let content = makeContent(for: nextResolvedItem)
 
     let contentSize = dialogContentSize(for: content)
     windowContentSize = contentSize
@@ -564,24 +579,27 @@ final class ItemPreviewDialogController: NSViewController {
     }
   }
 
+  private func clearHiddenPanePreview() {
+    cachedBody = nil
+    resolvedItem = item
+    toolbar.update(item: item, sensitiveContent: sensitiveContent)
+    installPaneContentView(for: nil)
+  }
+
   // Rebuilds the preview of the same item, after a change in how it is shown.
   private func reinstallContentView() {
     guard isViewLoaded, !isEditing else {
       return
     }
+    if presentation == .pane && !showsPreview {
+      clearHiddenPanePreview()
+      return
+    }
+    let content = makeContent(for: resolvedItem)
+    toolbar.update(item: resolvedItem, sensitiveContent: sensitiveContent)
     if presentation == .pane {
-      if showsPreview {
-        let content = makeContent(for: item)
-        toolbar.update(item: resolvedItem, sensitiveContent: sensitiveContent)
-        installPaneContentView(for: content)
-      } else {
-        resolvedItem = item
-        toolbar.update(item: item, sensitiveContent: sensitiveContent)
-        installPaneContentView(for: nil)
-      }
+      installPaneContentView(for: content)
     } else {
-      let content = makeContent(for: item)
-      toolbar.update(item: resolvedItem, sensitiveContent: sensitiveContent)
       installContentView(for: content)
     }
   }
@@ -693,11 +711,26 @@ final class ItemPreviewDialogController: NSViewController {
   // `closesWhenFinished` is used when the sheet is presented for editing: the
   // preview was never asked for, so it goes away together with the editor.
   func beginEditing(closesWhenFinished: Bool = false) {
-    guard !isEditing, !isReadOnly, item.kind.canEditTextContent else {
+    guard !isEditing, !isReadOnly, item.kind.canEditTextContent, !item.isCorruptPlaceholder else {
+      if closesWhenFinished {
+        onCancel?()
+      }
       return
     }
 
-    let hydrated = resolveHydratedItem(for: item)
+    let resolution = Self.resolveHydratedItem(
+      for: item,
+      cachedBody: &cachedBody,
+      loadContent: loadContent
+    )
+    guard resolution.didAuthenticate,
+          Self.requiredScope(for: item) == nil || resolution.item.isContentLoaded else {
+      if closesWhenFinished {
+        onCancel?()
+      }
+      return
+    }
+    let hydrated = resolution.item
     resolvedItem = hydrated
     closesWhenEditingEnds = closesWhenFinished
     toolbar.setEditing(true)
@@ -753,9 +786,12 @@ final class ItemPreviewDialogController: NSViewController {
     editingTextView = nil
 
     guard !closesWhenEditingEnds else {
-      self.resolvedItem = (presentation == .sheet || showsPreview)
-        ? resolveHydratedItem(for: item)
-        : item
+      if presentation == .pane && !showsPreview {
+        self.cachedBody = nil
+        self.resolvedItem = item
+      } else {
+        self.resolvedItem = resolveHydratedItem(for: item)
+      }
       detailsView.update(item: resolvedItem, hidesSensitiveContent: sensitiveContent.hidesContent)
       closesWhenEditingEnds = false
       onCancel?()
@@ -763,10 +799,8 @@ final class ItemPreviewDialogController: NSViewController {
     }
 
     if presentation == .pane && !showsPreview {
-      self.resolvedItem = item
-      toolbar.update(item: item, sensitiveContent: sensitiveContent)
       detailsView.update(item: item, hidesSensitiveContent: sensitiveContent.hidesContent)
-      installPaneContentView(for: nil)
+      clearHiddenPanePreview()
       return
     }
 
@@ -779,7 +813,7 @@ final class ItemPreviewDialogController: NSViewController {
     // The details were following the editor, so they go back to the item.
     detailsView.update(item: hydrated, hidesSensitiveContent: sensitiveContent.hidesContent)
 
-    let content = makeContent(for: item)
+    let content = makeContent(for: hydrated)
     if presentation == .pane {
       installPaneContentView(for: content)
     } else {
@@ -831,6 +865,8 @@ final class ItemPreviewDialogController: NSViewController {
   /// Stops what the preview has going, such as a page loading, before the
   /// pane lets go of it.
   func tearDownContent() {
+    cachedBody = nil
+    resolvedItem = item
     tearDownContentView()
   }
 
@@ -956,7 +992,7 @@ final class ItemPreviewDialogController: NSViewController {
            at: imageURL,
            role: .image,
            ownerClipID: item.id,
-           requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+           requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
          ) {
         return .image(image)
       }
@@ -1764,7 +1800,7 @@ extension ItemPreviewDialogController: ItemPreviewToolbarDelegate {
     }
 
     showsSVGMarkup = showsMarkup
-    installContentView(for: makeContent(for: item))
+    installContentView(for: makeContent(for: resolvedItem))
     view.window?.makeFirstResponder(view)
   }
 

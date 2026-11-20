@@ -9,9 +9,11 @@ import Testing
 
 @Suite
 struct RecoveryScriptIntegrationTests {
-    private nonisolated static let scriptURL: URL = URL(fileURLWithPath: #filePath)
+    private nonisolated static let repoRootURL: URL = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
+
+    private nonisolated static let scriptURL: URL = repoRootURL
         .appendingPathComponent("scripts/recover-history.swift")
 
     private nonisolated struct ProcessResult: Sendable {
@@ -26,29 +28,31 @@ struct RecoveryScriptIntegrationTests {
     }
 
     private nonisolated static let compiledBinaryResult: Result<URL, Error> = Result {
-        let baseTemp = FileManager.default.temporaryDirectory
-        try FileManager.default.createDirectory(at: baseTemp, withIntermediateDirectories: true)
-
-        let binaryDir = baseTemp.appendingPathComponent(
-            "ClipBookRecoveryScriptBin-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        guard Darwin.mkdir(binaryDir.path, mode_t(0o700)) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
+        let binaryDir = repoRootURL.appendingPathComponent(".build/test-recovery-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binaryDir, withIntermediateDirectories: true)
         guard Darwin.chmod(binaryDir.path, mode_t(0o700)) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
 
+        let stagedBinaryURL = binaryDir.appendingPathComponent(
+            ".recover-history.tmp-\(UUID().uuidString)",
+            isDirectory: false
+        )
         let binaryURL = binaryDir.appendingPathComponent("recover-history", isDirectory: false)
         let compileResult = try executeProcessSync(
             executableURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
-            arguments: ["swiftc", "-O", scriptURL.path, "-o", binaryURL.path]
+            arguments: ["swiftc", "-O", scriptURL.path, "-o", stagedBinaryURL.path]
         )
         guard compileResult.exitCode == 0 else {
+            _ = Darwin.unlink(stagedBinaryURL.path)
             throw ScriptCompilationError(
                 message: "swiftc failed (\(compileResult.exitCode)):\n\(compileResult.stderr)\n\(compileResult.stdout)"
             )
+        }
+        guard Darwin.rename(stagedBinaryURL.path, binaryURL.path) == 0 else {
+            let err = errno
+            _ = Darwin.unlink(stagedBinaryURL.path)
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
         }
         return binaryURL
     }
@@ -1479,6 +1483,234 @@ struct RecoveryScriptIntegrationTests {
             #expect(symlinkManifestRun.exitCode != 0)
             #expect(symlinkManifestRun.exitCode == 1)
             #expect(!fileManager.fileExists(atPath: symlinkManifestOut.path))
+        }
+    }
+
+    @Test
+    func modeAUnencryptedMissingPlainAssetRecoversNilPathAndInlineEqualsFlagParsing() async throws {
+        try await TestSupport.withTemporaryDirectory { workspace in
+            let fileManager = FileManager.default
+            let supportDir = workspace.appendingPathComponent("ModeAPlainMissingAsset", isDirectory: true)
+            try fileManager.createDirectory(at: supportDir, withIntermediateDirectories: true)
+
+            let keyProvider = FileDatabaseKeyProvider(supportDirectory: supportDir)
+            let linkID = UUID()
+            let survivingPlainImgID = UUID()
+            let plainImgID = UUID()
+            let missingEncID = UUID()
+            let unencryptedMissingEncID = UUID()
+            let survivingPlainPNG = try TestSupport.makePNGData(pixelWidth: 18, pixelHeight: 18, color: .systemGreen)
+            let missingEncURL: URL
+
+            do {
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                defer { store.close() }
+
+                // 1. Plain unencrypted .link row whose LinkPreviews/ directory & .ico/.png files are absent on disk.
+                let linkItem = ClipboardItem.fixture(
+                    id: linkID,
+                    kind: .link,
+                    title: "Healthy Link With Cleaned Preview",
+                    text: "https://example.org/docs",
+                    copiedAt: Date(timeIntervalSince1970: 1_715_500_300),
+                    linkPreviewDetails: LinkPreviewDetails(
+                        url: "https://example.org/docs",
+                        title: "Example Docs",
+                        description: "Documentation home",
+                        imagePath: supportDir.appendingPathComponent("LinkPreviews/\(linkID.uuidString)-preview.png").path,
+                        faviconPath: supportDir.appendingPathComponent("LinkPreviews/\(linkID.uuidString)-favicon.ico").path,
+                        fetchedAt: Date(timeIntervalSince1970: 1_715_500_305)
+                    )
+                )
+                #expect(!SensitiveContent.shouldEncryptAtRest(linkItem))
+                try store.upsert(linkItem)
+
+                // 2. Seed an existing Images/ directory with one valid plain PNG alongside a plain .image row whose .png file is missing on disk.
+                let survivingPlainURL = try store.writeManagedAsset(
+                    pngData: survivingPlainPNG,
+                    role: .image,
+                    clipID: survivingPlainImgID,
+                    encrypted: false
+                )
+                try store.upsert(
+                    ClipboardItem.fixture(
+                        id: survivingPlainImgID,
+                        kind: .image,
+                        title: "Surviving Plain PNG",
+                        assetPath: survivingPlainURL.path,
+                        copiedAt: Date(timeIntervalSince1970: 1_715_500_250)
+                    )
+                )
+
+                let plainImgItem = ClipboardItem.fixture(
+                    id: plainImgID,
+                    kind: .image,
+                    title: "Plain Missing PNG",
+                    text: "harmless caption",
+                    assetPath: supportDir.appendingPathComponent("Images/\(plainImgID.uuidString).png").path,
+                    copiedAt: Date(timeIntervalSince1970: 1_715_500_200)
+                )
+                #expect(!SensitiveContent.shouldEncryptAtRest(plainImgItem))
+                try store.upsert(plainImgItem)
+
+                // Verify clean Mode A recovery (including `--flag=value` syntax and `--strict`!) exits 0 with nil asset paths!
+            }
+
+            let cleanOut = workspace.appendingPathComponent("CleanPlainMissing.clipbookarchive", isDirectory: true)
+            let cleanRun = try await Self.runRecoveryCLI(
+                arguments: [
+                    "--support-dir=\(supportDir.path)",
+                    "--key-file=\(keyProvider.keyFileURL.path)",
+                    "--strict",
+                    "--output-dir=\(cleanOut.path)",
+                ]
+            )
+            #expect(cleanRun.exitCode == 0, "Expected exit 0 on plain missing assets, got \(cleanRun.exitCode): \(cleanRun.stderr)")
+            #expect(!fileManager.fileExists(atPath: cleanOut.appendingPathComponent("corrupted-items.json").path))
+
+            let decoder = Self.makeArchiveJSONDecoder()
+            let recoveredPlainItems = try decoder.decode(
+                [ClipBookArchiveItem].self,
+                from: try Data(contentsOf: cleanOut.appendingPathComponent("history.json"))
+            )
+            #expect(recoveredPlainItems.count == 3)
+            let recoveredLink = try #require(recoveredPlainItems.first { $0.id == linkID })
+            #expect(recoveredLink.text == "https://example.org/docs")
+            #expect(recoveredLink.linkPreviewDetails?.title == "Example Docs")
+            #expect(recoveredLink.linkPreviewDetails?.imagePath == nil)
+            #expect(recoveredLink.linkPreviewDetails?.faviconPath == nil)
+
+            let recoveredSurvivingPlainImg = try #require(recoveredPlainItems.first { $0.id == survivingPlainImgID })
+            let survivingRelAssetPath = try #require(recoveredSurvivingPlainImg.assetPath)
+            #expect(try Data(contentsOf: cleanOut.appendingPathComponent(survivingRelAssetPath)) == survivingPlainPNG)
+
+            let recoveredPlainImg = try #require(recoveredPlainItems.first { $0.id == plainImgID })
+            #expect(recoveredPlainImg.assetPath == nil)
+
+            // 3. Missing .enc asset paths (both isEncrypted == 1 and isEncrypted == 0 with .enc extension) isolate to corrupted-items.json with exit 2 and fail --strict with exit 1!
+            do {
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                defer { store.close() }
+                let pngBytes = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20)
+                let encURL = try store.writeManagedAsset(pngData: pngBytes, role: .image, clipID: missingEncID, encrypted: true)
+                let savedEnc = try store.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        id: missingEncID,
+                        kind: .image,
+                        title: "Missing Encrypted Asset",
+                        text: ["gh", "p_", "MISSING_ENC_ASSET_SECRET_778899001122"].joined(),
+                        assetPath: encURL.path,
+                        copiedAt: Date(timeIntervalSince1970: 1_715_500_100),
+                        sensitivity: .sensitive
+                    ),
+                    convertingExternalAssets: true
+                )
+                missingEncURL = URL(fileURLWithPath: try #require(savedEnc.assetPath))
+
+                // Pending-OCR style unencrypted header row (`isEncrypted == 0`) referencing a missing `.enc` asset path.
+                let pendingOCRMissingEncItem = ClipboardItem.fixture(
+                    id: unencryptedMissingEncID,
+                    kind: .image,
+                    title: "Pending OCR Missing Enc",
+                    text: nil,
+                    assetPath: supportDir.appendingPathComponent("Images/\(unencryptedMissingEncID.uuidString).enc").path,
+                    copiedAt: Date(timeIntervalSince1970: 1_715_500_050),
+                    sensitivity: nil
+                )
+                #expect(!SensitiveContent.shouldEncryptAtRest(pendingOCRMissingEncItem))
+                try store.upsert(pendingOCRMissingEncItem)
+            }
+            try fileManager.removeItem(at: missingEncURL)
+
+            let partialOut = workspace.appendingPathComponent("PartialMissingEnc.clipbookarchive", isDirectory: true)
+            let partialRun = try await Self.runRecoveryCLI(
+                arguments: [
+                    "--support-dir=\(supportDir.path)",
+                    "--key-file=\(keyProvider.keyFileURL.path)",
+                    "--output-dir=\(partialOut.path)",
+                ]
+            )
+            #expect(partialRun.exitCode == 2)
+            let corruptedIDs = try decoder.decode(
+                [String].self,
+                from: try Data(contentsOf: partialOut.appendingPathComponent("corrupted-items.json"))
+            )
+            #expect(
+                Set(corruptedIDs) == [
+                    missingEncID.uuidString.lowercased(),
+                    unencryptedMissingEncID.uuidString.lowercased(),
+                ]
+            )
+
+            let strictMissingEncOut = workspace.appendingPathComponent("StrictMissingEnc.clipbookarchive", isDirectory: true)
+            let strictMissingEncRun = try await Self.runRecoveryCLI(
+                arguments: [
+                    "--support-dir=\(supportDir.path)",
+                    "--key-file=\(keyProvider.keyFileURL.path)",
+                    "--strict",
+                    "--output-dir=\(strictMissingEncOut.path)",
+                ]
+            )
+            #expect(strictMissingEncRun.exitCode == 1)
+            #expect(!fileManager.fileExists(atPath: strictMissingEncOut.path))
+
+            // Mode B inline `--archive=<path>` and `--passphrase-file=<path>` syntax also succeeds cleanly.
+            let v2EncArchiveURL = workspace.appendingPathComponent("InlineFlagsV2.clipbookarchive", isDirectory: true)
+            let inlinePassphrase = "inline-equals-passphrase-2026"
+            let inlinePassFileURL = workspace.appendingPathComponent("inline.pass", isDirectory: false)
+            try Data((inlinePassphrase + "\n").utf8).write(to: inlinePassFileURL)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: inlinePassFileURL.path)
+            do {
+                let archiveSourceDir = workspace.appendingPathComponent("InlineArchiveSource", isDirectory: true)
+                let archiveStore = GRDBHistoryStore(directory: archiveSourceDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { archiveStore.close() }
+                try archiveStore.upsert(ClipboardItem.fixture(kind: .text, text: "Mode B inline flag clip"))
+                let service = ClipBookArchiveService(
+                    supportDirectory: archiveSourceDir,
+                    kdfIterations: 1_000,
+                    allowTestIterations: true
+                )
+                try service.export(
+                    items: try archiveStore.fetchAll(),
+                    tags: try archiveStore.fetchTags(),
+                    to: v2EncArchiveURL,
+                    passphrase: inlinePassphrase,
+                    loadItem: { try archiveStore.loadingContent(of: $0, scope: .full) }
+                )
+            }
+            let modeBInlineOut = workspace.appendingPathComponent("ModeBInlineOut.clipbookarchive", isDirectory: true)
+            let modeBInlineRun = try await Self.runRecoveryCLI(
+                arguments: [
+                    "--archive=\(v2EncArchiveURL.path)",
+                    "--passphrase-file=\(inlinePassFileURL.path)",
+                    "--allow-test-iterations",
+                    "--output-dir=\(modeBInlineOut.path)",
+                ]
+            )
+            #expect(modeBInlineRun.exitCode == 0, "Expected Mode B inline flags to exit 0, got \(modeBInlineRun.exitCode): \(modeBInlineRun.stderr)")
+
+            // 4. Reject raw `--key=...`, `--passphrase=...`, empty `--key-file=`, and boolean `--strict=true` with exit 1.
+            let rawKeyRun = try await Self.runRecoveryCLI(
+                arguments: ["--support-dir=\(supportDir.path)", "--key=deadbeef", "--output-dir=\(workspace.path)/x"]
+            )
+            #expect(rawKeyRun.exitCode == 1)
+            #expect(rawKeyRun.stderr.contains("Raw secrets are never accepted"))
+
+            let rawPassRun = try await Self.runRecoveryCLI(
+                arguments: ["--archive=\(cleanOut.path)", "--passphrase=hunter2", "--output-dir=\(workspace.path)/y"]
+            )
+            #expect(rawPassRun.exitCode == 1)
+            #expect(rawPassRun.stderr.contains("Raw secrets are never accepted"))
+
+            let emptyInlineRun = try await Self.runRecoveryCLI(
+                arguments: ["--support-dir=\(supportDir.path)", "--key-file=", "--output-dir=\(workspace.path)/z"]
+            )
+            #expect(emptyInlineRun.exitCode == 1)
+
+            let boolInlineRun = try await Self.runRecoveryCLI(
+                arguments: ["--support-dir=\(supportDir.path)", "--key-file=\(keyProvider.keyFileURL.path)", "--strict=true", "--output-dir=\(workspace.path)/w"]
+            )
+            #expect(boolInlineRun.exitCode == 1)
         }
     }
 }

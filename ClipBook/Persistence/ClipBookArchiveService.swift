@@ -255,7 +255,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
 
         let stagingRoot = try Self.makeStagingRoot(appropriateFor: destinationParent, archiveName: archiveURL.lastPathComponent)
         defer {
-            try? fileManager.removeItem(at: stagingRoot)
+            Self.secureRemoveDirectoryTree(at: stagingRoot)
         }
 
         let stagedArchiveURL = stagingRoot.appendingPathComponent(archiveURL.lastPathComponent, isDirectory: true)
@@ -1448,12 +1448,50 @@ nonisolated final class ClipBookArchiveService: Sendable {
     }
 
     private static func swapStagedArchive(at stagedArchiveURL: URL, into archiveURL: URL) throws {
+        let targetNoSlash = URL(fileURLWithPath: archiveURL.path, isDirectory: false)
+        if (try? targetNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            throw ClipBookArchiveError.invalidAssetPath(archiveURL.path)
+        }
+        var existingStat = stat()
+        let targetExists = Darwin.lstat(targetNoSlash.path, &existingStat) == 0
+        if targetExists && (existingStat.st_mode & S_IFMT) == S_IFLNK {
+            throw ClipBookArchiveError.invalidAssetPath(archiveURL.path)
+        }
+
         let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: archiveURL.path) {
+        if targetExists || fileManager.fileExists(atPath: archiveURL.path) {
             _ = try fileManager.replaceItemAt(archiveURL, withItemAt: stagedArchiveURL)
         } else {
             try fileManager.moveItem(at: stagedArchiveURL, to: archiveURL)
         }
+        _ = Darwin.chmod(archiveURL.path, mode_t(0o700))
+    }
+
+    private static func secureRemoveDirectoryTree(at rootURL: URL) {
+        var st = stat()
+        guard Darwin.lstat(rootURL.path, &st) == 0 else {
+            return
+        }
+        let mode = st.st_mode & S_IFMT
+        if mode == S_IFLNK || mode == S_IFREG {
+            ImageAssetStore.secureUnlink(at: rootURL)
+            return
+        }
+        guard mode == S_IFDIR else {
+            try? FileManager.default.removeItem(at: rootURL)
+            return
+        }
+
+        if let children = try? FileManager.default.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) {
+            for child in children {
+                secureRemoveDirectoryTree(at: child)
+            }
+        }
+        try? FileManager.default.removeItem(at: rootURL)
     }
 
     private static func readRegularFileNoFollow(at url: URL, relativePath: String) throws -> Data {

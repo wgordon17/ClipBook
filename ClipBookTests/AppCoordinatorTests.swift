@@ -499,11 +499,11 @@ enum AppCoordinatorTests {
                 try fileManager.createDirectory(at: resolvedSupportDir, withIntermediateDirectories: true)
             } else {
                 resolvedSupportDir = fileManager.temporaryDirectory
-                    .appendingPathComponent("ClipBookC5Tests-\(UUID().uuidString)", isDirectory: true)
+                    .appendingPathComponent("ClipBookSecurityCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
                 try fileManager.createDirectory(at: resolvedSupportDir, withIntermediateDirectories: true)
             }
 
-            let suiteName = "com.ikryanov.clipbook.c5tests.\(UUID().uuidString)"
+            let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
             let userDefaults = try #require(UserDefaults(suiteName: suiteName))
             userDefaults.removePersistentDomain(forName: suiteName)
 
@@ -546,7 +546,7 @@ enum AppCoordinatorTests {
             let pasteService = PasteService(
                 pasteboard: pasteboard,
                 loadContent: { [historyStore] item, scope in
-                    (try? historyStore.loadingContent(of: item, scope: scope)) ?? item
+                    try historyStore.loadingContent(of: item, scope: scope)
                 }
             )
             let coordinator = AppCoordinator(
@@ -1315,7 +1315,7 @@ enum AppCoordinatorTests {
             // Part A: Backdated orphaned .enc scrubbing + archive import orphan preservation + concurrent close().
             do {
                 let supportDir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("ClipBookC5Orphan-\(UUID().uuidString)", isDirectory: true)
+                    .appendingPathComponent("ClipBookOrphanSweep-\(UUID().uuidString)", isDirectory: true)
                 try FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
                 defer { try? FileManager.default.removeItem(at: supportDir) }
 
@@ -1416,7 +1416,7 @@ enum AppCoordinatorTests {
             // Concurrent GRDBHistoryStore.close() while background readers run must drain cleanly without reopening SQLite!
             do {
                 let closeDir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("ClipBookC5Close-\(UUID().uuidString)", isDirectory: true)
+                    .appendingPathComponent("ClipBookConcurrentClose-\(UUID().uuidString)", isDirectory: true)
                 try FileManager.default.createDirectory(at: closeDir, withIntermediateDirectories: true)
                 defer { try? FileManager.default.removeItem(at: closeDir) }
 
@@ -1452,7 +1452,7 @@ enum AppCoordinatorTests {
             // Part B: StoreLockState != .unlocked skips reboot-clear, quit-clear, retention, expiry, and orphan GC until retryUnlockHistoryStore() succeeds!
             do {
                 let lockedDir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("ClipBookC5Locked-\(UUID().uuidString)", isDirectory: true)
+                    .appendingPathComponent("ClipBookLockedLifecycle-\(UUID().uuidString)", isDirectory: true)
                 try FileManager.default.createDirectory(at: lockedDir, withIntermediateDirectories: true)
                 defer { try? FileManager.default.removeItem(at: lockedDir) }
 
@@ -1569,7 +1569,7 @@ enum AppCoordinatorTests {
         func storeLockStateInitRetryUnlockAndArchiveExportImportModesEndToEnd() async throws {
             let fileManager = FileManager.default
             let workspace = fileManager.temporaryDirectory
-                .appendingPathComponent("ClipBookC7Archive-\(UUID().uuidString)", isDirectory: true)
+                .appendingPathComponent("ClipBookArchiveModes-\(UUID().uuidString)", isDirectory: true)
             try fileManager.createDirectory(at: workspace, withIntermediateDirectories: true)
             defer { try? fileManager.removeItem(at: workspace) }
 

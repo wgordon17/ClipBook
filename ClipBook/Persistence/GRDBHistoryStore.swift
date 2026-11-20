@@ -35,10 +35,22 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private struct StoreState: Sendable {
         var lifecycle: LifecycleState = .open
         var lockState: StoreLockState = .unlocked
+        var openFailure: (any Error)? = nil
         var dbWriter: (any DatabaseWriter)? = nil
         var keys: ClipBookDerivedKeys? = nil
         var needsFreePageRelease: Bool = false
         var isFreePageReleaseScheduled: Bool = false
+
+        var isReady: Bool {
+            lifecycle == .open && lockState == .unlocked && dbWriter != nil && keys != nil
+        }
+    }
+
+    private struct TransactionAssetContext: Sendable {
+        var newlyWrittenURLs: [URL] = []
+        var supersededManagedURLs: [URL] = []
+        var evictedThumbnailPaths: [String] = []
+        var purgeSensitiveCachesOnCommit: Bool = false
     }
 
     private enum DatabaseProbeState {
@@ -61,6 +73,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private let assetStore: ImageAssetStore
     private let openLock = NSLock()
     private let state = OSAllocatedUnfairLock<StoreState>(initialState: StoreState())
+    private let writeAssetContext = OSAllocatedUnfairLock<TransactionAssetContext>(initialState: TransactionAssetContext())
     private let activeAccessGroup = DispatchGroup()
 
     private var databaseURL: URL {
@@ -129,6 +142,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         state.withLock { $0.lockState }
     }
 
+    var isOpen: Bool {
+        state.withLock { $0.isReady }
+    }
+
     func retryUnlock() throws {
         try openIfNeeded(allowRetryFromFailure: true)
     }
@@ -150,7 +167,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
 
+        SensitiveContent.removeAll()
         SVGImageRenderer.unregisterTextLoader(ownerID: instanceID)
+        SVGImageRenderer.shared.removeAll()
         ImageAssetStore.unregisterKeys(forSupportDirectory: directory, ownerID: instanceID)
         ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: directory)
         ImageDragFiles.removeAll()
@@ -300,11 +319,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 self.markNeedsFreePageRelease()
                 if let assetPath = existing.assetPath {
                     let assetURL = URL(fileURLWithPath: assetPath, isDirectory: false)
-                    if self.assetStore.isManagedAssetURL(assetURL) {
-                        ImageAssetStore.secureUnlink(at: assetURL)
-                    }
-                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: assetPath)
+                    let superseded = self.assetStore.isManagedAssetURL(assetURL) ? assetURL : nil
+                    self.recordSupersededAsset(supersededURL: superseded, evictedPath: assetPath)
                 }
+                self.writeAssetContext.withLock { $0.purgeSensitiveCachesOnCommit = true }
                 let formattedPrevious = self.loadsBodiesOnFetchAll ? existing : existing.unloadingContent()
                 return (nil, formattedPrevious, isTrashed, true)
             }
@@ -336,115 +354,108 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     // MARK: - HistoryStore Queries & Mutations
 
+    private var clipBatchSelectClause: String {
+        loadsBodiesOnFetchAll
+            ? "SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText FROM clips c LEFT JOIN clip_contents cc ON cc.clipId = c.id"
+            : "SELECT c.* FROM clips c"
+    }
+
+    private func fetchBatchedCursorItems(
+        in db: Database,
+        whereAndOrderSQL: String,
+        tagAttachments: [String: TagAttachment],
+        keys: ClipBookDerivedKeys
+    ) throws -> [ClipboardItem] {
+        let sql = "\(clipBatchSelectClause) \(whereAndOrderSQL)"
+        let decoder = Self.makeJSONDecoder()
+        let cursor = try Row.fetchCursor(db, sql: sql)
+        var items: [ClipboardItem] = []
+        var reachedEnd = false
+        while !reachedEnd {
+            try autoreleasepool {
+                var batchCount = 0
+                while batchCount < 512 {
+                    guard let row = try cursor.next() else {
+                        reachedEnd = true
+                        break
+                    }
+                    batchCount += 1
+                    let idString: String? = row["id"]
+                    let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
+                    if let item = try self.decodeBatchRow(
+                        row,
+                        attachment: attachment,
+                        hydratesBody: self.loadsBodiesOnFetchAll,
+                        keys: keys,
+                        decoder: decoder
+                    ) {
+                        items.append(item)
+                    }
+                }
+            }
+        }
+        return items
+    }
+
+    private func decodeFetchedBatchRows(
+        _ rows: [Row],
+        tagAttachments: [String: TagAttachment],
+        keys: ClipBookDerivedKeys,
+        where isIncluded: ((ClipboardItem) -> Bool)? = nil
+    ) throws -> [ClipboardItem] {
+        let decoder = Self.makeJSONDecoder()
+        var items: [ClipboardItem] = []
+        items.reserveCapacity(rows.count)
+        for row in rows {
+            let idString: String? = row["id"]
+            let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
+            if let item = try decodeBatchRow(
+                row,
+                attachment: attachment,
+                hydratesBody: loadsBodiesOnFetchAll,
+                keys: keys,
+                decoder: decoder
+            ), isIncluded?(item) ?? true {
+                items.append(item)
+            }
+        }
+        return items
+    }
+
     func fetchAll() throws -> [ClipboardItem] {
         try withRead { db, keys in
             let tagAttachments = try self.fetchTagAttachments(in: db, trashedFilter: false)
-            let sql: String
-            if self.loadsBodiesOnFetchAll {
-                sql = """
-                    SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                    FROM clips c
-                    LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                    WHERE c.deletedAt IS NULL
-                    ORDER BY c.copiedAt DESC
-                    """
-            } else {
-                sql = """
-                    SELECT c.*
-                    FROM clips c
-                    WHERE c.deletedAt IS NULL
-                    ORDER BY c.copiedAt DESC
-                    """
-            }
-
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql)
-            var items: [ClipboardItem] = []
-            while let row = try cursor.next() {
-                let idString: String? = row["id"]
-                let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: self.loadsBodiesOnFetchAll,
-                    keys: keys,
-                    decoder: decoder
-                ) {
-                    items.append(item)
-                }
-            }
-            return items
+            return try self.fetchBatchedCursorItems(
+                in: db,
+                whereAndOrderSQL: "WHERE c.deletedAt IS NULL ORDER BY c.copiedAt DESC",
+                tagAttachments: tagAttachments,
+                keys: keys
+            )
         }
     }
 
     func fetchTrashedItems() throws -> [ClipboardItem] {
         try withRead { db, keys in
             let tagAttachments = try self.fetchTagAttachments(in: db, trashedFilter: true)
-            let sql: String
-            if self.loadsBodiesOnFetchAll {
-                sql = """
-                    SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                    FROM clips c
-                    LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                    WHERE c.deletedAt IS NOT NULL
-                    ORDER BY c.deletedAt DESC
-                    """
-            } else {
-                sql = """
-                    SELECT c.*
-                    FROM clips c
-                    WHERE c.deletedAt IS NOT NULL
-                    ORDER BY c.deletedAt DESC
-                    """
-            }
-
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql)
-            var items: [ClipboardItem] = []
-            while let row = try cursor.next() {
-                let idString: String? = row["id"]
-                let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: self.loadsBodiesOnFetchAll,
-                    keys: keys,
-                    decoder: decoder
-                ) {
-                    items.append(item)
-                }
-            }
-            return items
+            return try self.fetchBatchedCursorItems(
+                in: db,
+                whereAndOrderSQL: "WHERE c.deletedAt IS NOT NULL ORDER BY c.deletedAt DESC",
+                tagAttachments: tagAttachments,
+                keys: keys
+            )
         }
     }
 
     func fetchItems(trashedBefore date: Date) throws -> [ClipboardItem] {
         try withRead { db, keys in
-            let tagAttachments = try self.fetchTagAttachments(in: db, trashedFilter: true)
-            let sql = """
-                SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                FROM clips c
-                LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                WHERE c.deletedAt < ?
-                ORDER BY c.deletedAt DESC
-                """
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql, arguments: [date.timeIntervalSince1970])
-            var items: [ClipboardItem] = []
-            while let row = try cursor.next() {
-                let idString: String? = row["id"]
-                let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: true,
-                    keys: keys,
-                    decoder: decoder
-                ) {
-                    items.append(item)
-                }
+            let sql = "\(self.clipBatchSelectClause) WHERE c.deletedAt < ? ORDER BY c.deletedAt DESC"
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [date.timeIntervalSince1970])
+            guard !rows.isEmpty else {
+                return []
             }
-            return items
+            let matchedIDs = rows.compactMap { $0["id"] as String? }
+            let tagAttachments = try self.fetchTagAttachments(in: db, forClipIDStrings: matchedIDs)
+            return try self.decodeFetchedBatchRows(rows, tagAttachments: tagAttachments, keys: keys)
         }
     }
 
@@ -565,7 +576,11 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 existingItem.expiresAt = existingItem.isKeptByUser ? nil : item.expiresAt
 
                 if SensitiveContent.shouldEncryptAtRest(existingItem) {
-                    try self.encryptManagedOrExternalAssetsOnCapture(&existingItem, keys: keys)
+                    try self.reconcileManagedAssetsForPersistence(
+                        &existingItem,
+                        shouldEncrypt: true,
+                        keys: keys
+                    )
                     self.scrubSupersededManagedAssetIfNeeded(
                         previousPath: previousAssetPath,
                         currentPath: existingItem.assetPath
@@ -634,11 +649,11 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     @discardableResult
     func saveAndReconcileItem(_ item: ClipboardItem, convertingExternalAssets: Bool = true) throws -> ClipboardItem {
         try withWrite { db, keys in
-            try self.reconcileAndPersistItem(
+            try self.persistUpsert(
                 in: db,
                 item: item,
-                convertingExternalAssets: convertingExternalAssets,
-                keys: keys
+                keys: keys,
+                assetMode: convertingExternalAssets ? .reconcileManagedAssets : .nonDestructiveEncryptedStaging
             )
         }
     }
@@ -659,16 +674,19 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
             existing.sensitivity = sensitivity
 
-            return try self.reconcileAndPersistItem(
+            return try self.persistUpsert(
                 in: db,
                 item: existing,
-                convertingExternalAssets: true,
-                keys: keys
+                keys: keys,
+                assetMode: .reconcileManagedAssets
             )
         }
     }
 
     func loadingContent(of item: ClipboardItem, scope: ClipboardContentScope = .full) throws -> ClipboardItem {
+        if item.isCorruptPlaceholder {
+            throw HistoryStoreError.authenticationFailed
+        }
         if scope == .body || !item.hasFormatting {
             if item.isContentLoaded {
                 return item
@@ -718,65 +736,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
             let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
             if isEncrypted {
-                let decoder = Self.makeJSONDecoder()
-                _ = try Self.decodeStringColumn(
-                    from: row,
-                    rowColumn: "title",
-                    aadTable: "clips",
-                    aadColumn: "title",
+                try Self.authenticateEncryptedClipHeaderColumns(
+                    in: row,
                     clipID: item.id,
-                    isEncrypted: true,
                     keys: keys
-                )
-                _ = try Self.decodeStringColumn(
-                    from: row,
-                    rowColumn: "textPreview",
-                    aadTable: "clips",
-                    aadColumn: "textPreview",
-                    clipID: item.id,
-                    isEncrypted: true,
-                    keys: keys
-                )
-                _ = try Self.decodeStringColumn(
-                    from: row,
-                    rowColumn: "htmlDigest",
-                    aadTable: "clips",
-                    aadColumn: "htmlDigest",
-                    clipID: item.id,
-                    isEncrypted: true,
-                    keys: keys
-                )
-                _ = try Self.decodeStringColumn(
-                    from: row,
-                    rowColumn: "imageDigest",
-                    aadTable: "clips",
-                    aadColumn: "imageDigest",
-                    clipID: item.id,
-                    isEncrypted: true,
-                    keys: keys
-                )
-                _ = try Self.decodeProtectedAssetPath(
-                    from: row,
-                    column: "assetPath",
-                    clipID: item.id,
-                    isEncrypted: true,
-                    keys: keys
-                )
-                _ = try Self.decodeProtectedFilePaths(
-                    from: row,
-                    column: "filePathsData",
-                    clipID: item.id,
-                    isEncrypted: true,
-                    keys: keys,
-                    decoder: decoder
-                )
-                _ = try Self.decodeProtectedLinkPreview(
-                    from: row,
-                    column: "linkPreviewData",
-                    clipID: item.id,
-                    isEncrypted: true,
-                    keys: keys,
-                    decoder: decoder
                 )
             }
 
@@ -1006,7 +969,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         return try withRead { db, keys in
-            let tagAttachments = try self.fetchTagAttachments(in: db, trashedFilter: false)
             let conditions = cutoffs.map { _ in "(c.kind = ? AND c.copiedAt < ?)" }.joined(separator: " OR ")
             var arguments: [any DatabaseValueConvertible] = []
             arguments.reserveCapacity(cutoffs.count * 2)
@@ -1015,60 +977,50 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 arguments.append(cutoff.timeIntervalSince1970)
             }
 
+            let protectedClause = policy.keepsFavoritesAndTaggedItems
+                ? " AND c.isFavorite = 0 AND NOT EXISTS (SELECT 1 FROM clip_tags ct WHERE ct.clipId = c.id)"
+                : ""
             let sql = """
-                SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                FROM clips c
-                LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                WHERE c.deletedAt IS NULL AND (\(conditions))
+                \(self.clipBatchSelectClause)
+                WHERE c.deletedAt IS NULL AND (\(conditions))\(protectedClause)
                 ORDER BY c.copiedAt DESC
                 """
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql, arguments: StatementArguments(arguments))
-            var items: [ClipboardItem] = []
-            while let row = try cursor.next() {
-                let idString: String? = row["id"]
-                let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: true,
-                    keys: keys,
-                    decoder: decoder
-                ), policy.isExpired(item) {
-                    items.append(item)
-                }
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+            guard !rows.isEmpty else {
+                return []
             }
-            return items
+
+            let tagAttachments: [String: TagAttachment]
+            if policy.keepsFavoritesAndTaggedItems {
+                tagAttachments = [:]
+            } else {
+                let matchedIDs = rows.compactMap { $0["id"] as String? }
+                tagAttachments = try self.fetchTagAttachments(in: db, forClipIDStrings: matchedIDs)
+            }
+
+            return try self.decodeFetchedBatchRows(
+                rows,
+                tagAttachments: tagAttachments,
+                keys: keys,
+                where: policy.isExpired
+            )
         }
     }
 
     func fetchItems(expiringBy date: Date) throws -> [ClipboardItem] {
         try withRead { db, keys in
-            let tagAttachments = try self.fetchTagAttachments(in: db, trashedFilter: nil)
             let sql = """
-                SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                FROM clips c
-                LEFT JOIN clip_contents cc ON cc.clipId = c.id
+                \(self.clipBatchSelectClause)
                 WHERE c.expiresAt IS NOT NULL AND c.expiresAt <= ?
                 ORDER BY c.copiedAt DESC
                 """
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql, arguments: [date.timeIntervalSince1970])
-            var items: [ClipboardItem] = []
-            while let row = try cursor.next() {
-                let idString: String? = row["id"]
-                let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: true,
-                    keys: keys,
-                    decoder: decoder
-                ) {
-                    items.append(item)
-                }
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [date.timeIntervalSince1970])
+            guard !rows.isEmpty else {
+                return []
             }
-            return items
+            let matchedIDs = rows.compactMap { $0["id"] as String? }
+            let tagAttachments = try self.fetchTagAttachments(in: db, forClipIDStrings: matchedIDs)
+            return try self.decodeFetchedBatchRows(rows, tagAttachments: tagAttachments, keys: keys)
         }
     }
 
@@ -1176,12 +1128,15 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             let deletedFilter = trashed ? "IS NOT NULL" : "IS NULL"
             let decoder = Self.makeJSONDecoder()
 
+            var tagIDsByClipID: [String: [Int]] = [:]
+            let clipWhereClause: String
+            let clipArguments: StatementArguments
+
             if ids.count <= Self.searchInClauseBatchLimit {
                 let idStrings = Array(indicesByIDString.keys)
                 let placeholders = Array(repeating: "?", count: idStrings.count).joined(separator: ", ")
                 let arguments = StatementArguments(idStrings)
 
-                var tagIDsByClipID: [String: [Int]] = [:]
                 let tagCursor = try Row.fetchCursor(
                     db,
                     sql: """
@@ -1203,38 +1158,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                     return nil
                 }
 
-                let clipSQL = """
-                    SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
-                           cc.text, cc.qrCodeText
-                    FROM clips c
-                    LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                    WHERE c.id IN (\(placeholders)) AND c.deletedAt \(deletedFilter)
-                    """
-                let cursor = try Row.fetchCursor(db, sql: clipSQL, arguments: arguments)
-                var rowCounter = 0
-                while let row = try cursor.next() {
-                    rowCounter += 1
-                    if (rowCounter & 511) == 0 && isCancelled() {
-                        return nil
-                    }
-                    guard let idString: String = row["id"],
-                          let targetIndices = indicesByIDString[idString] else {
-                        continue
-                    }
-                    let searchText = Self.decodeSearchTextForRow(
-                        row,
-                        idString: idString,
-                        tagIDs: tagIDsByClipID[idString] ?? [],
-                        tagNamesByID: tagNamesByID,
-                        keys: keys,
-                        decoder: decoder
-                    )
-                    for index in targetIndices {
-                        results[index] = searchText
-                    }
-                }
+                clipWhereClause = "c.id IN (\(placeholders)) AND c.deletedAt \(deletedFilter)"
+                clipArguments = arguments
             } else {
-                var tagIDsByClipID: [String: [Int]] = [:]
                 let tagCursor = try Row.fetchCursor(
                     db,
                     sql: """
@@ -1244,57 +1170,79 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                         ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
                         """
                 )
-                var tagRowCounter = 0
-                while let tagRow = try tagCursor.next() {
-                    tagRowCounter += 1
-                    if (tagRowCounter & 511) == 0 && isCancelled() {
-                        return nil
+                var tagCancelled = false
+                var tagReachedEnd = false
+                while !tagReachedEnd && !tagCancelled {
+                    try autoreleasepool {
+                        var batchCount = 0
+                        while batchCount < 512 {
+                            guard let tagRow = try tagCursor.next() else {
+                                tagReachedEnd = true
+                                break
+                            }
+                            batchCount += 1
+                            let clipIDString: String = tagRow["clipId"]
+                            guard indicesByIDString[clipIDString] != nil else {
+                                continue
+                            }
+                            let tagID: Int = tagRow["tagId"]
+                            tagIDsByClipID[clipIDString, default: []].append(tagID)
+                        }
+                        if !tagReachedEnd && isCancelled() {
+                            tagCancelled = true
+                        }
                     }
-                    let clipIDString: String = tagRow["clipId"]
-                    guard indicesByIDString[clipIDString] != nil else {
-                        continue
-                    }
-                    let tagID: Int = tagRow["tagId"]
-                    tagIDsByClipID[clipIDString, default: []].append(tagID)
                 }
 
-                if isCancelled() {
+                if tagCancelled || isCancelled() {
                     return nil
                 }
 
-                let clipSQL = """
-                    SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
-                           cc.text, cc.qrCodeText
-                    FROM clips c
-                    LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                    WHERE c.deletedAt \(deletedFilter)
-                    """
-                let cursor = try Row.fetchCursor(db, sql: clipSQL)
-                var rowCounter = 0
-                while let row = try cursor.next() {
-                    rowCounter += 1
-                    if (rowCounter & 511) == 0 && isCancelled() {
-                        return nil
+                clipWhereClause = "c.deletedAt \(deletedFilter)"
+                clipArguments = StatementArguments()
+            }
+
+            let clipSQL = """
+                SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
+                       cc.text, cc.qrCodeText
+                FROM clips c
+                LEFT JOIN clip_contents cc ON cc.clipId = c.id
+                WHERE \(clipWhereClause)
+                """
+            let cursor = try Row.fetchCursor(db, sql: clipSQL, arguments: clipArguments)
+            var cancelled = false
+            var reachedEnd = false
+            while !reachedEnd && !cancelled {
+                try autoreleasepool {
+                    var batchCount = 0
+                    while batchCount < 512 {
+                        guard let row = try cursor.next() else {
+                            reachedEnd = true
+                            break
+                        }
+                        batchCount += 1
+                        guard let idString: String = row["id"],
+                              let targetIndices = indicesByIDString[idString] else {
+                            continue
+                        }
+                        let searchText = Self.decodeSearchTextForRow(
+                            row,
+                            idString: idString,
+                            tagIDs: tagIDsByClipID[idString] ?? [],
+                            tagNamesByID: tagNamesByID,
+                            keys: keys,
+                            decoder: decoder
+                        )
+                        for index in targetIndices {
+                            results[index] = searchText
+                        }
                     }
-                    guard let idString: String = row["id"],
-                          let targetIndices = indicesByIDString[idString] else {
-                        continue
-                    }
-                    let searchText = Self.decodeSearchTextForRow(
-                        row,
-                        idString: idString,
-                        tagIDs: tagIDsByClipID[idString] ?? [],
-                        tagNamesByID: tagNamesByID,
-                        keys: keys,
-                        decoder: decoder
-                    )
-                    for index in targetIndices {
-                        results[index] = searchText
+                    if !reachedEnd && isCancelled() {
+                        cancelled = true
                     }
                 }
             }
-
-            return results
+            return cancelled ? nil : results
         }
     }
 
@@ -1391,6 +1339,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             case .keyMismatch:
                 throw HistoryStoreError.encryptionKeyMismatch
             case .unlocked:
+                if let openFailure = s.openFailure {
+                    throw openFailure
+                }
                 guard let writer = s.dbWriter, let keys = s.keys else {
                     return nil
                 }
@@ -1422,17 +1373,28 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private func withWrite<T>(_ updates: (Database, ClipBookDerivedKeys) throws -> T) throws -> T {
         let (writer, keys) = try acquireAccess()
         var isOutermostCommit = false
+        var committedAssets = TransactionAssetContext()
         let output: T
         do {
             output = try writer.unsafeReentrantWrite { db in
                 if db.isInsideTransaction {
                     return try updates(db, keys)
                 }
+                self.writeAssetContext.withLock { $0 = TransactionAssetContext() }
                 var result: T!
-                try db.inTransaction(.immediate) {
-                    result = try updates(db, keys)
-                    return .commit
+                do {
+                    try db.inTransaction(.immediate) {
+                        result = try updates(db, keys)
+                        return .commit
+                    }
+                } catch {
+                    let rolledBackAssets = self.takeWriteAssetContext()
+                    for writtenURL in rolledBackAssets.newlyWrittenURLs {
+                        ImageAssetStore.secureUnlink(at: writtenURL)
+                    }
+                    throw error
                 }
+                committedAssets = self.takeWriteAssetContext()
                 isOutermostCommit = true
                 return result
             }
@@ -1442,10 +1404,63 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         if isOutermostCommit {
+            for supersededURL in committedAssets.supersededManagedURLs {
+                ImageAssetStore.secureUnlink(at: supersededURL)
+            }
+            for evictedPath in committedAssets.evictedThumbnailPaths {
+                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: evictedPath)
+            }
+            if committedAssets.purgeSensitiveCachesOnCommit {
+                SensitiveContent.removeAll()
+                SVGImageRenderer.shared.removeAll()
+            }
             scheduleAsyncFreePageReleaseIfNeeded(on: writer)
         }
         activeAccessGroup.leave()
         return output
+    }
+
+    private func takeWriteAssetContext() -> TransactionAssetContext {
+        writeAssetContext.withLock { ctx in
+            let snapshot = ctx
+            ctx = TransactionAssetContext()
+            return snapshot
+        }
+    }
+
+    private func recordAssetOutcome(_ outcome: ImageAssetStore.AssetConversionOutcome, evictedPath: String?) {
+        let canonicalWritten = Self.canonicalFileURL(outcome.writtenURL)
+        let canonicalSuperseded = outcome.supersededManagedURL.map(Self.canonicalFileURL)
+        writeAssetContext.withLock { ctx in
+            ctx.supersededManagedURLs.removeAll { Self.canonicalFileURL($0) == canonicalWritten }
+            if outcome.createdNewFile,
+               !ctx.newlyWrittenURLs.contains(where: { Self.canonicalFileURL($0) == canonicalWritten }) {
+                ctx.newlyWrittenURLs.append(outcome.writtenURL)
+            }
+            if let superseded = outcome.supersededManagedURL,
+               let canonicalSuperseded,
+               canonicalSuperseded != canonicalWritten,
+               !ctx.supersededManagedURLs.contains(where: { Self.canonicalFileURL($0) == canonicalSuperseded }) {
+                ctx.supersededManagedURLs.append(superseded)
+            }
+            if let evictedPath, !evictedPath.isEmpty, !ctx.evictedThumbnailPaths.contains(evictedPath) {
+                ctx.evictedThumbnailPaths.append(evictedPath)
+            }
+        }
+    }
+
+    private func recordSupersededAsset(supersededURL: URL?, evictedPath: String?) {
+        let canonicalSuperseded = supersededURL.map(Self.canonicalFileURL)
+        writeAssetContext.withLock { ctx in
+            if let supersededURL,
+               let canonicalSuperseded,
+               !ctx.supersededManagedURLs.contains(where: { Self.canonicalFileURL($0) == canonicalSuperseded }) {
+                ctx.supersededManagedURLs.append(supersededURL)
+            }
+            if let evictedPath, !evictedPath.isEmpty, !ctx.evictedThumbnailPaths.contains(evictedPath) {
+                ctx.evictedThumbnailPaths.append(evictedPath)
+            }
+        }
     }
 
     private func markNeedsFreePageRelease() {
@@ -1535,17 +1550,21 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             guard s.lifecycle == .open else {
                 throw DatabaseError(resultCode: .SQLITE_MISUSE, message: "Connection is closed")
             }
-            if !allowRetryFromFailure {
+            if allowRetryFromFailure {
+                s.openFailure = nil
+            } else {
                 switch s.lockState {
                 case .locked(let reason):
                     throw HistoryStoreError.encryptionKeyUnavailable(reason)
                 case .keyMismatch:
                     throw HistoryStoreError.encryptionKeyMismatch
                 case .unlocked:
-                    break
+                    if let openFailure = s.openFailure {
+                        throw openFailure
+                    }
                 }
             }
-            if s.lockState == .unlocked, s.dbWriter != nil, s.keys != nil {
+            if s.isReady {
                 return false
             }
             activeAccessGroup.enter()
@@ -1559,89 +1578,79 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             activeAccessGroup.leave()
         }
 
-        // Phase 1: Purely structural read-only crash recovery BEFORE touching DatabaseKeyProvider.
-        recoverInterruptedPhaseBCutoverIfNeeded()
+        do {
+            // Phase 1: Purely structural read-only crash recovery BEFORE touching DatabaseKeyProvider.
+            recoverInterruptedPhaseBCutoverIfNeeded()
 
-        // Phase 2: Read-only probe of History.sqlite (mutates zero bytes / mtime).
-        let probeState = try probeExistingDatabaseReadOnly()
+            // Phase 2: Read-only probe of History.sqlite (mutates zero bytes / mtime).
+            let probeState = try probeExistingDatabaseReadOnly()
 
-        // Phase 3: Master key load/create + verifier check -> StoreLockState transitions.
-        let keys: ClipBookDerivedKeys
-        switch probeState {
-        case .fresh, .legacy:
-            do {
+            // Phase 3: Master key load/create + verifier check -> StoreLockState transitions.
+            let keys: ClipBookDerivedKeys
+            switch probeState {
+            case .fresh, .legacy:
                 let masterKey = try keyProvider.loadOrCreateMasterKey(canCreateNewKey: true)
                 keys = ClipBookDerivedKeys(masterKey: masterKey)
-            } catch let error as HistoryStoreError {
-                if case .encryptionKeyUnavailable(let reason) = error {
-                    state.withLock { $0.lockState = .locked(reason) }
+                state.withLock {
+                    $0.lockState = .unlocked
+                    $0.openFailure = nil
                 }
-                throw error
-            }
-        case .existingV5(let verifier):
-            let masterKey: SymmetricKey
-            do {
-                masterKey = try keyProvider.loadOrCreateMasterKey(canCreateNewKey: false)
-            } catch let error as HistoryStoreError {
-                if case .encryptionKeyUnavailable(let reason) = error {
-                    state.withLock { $0.lockState = .locked(reason) }
-                }
-                throw error
-            }
-            let candidateKeys = ClipBookDerivedKeys(masterKey: masterKey)
-            guard HistoryCrypto.verifyKeyVerifier(verifier, keys: candidateKeys) else {
-                state.withLock { $0.lockState = .keyMismatch }
-                throw HistoryStoreError.encryptionKeyMismatch
-            }
-            keys = candidateKeys
-        }
-
-        // Phase 4: Initialize fresh DB or run clean-room v0-v4 -> v5 migration, then open DatabasePool.
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        switch probeState {
-        case .legacy:
-            try migrateLegacyDatabaseToV5(keys: keys)
-        case .fresh:
-            try precreateFreshDatabaseFile()
-        case .existingV5:
-            break
-        }
-
-        let writer = try Self.makeDatabaseWriter(at: databaseURL.path)
-
-        if case .fresh = probeState {
-            do {
-                try writer.unsafeReentrantWrite { db in
-                    try db.inTransaction(.immediate) {
-                        try Self.createV5Schema(in: db)
-                        let verifier = HistoryCrypto.makeKeyVerifier(keys: keys)
-                        try db.execute(
-                            sql: "INSERT OR REPLACE INTO store_metadata (key, value) VALUES (?, ?)",
-                            arguments: [Self.keyVerifierMetadataKey, verifier]
-                        )
-                        try db.execute(sql: "PRAGMA user_version = \(Self.currentSchemaVersion)")
-                        return .commit
+            case .existingV5(let verifier):
+                let masterKey = try keyProvider.loadOrCreateMasterKey(canCreateNewKey: false)
+                let candidateKeys = ClipBookDerivedKeys(masterKey: masterKey)
+                guard HistoryCrypto.verifyKeyVerifier(verifier, keys: candidateKeys) else {
+                    state.withLock {
+                        $0.lockState = .keyMismatch
+                        $0.openFailure = nil
                     }
+                    throw HistoryStoreError.encryptionKeyMismatch
                 }
-                try? writer.barrierWriteWithoutTransaction { db in
-                    _ = try db.checkpoint(.truncate)
+                keys = candidateKeys
+                state.withLock {
+                    $0.lockState = .unlocked
+                    $0.openFailure = nil
                 }
-            } catch {
-                closeWriterCleanly(writer)
-                throw error
             }
-        }
 
-        sweepLeftoverScrubbingAndSupersededPlaintextAssets(in: writer)
+            // Phase 4: Initialize fresh DB or run clean-room v0-v4 -> v5 migration, then open DatabasePool.
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let installed = state.withLock { s -> Bool in
-            guard s.lifecycle == .open else {
-                return false
+            switch probeState {
+            case .legacy:
+                try migrateLegacyDatabaseToV5(keys: keys)
+            case .fresh:
+                try precreateFreshDatabaseFile()
+            case .existingV5:
+                break
             }
-            s.dbWriter = writer
-            s.keys = keys
-            s.lockState = .unlocked
+
+            let writer = try Self.makeDatabaseWriter(at: databaseURL.path)
+
+            if case .fresh = probeState {
+                do {
+                    try writer.unsafeReentrantWrite { db in
+                        try db.inTransaction(.immediate) {
+                            try Self.createV5Schema(in: db)
+                            let verifier = HistoryCrypto.makeKeyVerifier(keys: keys)
+                            try db.execute(
+                                sql: "INSERT OR REPLACE INTO store_metadata (key, value) VALUES (?, ?)",
+                                arguments: [Self.keyVerifierMetadataKey, verifier]
+                            )
+                            try db.execute(sql: "PRAGMA user_version = \(Self.currentSchemaVersion)")
+                            return .commit
+                        }
+                    }
+                    try? writer.barrierWriteWithoutTransaction { db in
+                        _ = try db.checkpoint(.truncate)
+                    }
+                } catch {
+                    closeWriterCleanly(writer)
+                    throw error
+                }
+            }
+
+            sweepLeftoverScrubbingAndSupersededPlaintextAssets(in: writer, keys: keys)
+
             ImageAssetStore.registerKeys(keys, forSupportDirectory: directory, ownerID: instanceID)
             SVGImageRenderer.registerTextLoader(
                 { [weak self] clipID in
@@ -1649,19 +1658,60 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 },
                 ownerID: instanceID
             )
-            return true
-        }
 
-        if !installed {
-            closeWriterCleanly(writer)
-            throw DatabaseError(resultCode: .SQLITE_MISUSE, message: "Connection is closed")
+            let installed = state.withLock { s -> Bool in
+                guard s.lifecycle == .open else {
+                    return false
+                }
+                s.dbWriter = writer
+                s.keys = keys
+                s.lockState = .unlocked
+                s.openFailure = nil
+                return true
+            }
+
+            if !installed {
+                SVGImageRenderer.unregisterTextLoader(ownerID: instanceID)
+                ImageAssetStore.unregisterKeys(forSupportDirectory: directory, ownerID: instanceID)
+                closeWriterCleanly(writer)
+                throw DatabaseError(resultCode: .SQLITE_MISUSE, message: "Connection is closed")
+            }
+        } catch let storeError as HistoryStoreError {
+            switch storeError {
+            case .encryptionKeyUnavailable(let reason):
+                state.withLock { s in
+                    if s.lifecycle == .open {
+                        s.lockState = .locked(reason)
+                        s.openFailure = nil
+                    }
+                }
+            case .encryptionKeyMismatch:
+                state.withLock { s in
+                    if s.lifecycle == .open {
+                        s.lockState = .keyMismatch
+                        s.openFailure = nil
+                    }
+                }
+            default:
+                state.withLock { s in
+                    if s.lifecycle == .open {
+                        s.openFailure = storeError
+                    }
+                }
+            }
+            throw storeError
+        } catch {
+            state.withLock { s in
+                if s.lifecycle == .open {
+                    s.openFailure = error
+                }
+            }
+            throw error
         }
     }
 
     private func loadDecryptedSVGText(for clipID: UUID) -> String? {
-        guard state.withLock({
-            $0.lifecycle == .open && $0.lockState == .unlocked && $0.dbWriter != nil && $0.keys != nil
-        }) else {
+        guard isOpen else {
             return nil
         }
         return try? withRead { db, keys in
@@ -2098,7 +2148,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    private func sweepLeftoverScrubbingAndSupersededPlaintextAssets(in writer: any DatabaseWriter) {
+    private func sweepLeftoverScrubbingAndSupersededPlaintextAssets(
+        in writer: any DatabaseWriter,
+        keys: ClipBookDerivedKeys
+    ) {
         let scrubbingCandidates: [URL] = [
             scrubbingDBURL,
             scrubbingWALURL,
@@ -2128,35 +2181,68 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         // Remove any leftover <stem>.png/.jpg/.ico/.gif/.webp in Images/ or LinkPreviews/
-        // whose <stem>.enc counterpart already exists and is not referenced by an unencrypted row.
-        let unencryptedAssetFileNames: Set<String> = (try? writer.unsafeReentrantRead { db -> Set<String> in
-            let decoder = Self.makeJSONDecoder()
-            var names: Set<String> = []
-            let cursor = try Row.fetchCursor(
-                db,
-                sql: """
-                    SELECT assetPath, linkPreviewData
-                    FROM clips
-                    WHERE isEncrypted = 0 AND (assetPath IS NOT NULL OR linkPreviewData IS NOT NULL)
-                    """
-            )
-            while let row = try cursor.next() {
-                if let assetData: Data = row["assetPath"],
-                   let path = String(data: assetData, encoding: .utf8) {
-                    names.insert(URL(fileURLWithPath: path).lastPathComponent)
-                }
-                if let lpData: Data = row["linkPreviewData"],
-                   let details = try? decoder.decode(LinkPreviewDetails.self, from: lpData) {
-                    if let imgPath = details.imagePath {
-                        names.insert(URL(fileURLWithPath: imgPath).lastPathComponent)
+        // whose <stem>.enc counterpart already exists and is not referenced by an unencrypted row,
+        // and scrub any leftover <stem>.enc whose plain <stem>.<ext> counterpart is referenced by
+        // an unencrypted row after a post-commit crash.
+        let (unencryptedAssetFileNames, encryptedAssetFileNames): (Set<String>, Set<String>) = (
+            try? writer.unsafeReentrantRead { db -> (Set<String>, Set<String>) in
+                let decoder = Self.makeJSONDecoder()
+                var plainRowNames: Set<String> = []
+                var encryptedRowNames: Set<String> = []
+                let cursor = try Row.fetchCursor(
+                    db,
+                    sql: """
+                        SELECT id, isEncrypted, assetPath, linkPreviewData
+                        FROM clips
+                        WHERE assetPath IS NOT NULL OR linkPreviewData IS NOT NULL
+                        """
+                )
+                while let row = try cursor.next() {
+                    let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
+                    if !isEncrypted {
+                        if let assetData: Data = row["assetPath"],
+                           let path = String(data: assetData, encoding: .utf8) {
+                            plainRowNames.insert(URL(fileURLWithPath: path).lastPathComponent)
+                        }
+                        if let lpData: Data = row["linkPreviewData"],
+                           let details = try? decoder.decode(LinkPreviewDetails.self, from: lpData) {
+                            if let imgPath = details.imagePath {
+                                plainRowNames.insert(URL(fileURLWithPath: imgPath).lastPathComponent)
+                            }
+                            if let favPath = details.faviconPath {
+                                plainRowNames.insert(URL(fileURLWithPath: favPath).lastPathComponent)
+                            }
+                        }
+                    } else if let idString: String = row["id"], let clipID = UUID(uuidString: idString) {
+                        if let path = try? Self.decodeProtectedAssetPath(
+                            from: row,
+                            column: "assetPath",
+                            clipID: clipID,
+                            isEncrypted: true,
+                            keys: keys
+                        ) {
+                            encryptedRowNames.insert(URL(fileURLWithPath: path).lastPathComponent)
+                        }
+                        if let details = try? Self.decodeProtectedLinkPreview(
+                            from: row,
+                            column: "linkPreviewData",
+                            clipID: clipID,
+                            isEncrypted: true,
+                            keys: keys,
+                            decoder: decoder
+                        ) {
+                            if let imgPath = details.imagePath {
+                                encryptedRowNames.insert(URL(fileURLWithPath: imgPath).lastPathComponent)
+                            }
+                            if let favPath = details.faviconPath {
+                                encryptedRowNames.insert(URL(fileURLWithPath: favPath).lastPathComponent)
+                            }
+                        }
                     }
-                    if let favPath = details.faviconPath {
-                        names.insert(URL(fileURLWithPath: favPath).lastPathComponent)
-                    }
                 }
+                return (plainRowNames, encryptedRowNames)
             }
-            return names
-        }) ?? []
+        ) ?? ([], [])
 
         for assetDir in [assetStore.imagesDirectory, assetStore.linkPreviewsDirectory] {
             guard let files = try? FileManager.default.contentsOfDirectory(
@@ -2168,16 +2254,31 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
 
             var encStems: Set<String> = []
-            for file in files where file.pathExtension.lowercased() == "enc" {
-                encStems.insert(file.deletingPathExtension().lastPathComponent)
+            var existingPlainStemsReferencedByUnencryptedRows: Set<String> = []
+            for file in files {
+                let ext = file.pathExtension.lowercased()
+                let stem = file.deletingPathExtension().lastPathComponent
+                if ext == "enc" {
+                    encStems.insert(stem)
+                } else if unencryptedAssetFileNames.contains(file.lastPathComponent) {
+                    existingPlainStemsReferencedByUnencryptedRows.insert(stem)
+                }
             }
             guard !encStems.isEmpty else {
                 continue
             }
 
-            for file in files where file.pathExtension.lowercased() != "enc" {
+            for file in files {
+                let ext = file.pathExtension.lowercased()
                 let stem = file.deletingPathExtension().lastPathComponent
-                if encStems.contains(stem) && !unencryptedAssetFileNames.contains(file.lastPathComponent) {
+                if ext != "enc" {
+                    if encStems.contains(stem) && !unencryptedAssetFileNames.contains(file.lastPathComponent) {
+                        ImageAssetStore.secureUnlink(at: file)
+                        ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: file.path)
+                    }
+                } else if existingPlainStemsReferencedByUnencryptedRows.contains(stem)
+                    && !unencryptedAssetFileNames.contains(file.lastPathComponent)
+                    && !encryptedAssetFileNames.contains(file.lastPathComponent) {
                     ImageAssetStore.secureUnlink(at: file)
                     ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: file.path)
                 }
@@ -2270,52 +2371,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     // MARK: - Write & Reconcile Helpers
 
-    private func encryptManagedOrExternalAssetsOnCapture(
-        _ item: inout ClipboardItem,
-        keys: ClipBookDerivedKeys
-    ) throws {
-        if let oldAssetPath = item.assetPath {
-            let encryptedPath = try assetStore.encryptAssetIfNeeded(
-                at: oldAssetPath,
-                role: .image,
-                clipID: item.id,
-                keys: keys
-            )
-            item.assetPath = encryptedPath
-            if encryptedPath != oldAssetPath {
-                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldAssetPath)
-            }
-        }
-
-        if var details = item.linkPreviewDetails {
-            if let oldImagePath = details.imagePath {
-                let encryptedImagePath = try assetStore.encryptAssetIfNeeded(
-                    at: oldImagePath,
-                    role: .linkPreview,
-                    clipID: item.id,
-                    keys: keys
-                )
-                details.imagePath = encryptedImagePath
-                if encryptedImagePath != oldImagePath {
-                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldImagePath)
-                }
-            }
-            if let oldFaviconPath = details.faviconPath {
-                let encryptedFaviconPath = try assetStore.encryptAssetIfNeeded(
-                    at: oldFaviconPath,
-                    role: .linkFavicon,
-                    clipID: item.id,
-                    keys: keys
-                )
-                details.faviconPath = encryptedFaviconPath
-                if encryptedFaviconPath != oldFaviconPath {
-                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldFaviconPath)
-                }
-            }
-            item.linkPreviewDetails = details
-        }
-    }
-
     private enum AssetPersistenceMode {
         case nonDestructiveEncryptedStaging
         case reconcileManagedAssets
@@ -2339,10 +2394,27 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
         var linkStat = stat()
-        if Darwin.lstat(previousURL.path, &linkStat) == 0 {
-            ImageAssetStore.secureUnlink(at: previousURL)
+        let superseded = Darwin.lstat(previousURL.path, &linkStat) == 0 ? previousURL : nil
+        recordSupersededAsset(supersededURL: superseded, evictedPath: previousPath)
+    }
+
+    private func stageReconciledAssetPath(
+        _ oldPath: String,
+        role: AssetRole,
+        clipID: UUID,
+        shouldEncrypt: Bool,
+        keys: ClipBookDerivedKeys
+    ) throws -> String? {
+        let outcome = shouldEncrypt
+            ? try assetStore.stageEncryptedAssetIfNeeded(at: oldPath, role: role, clipID: clipID, keys: keys)
+            : try assetStore.stageDecryptedAssetIfNeeded(at: oldPath, role: role, clipID: clipID, keys: keys)
+        let reconciledPath = outcome?.writtenURL.path
+        if let outcome {
+            recordAssetOutcome(outcome, evictedPath: reconciledPath != oldPath ? oldPath : nil)
+        } else if reconciledPath != oldPath {
+            recordSupersededAsset(supersededURL: nil, evictedPath: oldPath)
         }
-        ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: previousPath)
+        return reconciledPath
     }
 
     private func reconcileManagedAssetsForPersistence(
@@ -2351,89 +2423,36 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         keys: ClipBookDerivedKeys
     ) throws {
         if let oldAssetPath = workingItem.assetPath {
-            let reconciledPath: String?
-            if shouldEncrypt {
-                reconciledPath = try assetStore.encryptAssetIfNeeded(
-                    at: oldAssetPath,
-                    role: .image,
-                    clipID: workingItem.id,
-                    keys: keys
-                )
-            } else {
-                reconciledPath = try assetStore.decryptAssetIfNeeded(
-                    at: oldAssetPath,
-                    role: .image,
-                    clipID: workingItem.id,
-                    keys: keys
-                )
-            }
-            workingItem.assetPath = reconciledPath
-            if reconciledPath != oldAssetPath {
-                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldAssetPath)
-            }
+            workingItem.assetPath = try stageReconciledAssetPath(
+                oldAssetPath,
+                role: .image,
+                clipID: workingItem.id,
+                shouldEncrypt: shouldEncrypt,
+                keys: keys
+            )
         }
 
         if var details = workingItem.linkPreviewDetails {
             if let oldImagePath = details.imagePath {
-                let reconciledPreview: String?
-                if shouldEncrypt {
-                    reconciledPreview = try assetStore.encryptAssetIfNeeded(
-                        at: oldImagePath,
-                        role: .linkPreview,
-                        clipID: workingItem.id,
-                        keys: keys
-                    )
-                } else {
-                    reconciledPreview = try assetStore.decryptAssetIfNeeded(
-                        at: oldImagePath,
-                        role: .linkPreview,
-                        clipID: workingItem.id,
-                        keys: keys
-                    )
-                }
-                details.imagePath = reconciledPreview
-                if reconciledPreview != oldImagePath {
-                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldImagePath)
-                }
+                details.imagePath = try stageReconciledAssetPath(
+                    oldImagePath,
+                    role: .linkPreview,
+                    clipID: workingItem.id,
+                    shouldEncrypt: shouldEncrypt,
+                    keys: keys
+                )
             }
             if let oldFaviconPath = details.faviconPath {
-                let reconciledFavicon: String?
-                if shouldEncrypt {
-                    reconciledFavicon = try assetStore.encryptAssetIfNeeded(
-                        at: oldFaviconPath,
-                        role: .linkFavicon,
-                        clipID: workingItem.id,
-                        keys: keys
-                    )
-                } else {
-                    reconciledFavicon = try assetStore.decryptAssetIfNeeded(
-                        at: oldFaviconPath,
-                        role: .linkFavicon,
-                        clipID: workingItem.id,
-                        keys: keys
-                    )
-                }
-                details.faviconPath = reconciledFavicon
-                if reconciledFavicon != oldFaviconPath {
-                    ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldFaviconPath)
-                }
+                details.faviconPath = try stageReconciledAssetPath(
+                    oldFaviconPath,
+                    role: .linkFavicon,
+                    clipID: workingItem.id,
+                    shouldEncrypt: shouldEncrypt,
+                    keys: keys
+                )
             }
             workingItem.linkPreviewDetails = details
         }
-    }
-
-    private func reconcileAndPersistItem(
-        in db: Database,
-        item: ClipboardItem,
-        convertingExternalAssets: Bool,
-        keys: ClipBookDerivedKeys
-    ) throws -> ClipboardItem {
-        try persistUpsert(
-            in: db,
-            item: item,
-            keys: keys,
-            assetMode: convertingExternalAssets ? .reconcileManagedAssets : .nonDestructiveEncryptedStaging
-        )
     }
 
     private func stageNonDestructiveEncryptedAssetIfNeeded(
@@ -2477,12 +2496,33 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             keys: keys,
             requiresEncryption: false
         )
+        let targetDir = role == .image ? assetStore.imagesDirectory : assetStore.linkPreviewsDirectory
+        let targetName: String
+        switch role {
+        case .image:
+            targetName = "\(clipID.uuidString).enc"
+        case .linkPreview:
+            targetName = "\(clipID.uuidString)-preview.enc"
+        case .linkFavicon:
+            targetName = "\(clipID.uuidString)-favicon.enc"
+        }
+        let expectedTargetURL = targetDir.appendingPathComponent(targetName, isDirectory: false)
+        let targetPreexisted = Self.fileOrSymlinkExists(at: expectedTargetURL)
         let stagedURL = try assetStore.writeAsset(
             pngData: plainData,
             role: role,
             clipID: clipID,
             encrypted: true,
             keys: keys
+        )
+        let createdNew = !targetPreexisted && Self.canonicalFileURL(sourceURL) != Self.canonicalFileURL(stagedURL)
+        recordAssetOutcome(
+            ImageAssetStore.AssetConversionOutcome(
+                writtenURL: stagedURL,
+                createdNewFile: createdNew,
+                supersededManagedURL: nil
+            ),
+            evictedPath: nil
         )
         return stagedURL.path
     }
@@ -2493,6 +2533,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         keys: ClipBookDerivedKeys,
         assetMode: AssetPersistenceMode
     ) throws -> ClipboardItem {
+        if item.isCorruptPlaceholder {
+            throw HistoryStoreError.authenticationFailed
+        }
+
         var workingItem = item
         let priorStoredContentKey = item.storedContentKey
         let idString = workingItem.id.uuidString
@@ -2506,69 +2550,30 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         let existingSourceAppName: String? = existingClipRow?["sourceAppName"]
         let existingSourceBundleID: String? = existingClipRow?["sourceBundleIdentifier"]
 
-        var shouldEncrypt = SensitiveContent.shouldEncryptAtRest(workingItem)
-
         // Preserve unloaded body/formatting columns and re-seal/unseal if encryption state changed.
         let writesBody = workingItem.isContentLoaded
         let writesFormatting = workingItem.isFormattingLoaded || !workingItem.hasFormatting
 
-        var existingPlainText: String? = nil
-        var existingPlainQR: String? = nil
-        var existingPlainRTF: Data? = nil
-        var existingPlainHTML: String? = nil
-        var loadedExistingBody = false
-        var loadedExistingFormatting = false
-
-        if let wasEncrypted = existingIsEncrypted, (!writesBody || !writesFormatting) {
-            if let existingContentsRow = try Row.fetchOne(
+        if existingIsEncrypted == true && (!writesBody || !writesFormatting) {
+            if let protectedHeaderRow = try Row.fetchOne(
                 db,
-                sql: "SELECT text, qrCodeText, rtf, html FROM clip_contents WHERE clipId = ? LIMIT 1",
+                sql: """
+                    SELECT title, textPreview, htmlDigest, imageDigest, assetPath, filePathsData, linkPreviewData
+                    FROM clips
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
                 arguments: [idString]
             ) {
-                if !writesBody && (wasEncrypted != shouldEncrypt || (!workingItem.isContentLoaded && priorStoredContentKey == nil)) {
-                    existingPlainText = try Self.decodeStringColumn(
-                        from: existingContentsRow,
-                        rowColumn: "text",
-                        aadTable: "clip_contents",
-                        aadColumn: "text",
-                        clipID: workingItem.id,
-                        isEncrypted: wasEncrypted,
-                        keys: keys
-                    )
-                    existingPlainQR = try Self.decodeStringColumn(
-                        from: existingContentsRow,
-                        rowColumn: "qrCodeText",
-                        aadTable: "clip_contents",
-                        aadColumn: "qrCodeText",
-                        clipID: workingItem.id,
-                        isEncrypted: wasEncrypted,
-                        keys: keys
-                    )
-                    loadedExistingBody = true
-                }
-                if !writesFormatting && wasEncrypted != shouldEncrypt {
-                    existingPlainRTF = try Self.decodeDataColumn(
-                        from: existingContentsRow,
-                        rowColumn: "rtf",
-                        aadTable: "clip_contents",
-                        aadColumn: "rtf",
-                        clipID: workingItem.id,
-                        isEncrypted: wasEncrypted,
-                        keys: keys
-                    )
-                    existingPlainHTML = try Self.decodeStringColumn(
-                        from: existingContentsRow,
-                        rowColumn: "html",
-                        aadTable: "clip_contents",
-                        aadColumn: "html",
-                        clipID: workingItem.id,
-                        isEncrypted: wasEncrypted,
-                        keys: keys
-                    )
-                    loadedExistingFormatting = true
-                }
+                try Self.authenticateEncryptedClipHeaderColumns(
+                    in: protectedHeaderRow,
+                    clipID: workingItem.id,
+                    keys: keys
+                )
             }
         }
+
+        var shouldEncrypt = SensitiveContent.shouldEncryptAtRest(workingItem)
 
         switch assetMode {
         case .reconcileManagedAssets:
@@ -2625,6 +2630,82 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
         }
 
+        let reusableStoredKey = workingItem.storedContentKey ?? (
+            workingItem.kind == .image && workingItem.imageDigest != nil ? priorStoredContentKey : nil
+        )
+        let canReuseContentKey = workingItem.isContentLoaded || reusableStoredKey != nil
+
+        var existingPlainText: String? = nil
+        var existingPlainQR: String? = nil
+        var existingPlainRTF: Data? = nil
+        var existingPlainHTML: String? = nil
+        var loadedExistingBody = false
+        var loadedExistingFormatting = false
+
+        if let wasEncrypted = existingIsEncrypted {
+            let needsExistingBody = !writesBody && (wasEncrypted != shouldEncrypt || !canReuseContentKey)
+            let needsExistingFormatting = !writesFormatting && (wasEncrypted != shouldEncrypt)
+            if needsExistingBody || needsExistingFormatting {
+                let projectedColumns: String
+                switch (needsExistingBody, needsExistingFormatting) {
+                case (true, false):
+                    projectedColumns = "text, qrCodeText"
+                case (false, true):
+                    projectedColumns = "rtf, html"
+                default:
+                    projectedColumns = "text, qrCodeText, rtf, html"
+                }
+                if let existingContentsRow = try Row.fetchOne(
+                    db,
+                    sql: "SELECT \(projectedColumns) FROM clip_contents WHERE clipId = ? LIMIT 1",
+                    arguments: [idString]
+                ) {
+                    if needsExistingBody {
+                        existingPlainText = try Self.decodeStringColumn(
+                            from: existingContentsRow,
+                            rowColumn: "text",
+                            aadTable: "clip_contents",
+                            aadColumn: "text",
+                            clipID: workingItem.id,
+                            isEncrypted: wasEncrypted,
+                            keys: keys
+                        )
+                        existingPlainQR = try Self.decodeStringColumn(
+                            from: existingContentsRow,
+                            rowColumn: "qrCodeText",
+                            aadTable: "clip_contents",
+                            aadColumn: "qrCodeText",
+                            clipID: workingItem.id,
+                            isEncrypted: wasEncrypted,
+                            keys: keys
+                        )
+                        loadedExistingBody = true
+                    }
+                    if needsExistingFormatting {
+                        existingPlainRTF = try Self.decodeDataColumn(
+                            from: existingContentsRow,
+                            rowColumn: "rtf",
+                            aadTable: "clip_contents",
+                            aadColumn: "rtf",
+                            clipID: workingItem.id,
+                            isEncrypted: wasEncrypted,
+                            keys: keys
+                        )
+                        existingPlainHTML = try Self.decodeStringColumn(
+                            from: existingContentsRow,
+                            rowColumn: "html",
+                            aadTable: "clip_contents",
+                            aadColumn: "html",
+                            clipID: workingItem.id,
+                            isEncrypted: wasEncrypted,
+                            keys: keys
+                        )
+                        loadedExistingFormatting = true
+                    }
+                }
+            }
+        }
+
         // Compute contentKey (32-byte HMAC-SHA256 BLOB).
         let hmacKey: Data
         if workingItem.isContentLoaded {
@@ -2635,38 +2716,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 htmlDigest: parts.htmlDigest,
                 keys: keys
             )
-        } else if let reusableKey = workingItem.storedContentKey ?? (
-            workingItem.kind == .image && workingItem.imageDigest != nil ? priorStoredContentKey : nil
-        ) {
-            hmacKey = reusableKey
+        } else if let reusableStoredKey {
+            hmacKey = reusableStoredKey
         } else {
-            if !loadedExistingBody, let wasEncrypted = existingIsEncrypted {
-                if let row = try Row.fetchOne(
-                    db,
-                    sql: "SELECT text, qrCodeText FROM clip_contents WHERE clipId = ? LIMIT 1",
-                    arguments: [idString]
-                ) {
-                    existingPlainText = try Self.decodeStringColumn(
-                        from: row,
-                        rowColumn: "text",
-                        aadTable: "clip_contents",
-                        aadColumn: "text",
-                        clipID: workingItem.id,
-                        isEncrypted: wasEncrypted,
-                        keys: keys
-                    )
-                    existingPlainQR = try Self.decodeStringColumn(
-                        from: row,
-                        rowColumn: "qrCodeText",
-                        aadTable: "clip_contents",
-                        aadColumn: "qrCodeText",
-                        clipID: workingItem.id,
-                        isEncrypted: wasEncrypted,
-                        keys: keys
-                    )
-                    loadedExistingBody = true
-                }
-            }
             let hydrated = workingItem.withLoadedContent(
                 text: existingPlainText,
                 qrCodeText: existingPlainQR,
@@ -3181,6 +3233,73 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         return details
     }
 
+    private static func authenticateEncryptedClipHeaderColumns(
+        in row: Row,
+        clipID: UUID,
+        keys: ClipBookDerivedKeys
+    ) throws {
+        let decoder = makeJSONDecoder()
+        _ = try decodeStringColumn(
+            from: row,
+            rowColumn: "title",
+            aadTable: "clips",
+            aadColumn: "title",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys
+        )
+        _ = try decodeStringColumn(
+            from: row,
+            rowColumn: "textPreview",
+            aadTable: "clips",
+            aadColumn: "textPreview",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys
+        )
+        _ = try decodeStringColumn(
+            from: row,
+            rowColumn: "htmlDigest",
+            aadTable: "clips",
+            aadColumn: "htmlDigest",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys
+        )
+        _ = try decodeStringColumn(
+            from: row,
+            rowColumn: "imageDigest",
+            aadTable: "clips",
+            aadColumn: "imageDigest",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys
+        )
+        _ = try decodeProtectedAssetPath(
+            from: row,
+            column: "assetPath",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys
+        )
+        _ = try decodeProtectedFilePaths(
+            from: row,
+            column: "filePathsData",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys,
+            decoder: decoder
+        )
+        _ = try decodeProtectedLinkPreview(
+            from: row,
+            column: "linkPreviewData",
+            clipID: clipID,
+            isEncrypted: true,
+            keys: keys,
+            decoder: decoder
+        )
+    }
+
     private static func decodeProtectedFilePaths(
         from row: Row,
         column: String,
@@ -3198,6 +3317,11 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             isEncrypted: isEncrypted,
             keys: keys
         )
+        if jsonData.count == 2,
+           jsonData[jsonData.startIndex] == 0x5B,
+           jsonData[jsonData.index(after: jsonData.startIndex)] == 0x5D {
+            return []
+        }
         do {
             return try decoder.decode([String].self, from: jsonData)
         } catch {
@@ -3442,7 +3566,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             sensitivity: .sensitive,
             expiresAt: expiresAt,
             deletedAt: deletedAt,
-            storedContentKey: storedContentKey
+            storedContentKey: storedContentKey,
+            isCorruptPlaceholder: true
         )
     }
 
@@ -3678,6 +3803,45 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 entry.tagOrders[tagID] = sortOrder
             }
             map[clipID] = entry
+        }
+        return map
+    }
+
+    private func fetchTagAttachments(
+        in db: Database,
+        forClipIDStrings clipIDStrings: [String]
+    ) throws -> [String: TagAttachment] {
+        guard !clipIDStrings.isEmpty else {
+            return [:]
+        }
+        var map: [String: TagAttachment] = [:]
+        var offset = 0
+        while offset < clipIDStrings.count {
+            let end = min(offset + Self.searchInClauseBatchLimit, clipIDStrings.count)
+            let batch = Array(clipIDStrings[offset..<end])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ", ")
+            let sql = """
+                SELECT ct.clipId, ct.tagId, ct.sortOrder, t.name
+                FROM clip_tags ct
+                JOIN tags t ON t.id = ct.tagId
+                WHERE ct.clipId IN (\(placeholders))
+                ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
+                """
+            let cursor = try Row.fetchCursor(db, sql: sql, arguments: StatementArguments(batch))
+            while let row = try cursor.next() {
+                let clipID: String = row["clipId"]
+                let tagID: Int = row["tagId"]
+                let tagName: String = row["name"]
+                let sortOrder: Int? = row["sortOrder"]
+                var entry = map[clipID] ?? TagAttachment()
+                entry.tagIDs.append(tagID)
+                entry.tagNames.append(tagName)
+                if let sortOrder {
+                    entry.tagOrders[tagID] = sortOrder
+                }
+                map[clipID] = entry
+            }
+            offset = end
         }
         return map
     }
@@ -4193,14 +4357,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private static func fileOrSymlinkExists(at url: URL) -> Bool {
         var st = stat()
         return Darwin.lstat(url.path, &st) == 0
-    }
-
-    private static func fileSize(at url: URL) -> Int64? {
-        var st = stat()
-        guard Darwin.lstat(url.path, &st) == 0 else {
-            return nil
-        }
-        return Int64(st.st_size)
     }
 
     private static func sameInode(_ lhs: URL, _ rhs: URL) -> Bool {

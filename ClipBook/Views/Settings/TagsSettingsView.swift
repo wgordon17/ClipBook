@@ -21,6 +21,7 @@ struct TagsSettingsView: View {
                         TagSettingsRow(
                             tag: tag,
                             itemCount: tagItemCounts[tag.id, default: 0],
+                            isEnabled: model.storeLockState == .unlocked,
                             onEdit: {
                                 showTagDialog(for: tag)
                             },
@@ -37,6 +38,7 @@ struct TagsSettingsView: View {
                 Button(L10n.string("New Tag...")) {
                     showTagDialog()
                 }
+                .disabled(model.storeLockState != .unlocked)
             }
         }
         .background(SettingsWindowAccessor(window: $settingsWindow))
@@ -103,6 +105,7 @@ private struct EmptyTagsSettingsRow: View {
 private struct TagSettingsRow: View {
     let tag: Tag
     let itemCount: Int
+    let isEnabled: Bool
     let onEdit: () -> Void
     let onDelete: () -> Void
 
@@ -124,8 +127,9 @@ private struct TagSettingsRow: View {
                 .monospacedDigit()
                 .frame(minWidth: 60, alignment: .trailing)
 
-            TagActionsMenuButton(onEdit: onEdit, onDelete: onDelete)
+            TagActionsMenuButton(isEnabled: isEnabled, onEdit: onEdit, onDelete: onDelete)
                 .frame(width: 24, height: 24)
+                .disabled(!isEnabled)
         }
         .padding(.vertical, 9)
     }
@@ -152,6 +156,7 @@ private extension NSColor {
 }
 
 private struct TagActionsMenuButton: NSViewRepresentable {
+    let isEnabled: Bool
     let onEdit: () -> Void
     let onDelete: () -> Void
 
@@ -178,6 +183,7 @@ private struct TagActionsMenuButton: NSViewRepresentable {
     }
 
     private func configure(_ button: NSButton) {
+        button.isEnabled = isEnabled
         let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
         button.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: L10n.string("Tag actions"))?
             .withSymbolConfiguration(configuration)

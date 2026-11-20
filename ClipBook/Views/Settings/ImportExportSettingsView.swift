@@ -151,7 +151,11 @@ struct ImportExportSettingsView: View {
         let initialTotalCount: Int
         switch mode {
         case .unencryptedSkippingSensitive:
-            initialTotalCount = model.items.filter { $0.expiresAt == nil && !SensitiveContent.shouldEncryptAtRest($0) }.count
+            initialTotalCount = model.items.filter {
+                $0.expiresAt == nil
+                    && !SensitiveContent.shouldEncryptAtRest($0)
+                    && !$0.hasUnverifiedEncryptedImageAsset
+            }.count
         case .unencryptedIncludingSensitive, .encrypted:
             initialTotalCount = model.items.filter { $0.expiresAt == nil }.count
         }
@@ -290,6 +294,11 @@ private enum ArchivePassphraseSheetMode {
 }
 
 private struct ArchivePassphraseSheet: View {
+    private enum FocusedField: Hashable {
+        case passphrase
+        case confirmPassphrase
+    }
+
     let mode: ArchivePassphraseSheetMode
     let onCancel: () -> Void
     let onConfirmExportPassphrase: (String) -> Void
@@ -300,6 +309,7 @@ private struct ArchivePassphraseSheet: View {
     @State private var confirmPassphrase = ""
     @State private var isVerifying = false
     @State private var errorMessage: String?
+    @FocusState private var focusedField: FocusedField?
 
     private var nfcPassphrase: String {
         passphrase.precomposedStringWithCanonicalMapping
@@ -340,6 +350,21 @@ private struct ArchivePassphraseSheet: View {
             )
             .textFieldStyle(.roundedBorder)
             .disabled(isVerifying)
+            .focused($focusedField, equals: .passphrase)
+            .onSubmit {
+                switch mode {
+                case .create:
+                    if confirmPassphrase.isEmpty {
+                        focusedField = .confirmPassphrase
+                    } else if !isConfirmDisabled {
+                        submit()
+                    }
+                case .unlock:
+                    if !isConfirmDisabled {
+                        submit()
+                    }
+                }
+            }
 
             if case .create = mode {
                 SecureField(
@@ -353,6 +378,13 @@ private struct ArchivePassphraseSheet: View {
                     )
                 )
                 .textFieldStyle(.roundedBorder)
+                .disabled(isVerifying)
+                .focused($focusedField, equals: .confirmPassphrase)
+                .onSubmit {
+                    if !isConfirmDisabled {
+                        submit()
+                    }
+                }
 
                 if !confirmPassphrase.isEmpty && nfcPassphrase != nfcConfirmPassphrase {
                     Text(L10n.string("Passphrases do not match."))
@@ -388,6 +420,9 @@ private struct ArchivePassphraseSheet: View {
         .padding(18)
         .frame(width: 420)
         .interactiveDismissDisabled(isVerifying)
+        .onAppear {
+            focusedField = .passphrase
+        }
     }
 
     private var title: String {
@@ -438,14 +473,17 @@ private struct ArchivePassphraseSheet: View {
             isVerifying = true
             errorMessage = nil
             Task { @MainActor in
-                defer {
-                    isVerifying = false
-                }
                 do {
                     try await verifyUnlockPassphrase(submittedPassphrase)
+                    isVerifying = false
                     onUnlockVerified(submittedPassphrase)
                 } catch {
+                    isVerifying = false
                     errorMessage = PersistenceErrorLocalization.message(for: error)
+                    focusedField = .passphrase
+                    DispatchQueue.main.async {
+                        focusedField = .passphrase
+                    }
                 }
             }
         }

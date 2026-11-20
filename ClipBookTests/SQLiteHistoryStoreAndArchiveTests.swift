@@ -1371,6 +1371,182 @@ enum SQLiteHistoryStoreAndArchiveTests {
         }
 
         @Test
+        func upsertAndSaveAndReconcileRejectCorruptEncryptedPlaceholdersWithoutOverwriting() throws {
+            try TestSupport.withTemporaryDirectory { directory in
+                let fileManager = FileManager.default
+                let dbURL = directory.appendingPathComponent("History.sqlite")
+                let imagesDir = directory.appendingPathComponent("Images", isDirectory: true)
+                try fileManager.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+
+                let masterKey = SymmetricKey(size: .bits256)
+                let keyProvider = InMemoryDatabaseKeyProvider(key: masterKey)
+
+                let healthyID = UUID()
+                let corruptTextID = UUID()
+                let corruptImageID = UUID()
+                let sourcePNG = imagesDir.appendingPathComponent("\(corruptImageID.uuidString).png")
+                try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemTeal).write(to: sourcePNG)
+                var encAssetURL: URL!
+
+                do {
+                    let seedStore = GRDBHistoryStore(directory: directory, keyProvider: keyProvider)
+                    defer { seedStore.close() }
+
+                    try seedStore.upsert(
+                        ClipboardItem.fixture(
+                            id: healthyID,
+                            kind: .text,
+                            text: "Healthy control clip",
+                            copiedAt: Date(timeIntervalSince1970: 1_700_200_300)
+                        )
+                    )
+
+                    let secretTextItem = ClipboardItem.fixture(
+                        id: corruptTextID,
+                        kind: .text,
+                        title: "Protected Secret Title",
+                        text: ["Authorization", ": Bearer ", "PLACEHOLDER_GUARD_", "4455667788990011"].joined(),
+                        copiedAt: Date(timeIntervalSince1970: 1_700_200_200)
+                    )
+                    #expect(SensitiveContent.shouldEncryptAtRest(secretTextItem))
+                    try seedStore.upsert(secretTextItem)
+
+                    let secretImageItem = ClipboardItem.fixture(
+                        id: corruptImageID,
+                        kind: .image,
+                        title: "Protected Image Title",
+                        text: ["Authorization", ": Bearer ", "IMAGE_PLACEHOLDER_", "9988776655443322"].joined(),
+                        assetPath: sourcePNG.path,
+                        copiedAt: Date(timeIntervalSince1970: 1_700_200_100),
+                        sensitivity: .sensitive
+                    )
+                    let savedImage = try seedStore.saveAndReconcileItem(secretImageItem, convertingExternalAssets: true)
+                    encAssetURL = URL(fileURLWithPath: try #require(savedImage.assetPath))
+                }
+
+                // Tamper encrypted header columns on both secret rows while keeping clip_contents.text and the .enc asset intact.
+                try Self.executeSQL(at: dbURL, """
+                    UPDATE clips SET title = \(Self.sqlHex(Data("corrupted-header-title".utf8)))
+                    WHERE id = '\(corruptTextID.uuidString)';
+                    UPDATE clips SET assetPath = \(Self.sqlHex(Data("corrupted-header-asset-path".utf8)))
+                    WHERE id = '\(corruptImageID.uuidString)';
+                    """)
+
+                func snapshotRowState(for id: UUID) throws -> String {
+                    try #require(
+                        try Self.queryText(
+                            at: dbURL,
+                            """
+                            SELECT c.isEncrypted || '|' || c.isFavorite || '|' || coalesce(hex(c.title), 'NULL')
+                                || '|' || coalesce(hex(c.textPreview), 'NULL') || '|' || coalesce(hex(c.assetPath), 'NULL')
+                                || '|' || coalesce(hex(cc.text), 'NULL')
+                            FROM clips c
+                            LEFT JOIN clip_contents cc ON cc.clipId = c.id
+                            WHERE c.id = '\(id.uuidString)';
+                            """
+                        )
+                    )
+                }
+
+                let baselineTextRow = try snapshotRowState(for: corruptTextID)
+                let baselineImageRow = try snapshotRowState(for: corruptImageID)
+                let baselineEncBytes = try Data(contentsOf: encAssetURL)
+
+                do {
+                    let store = GRDBHistoryStore(directory: directory, keyProvider: keyProvider)
+                    defer { store.close() }
+
+                    let byID = Dictionary(uniqueKeysWithValues: try store.fetchAll().map { ($0.id, $0) })
+                    let healthy = try #require(byID[healthyID])
+                    #expect(!healthy.isCorruptPlaceholder)
+
+                    for corruptID in [corruptTextID, corruptImageID] {
+                        let placeholder = try #require(byID[corruptID])
+                        #expect(placeholder.isCorruptPlaceholder)
+                        #expect(placeholder.unloadingContent().isCorruptPlaceholder)
+                        #expect(placeholder.withLoadedContent(text: "forged-body", qrCodeText: nil).isCorruptPlaceholder)
+
+                        var mutatedUnloaded = placeholder
+                        mutatedUnloaded.isFavorite = true
+                        mutatedUnloaded.title = "Attempted Overwrite Title"
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            try store.upsert(mutatedUnloaded)
+                        }
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            _ = try store.saveAndReconcileItem(mutatedUnloaded, convertingExternalAssets: false)
+                        }
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            _ = try store.saveAndReconcileItem(mutatedUnloaded, convertingExternalAssets: true)
+                        }
+
+                        let mutatedLoaded = mutatedUnloaded.withLoadedContent(
+                            text: "Attempted Overwrite Plaintext Body",
+                            qrCodeText: nil
+                        )
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            try store.upsert(mutatedLoaded)
+                        }
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            _ = try store.saveAndReconcileItem(mutatedLoaded, convertingExternalAssets: true)
+                        }
+
+                        // Even a caller passing a non-placeholder unloaded header for the tampered ID is blocked by header authentication.
+                        let synthesizedUnloaded = ClipboardItem.fromStoredHeader(
+                            id: corruptID,
+                            kind: placeholder.kind,
+                            title: "Bypassed Flag Attempt",
+                            textPreview: nil,
+                            characterCount: 0,
+                            containsPreviewSecret: true,
+                            containsRestSecret: true,
+                            hasRecognizedText: false,
+                            hasQRCodeText: false,
+                            isSVGText: false,
+                            hasFormatting: false,
+                            htmlDigest: nil,
+                            imageDigest: nil,
+                            imageWidth: nil,
+                            imageHeight: nil,
+                            assetPath: nil,
+                            filePaths: [],
+                            sourceAppName: placeholder.sourceAppName,
+                            sourceBundleIdentifier: placeholder.sourceBundleIdentifier,
+                            copiedAt: placeholder.copiedAt,
+                            firstCopiedAt: placeholder.firstCopiedAt,
+                            byteSize: placeholder.byteSize,
+                            isFavorite: true,
+                            tags: [],
+                            tagOrders: [:],
+                            copyCount: placeholder.copyCount,
+                            linkPreviewDetails: nil,
+                            copySequenceID: nil,
+                            copySequenceOrder: nil,
+                            favoriteOrder: nil,
+                            sensitivity: .sensitive,
+                            expiresAt: nil,
+                            deletedAt: nil,
+                            storedContentKey: nil,
+                            isCorruptPlaceholder: false
+                        )
+                        #expect(!synthesizedUnloaded.isCorruptPlaceholder)
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            try store.upsert(synthesizedUnloaded)
+                        }
+                        #expect(throws: HistoryStoreError.authenticationFailed) {
+                            _ = try store.saveAndReconcileItem(synthesizedUnloaded, convertingExternalAssets: true)
+                        }
+                    }
+
+                    store.flushPendingFreePageRelease()
+                }
+
+                #expect(try snapshotRowState(for: corruptTextID) == baselineTextRow)
+                #expect(try snapshotRowState(for: corruptImageID) == baselineImageRow)
+                #expect(try Data(contentsOf: encAssetURL) == baselineEncBytes)
+            }
+        }
+
+        @Test
         func storeLockStateFailClosedAndRetryUnlockRecovery() throws {
             try TestSupport.withTemporaryDirectory { directory in
                 let fileManager = FileManager.default

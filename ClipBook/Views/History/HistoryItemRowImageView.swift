@@ -59,7 +59,9 @@ final class HistoryItemRowImageView: HistoryItemRowView {
     let assetContext = ImageAssetThumbnailLoader.ManagedAssetContext(
       role: .image,
       ownerClipID: item.id,
-      requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+      requiresEncryption: configuredItem?.id == item.id
+        ? requiresEncryptionAtRest
+        : SensitiveContent.shouldEncryptAtRest(item)
     )
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,

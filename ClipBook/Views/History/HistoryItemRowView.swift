@@ -895,6 +895,7 @@ class HistoryItemRowView: NSTableCellView {
   private(set) var linkPreview: LinkPreview?
   private(set) var showsLinkPreview = false
   private(set) var configuredItem: ClipboardItem?
+  private(set) var requiresEncryptionAtRest = false
   private var detectsSensitiveContent = false
   /// True while the row shows dots in place of the item's sensitive content.
   private(set) var hidesSensitiveContent = false
@@ -1002,6 +1003,7 @@ class HistoryItemRowView: NSTableCellView {
     pendingLines = []
     pendingTrailingView = nil
     configuredItem = item
+    requiresEncryptionAtRest = SensitiveContent.shouldEncryptAtRest(item)
     self.itemTags = itemTags
     rowTableWidth = tableWidth
     self.searchQuery = searchQuery
@@ -1377,7 +1379,10 @@ class HistoryItemRowView: NSTableCellView {
     guard let filePath = item.filePaths.first else {
       return false
     }
-    if SensitiveContent.shouldEncryptAtRest(item) {
+    let isEncrypted = configuredItem?.id == item.id
+      ? requiresEncryptionAtRest
+      : SensitiveContent.shouldEncryptAtRest(item)
+    if isEncrypted {
       return ClipboardItem.isImageFile(at: filePath)
     }
 
@@ -1399,7 +1404,7 @@ class HistoryItemRowView: NSTableCellView {
       return NSWorkspace.shared.icon(forFile: filePath)
     }
 
-    if let item = configuredItem, SensitiveContent.shouldEncryptAtRest(item) {
+    if configuredItem != nil && requiresEncryptionAtRest {
       guard ClipboardItem.isImageFile(at: filePath) else {
         return NSWorkspace.shared.icon(forFile: filePath)
       }
@@ -1441,7 +1446,7 @@ class HistoryItemRowView: NSTableCellView {
   }
 
   func imageDimensions(forFileAt filePath: String) -> (width: Int, height: Int)? {
-    let usesDiskPreviewCache = !(configuredItem.map(SensitiveContent.shouldEncryptAtRest) ?? false)
+    let usesDiskPreviewCache = !(configuredItem != nil && requiresEncryptionAtRest)
     guard (usesDiskPreviewCache ? filePreviewCache?.isImageFile(at: filePath) : nil)
             ?? ClipboardItem.isImageFile(at: filePath) else {
       return nil

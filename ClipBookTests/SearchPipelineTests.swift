@@ -1786,7 +1786,7 @@ extension SharedProcessStateTests {
                     initStore.close()
                 }
 
-                let suiteName = "com.ikryanov.clipbook.scale.tests.\(UUID().uuidString)"
+                let suiteName = "com.ikryanov.clipbook.tests.\(UUID().uuidString)"
                 let defaults = try #require(UserDefaults(suiteName: suiteName))
                 defaults.removePersistentDomain(forName: suiteName)
                 defer { TestSupport.removeDefaultsSuite(named: suiteName) }
@@ -1833,7 +1833,7 @@ extension SharedProcessStateTests {
                     let pasteService = PasteService(
                         pasteboard: pasteboard,
                         loadContent: { [spyStore] item, scope in
-                            (try? spyStore.loadingContent(of: item, scope: scope)) ?? item
+                            try spyStore.loadingContent(of: item, scope: scope)
                         }
                     )
                     let coordinator = AppCoordinator(
@@ -1870,7 +1870,7 @@ extension SharedProcessStateTests {
                         #expect(fetchElapsed < .seconds(15), "Unloaded fetchAll() took \(fetchElapsed) at \(milestone) rows")
 
                         let headerFootprintDelta = max(0, postHeaderFootprint - baselineFootprint)
-                        // Eager pre-C6 items held both text and searchText plus formatting in memory.
+                        // Eagerly hydrated items hold both text and searchText plus formatting in memory.
                         let eagerHydratedEquivalentBytes = cumulativeBodyUTF8Bytes * 2 + cumulativeHTMLUTF8Bytes
                         #expect(
                             headerFootprintDelta < eagerHydratedEquivalentBytes / 2,

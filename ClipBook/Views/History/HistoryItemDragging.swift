@@ -83,6 +83,9 @@ enum HistoryItemDragging {
   /// `asPlainText` drops the formatting of text-like items, so a rich text,
   /// link or color lands as the plain string; images and files are unaffected.
   static func payload(for item: ClipboardItem, asPlainText: Bool) -> HistoryRowDragPayload? {
+    guard !item.isCorruptPlaceholder else {
+      return nil
+    }
     if asPlainText, item.kind.isEditableText {
       return textPayload(for: item)
     }
@@ -113,7 +116,7 @@ enum HistoryItemDragging {
       assetURL: assetURL,
       fileName: draggedImageFileName(for: item),
       ownerClipID: item.id,
-      requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+      requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
     )
     return singleEntryPayload(pasteboardItem)
   }

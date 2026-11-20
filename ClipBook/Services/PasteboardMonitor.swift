@@ -70,6 +70,7 @@ final class PasteboardMonitor {
     // A read that was started before the monitor was stopped belongs to no
     // one when it finishes, and its result is dropped.
     private var readGeneration = 0
+    private var recognitionGeneration: UInt64 = 0
     nonisolated private let computeImageDigest: @Sendable (Data) -> String
     nonisolated private let findStoredImage: @Sendable (String) -> StoredImage?
     nonisolated private let recognizeImageData: @Sendable (Data) -> RecognizedImageContent
@@ -119,6 +120,27 @@ final class PasteboardMonitor {
         inFlightImageRecognitionIDs.contains(id)
     }
 
+    func resumePendingImageRecognitions(for items: [ClipboardItem]) {
+        for item in items where item.kind == .image
+            && item.hasUnverifiedEncryptedImageAsset
+            && !SensitiveContent.shouldEncryptAtRest(item)
+            && !item.hasRecognizedText
+            && !item.hasQRCodeText
+            && !inFlightImageRecognitionIDs.contains(item.id) {
+            guard let assetURL = item.assetURL,
+                  let pngData = try? ImageAssetStore.readAssetData(
+                      at: assetURL,
+                      role: .image,
+                      ownerClipID: item.id,
+                      requiresEncryption: true
+                  ) else {
+                continue
+            }
+            inFlightImageRecognitionIDs.insert(item.id)
+            recognizeText(ofPNGData: pngData, inItemWithID: item.id)
+        }
+    }
+
     func start(preferences: AppPreferences) {
         self.preferences = preferences
         timer?.invalidate()
@@ -132,6 +154,7 @@ final class PasteboardMonitor {
         timer?.invalidate()
         timer = nil
         readGeneration += 1
+        recognitionGeneration &+= 1
         if let pendingID = pendingCopyAndMergeItem?.id {
             discardPendingCaptureResources(for: pendingID)
         }
@@ -581,10 +604,11 @@ final class PasteboardMonitor {
 
     private func recognizeText(ofPNGData pngData: Data, inItemWithID itemID: ClipboardItem.ID) {
         let recognize = recognizeImageData
+        let generation = recognitionGeneration
         textRecognitionQueue.async { [weak self] in
             let content = recognize(pngData)
             Task { @MainActor [weak self] in
-                guard let self else {
+                guard let self, self.recognitionGeneration == generation else {
                     return
                 }
 
@@ -596,10 +620,11 @@ final class PasteboardMonitor {
 
     private func recognizeText(ofImageAt url: URL, inItemWithID itemID: ClipboardItem.ID) {
         let recognize = recognizeImageFile
+        let generation = recognitionGeneration
         textRecognitionQueue.async { [weak self] in
             let content = recognize(url)
             Task { @MainActor [weak self] in
-                guard let self else {
+                guard let self, self.recognitionGeneration == generation else {
                     return
                 }
 
@@ -628,7 +653,7 @@ final class PasteboardMonitor {
     }
 
     private func copyAndMergeTargetItem() throws -> ClipboardItem? {
-        try historyStore.fetchMostRecentItem { !$0.isFavorite }
+        try historyStore.fetchMostRecentItem { !$0.isFavorite && !$0.isCorruptPlaceholder }
     }
 
     private func copyAndMergedItem(sourceItem: ClipboardItem, targetItem: ClipboardItem) throws -> ClipboardItem? {
@@ -654,6 +679,8 @@ final class PasteboardMonitor {
         targetItem.linkPreviewDetails = nil
         if sourceItem.sensitivity == .sensitive || targetItem.sensitivity == .sensitive {
             targetItem.sensitivity = .sensitive
+        } else if targetItem.sensitivity == .notSensitive && sourceItem.sensitivity != .notSensitive {
+            targetItem.sensitivity = nil
         }
         // The merged text holds the copied content, so it goes when that
         // content would have gone, unless the user keeps the item.
@@ -738,7 +765,7 @@ final class PasteboardMonitor {
     /// one before it.
     private func mostRecentClipForSequenceTracking(item: ClipboardItem) throws -> ClipboardItem? {
         try historyStore.fetchMostRecentItem { clip in
-            !clip.hasSameContent(as: item)
+            !clip.isCorruptPlaceholder && !clip.hasSameContent(as: item)
         }
     }
 }

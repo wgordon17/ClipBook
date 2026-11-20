@@ -1,5 +1,6 @@
 @testable import ClipBook
 import AppKit
+import CryptoKit
 import Foundation
 import os
 import SwiftUI
@@ -1657,6 +1658,246 @@ extension SharedProcessStateTests {
 
     @Suite
     struct SettingsViewWiringTests {
+        @MainActor
+        private static func makeLockedCoordinatorHarness(
+            supportDirectory: URL,
+            keyProvider: any DatabaseKeyProvider
+        ) throws -> TestCoordinatorHarness {
+            TestSupport.ensureAppKitInitialized()
+            let fileManager = FileManager.default
+            try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+
+            let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
+            let userDefaults = try #require(UserDefaults(suiteName: suiteName))
+            userDefaults.removePersistentDomain(forName: suiteName)
+
+            let pasteboard = NSPasteboard.withUniqueName()
+            let historyStore = GRDBHistoryStore(
+                directory: supportDirectory,
+                keyProvider: keyProvider
+            )
+            _ = try? historyStore.fetchAll()
+
+            let preferencesStore = PreferencesStore(userDefaults: userDefaults)
+            var initialPreferences = AppPreferences()
+            initialPreferences.warnOnClearHistory = false
+            initialPreferences.soundEffectsEnabled = false
+            initialPreferences.launchAtLogin = false
+            initialPreferences.showPreviewForLinks = false
+            preferencesStore.save(initialPreferences)
+
+            let model = AppModel()
+            model.preferences = initialPreferences
+
+            let globalShortcuts = GlobalShortcutService(isEnabled: false)
+            let updateService = TestNoOpUpdateService()
+            let licensingService = LicensingService()
+            let clipboardMonitor = PasteboardMonitor(
+                historyStore: historyStore,
+                fileManager: fileManager,
+                supportDirectory: supportDirectory,
+                pasteboard: pasteboard
+            )
+            let pasteService = PasteService(
+                pasteboard: pasteboard,
+                loadContent: { [historyStore] item, scope in
+                    try historyStore.loadingContent(of: item, scope: scope)
+                }
+            )
+            let coordinator = AppCoordinator(
+                model: model,
+                preferencesStore: preferencesStore,
+                historyStore: historyStore,
+                clipboardMonitor: clipboardMonitor,
+                pasteService: pasteService,
+                globalShortcuts: globalShortcuts,
+                updateService: updateService,
+                licensingService: licensingService,
+                fileManager: fileManager,
+                supportDirectory: supportDirectory
+            )
+
+            return TestCoordinatorHarness(
+                coordinator: coordinator,
+                model: model,
+                historyStore: historyStore,
+                preferencesStore: preferencesStore,
+                clipboardMonitor: clipboardMonitor,
+                globalShortcuts: globalShortcuts,
+                updateService: updateService,
+                pasteboard: pasteboard,
+                userDefaultsSuiteName: suiteName,
+                supportDirectory: supportDirectory
+            )
+        }
+
+        @MainActor
+        private static func collectViewSubviews(in root: NSView) -> [NSView] {
+            var visited = Set<ObjectIdentifier>()
+            var result: [NSView] = []
+            func walk(_ view: NSView) {
+                guard visited.insert(ObjectIdentifier(view)).inserted else { return }
+                result.append(view)
+                for subview in view.subviews {
+                    walk(subview)
+                }
+            }
+            walk(root)
+            return result
+        }
+
+        @MainActor
+        private static func safeAXAttribute(_ attr: NSAccessibility.Attribute, of object: AnyObject) -> Any? {
+            guard let supported = object.accessibilityAttributeNames?(),
+                  supported.contains(attr) else {
+                return nil
+            }
+            return object.accessibilityAttributeValue?(attr)
+        }
+
+        @MainActor
+        private static func collectAccessibilityObjects(in root: AnyObject) -> [AnyObject] {
+            var visited = Set<ObjectIdentifier>()
+            var result: [AnyObject] = []
+            func walk(_ object: AnyObject) {
+                guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+                result.append(object)
+                if let children = object.accessibilityChildren?() {
+                    for child in children {
+                        walk(child as AnyObject)
+                    }
+                }
+                if let children = safeAXAttribute(.children, of: object) as? [AnyObject] {
+                    for child in children {
+                        walk(child)
+                    }
+                }
+                if let view = object as? NSView {
+                    for subview in view.subviews {
+                        walk(subview)
+                    }
+                }
+            }
+            walk(root)
+            return result
+        }
+
+        @MainActor
+        private static func axStringAttributes(of object: AnyObject) -> [String] {
+            var values: [String] = []
+            if let label = object.accessibilityLabel?(), !label.isEmpty { values.append(label) }
+            if let title = object.accessibilityTitle?(), !title.isEmpty { values.append(title) }
+            let valueSel = NSSelectorFromString("accessibilityValue")
+            if object.responds(to: valueSel),
+               let val = object.perform(valueSel)?.takeUnretainedValue() as? String,
+               !val.isEmpty {
+                values.append(val)
+            }
+            for attr: NSAccessibility.Attribute in [.title, .description, .value] {
+                if let str = safeAXAttribute(attr, of: object) as? String, !str.isEmpty {
+                    values.append(str)
+                }
+            }
+            return values
+        }
+
+        @MainActor
+        private static func axRole(of object: AnyObject) -> NSAccessibility.Role? {
+            if let role = object.accessibilityRole?() {
+                return role
+            }
+            if let rawRole = safeAXAttribute(.role, of: object) as? String {
+                return NSAccessibility.Role(rawValue: rawRole)
+            }
+            return nil
+        }
+
+        @MainActor
+        private static func axSubrole(of object: AnyObject) -> NSAccessibility.Subrole? {
+            if let subrole = object.accessibilitySubrole?() {
+                return subrole
+            }
+            if let rawSubrole = safeAXAttribute(.subrole, of: object) as? String {
+                return NSAccessibility.Subrole(rawValue: rawSubrole)
+            }
+            return nil
+        }
+
+        @MainActor
+        private static func axIsEnabled(_ object: AnyObject) -> Bool {
+            if let enabled = object.isAccessibilityEnabled?() {
+                return enabled
+            }
+            if let number = safeAXAttribute(.enabled, of: object) as? NSNumber {
+                return number.boolValue
+            }
+            return false
+        }
+
+        @MainActor
+        private static func renderedStrings(in root: NSView) -> [String] {
+            var strings: [String] = []
+            for view in collectViewSubviews(in: root) {
+                if let tf = view as? NSTextField, !tf.isHidden, !tf.stringValue.isEmpty {
+                    strings.append(tf.stringValue)
+                } else if let button = view as? NSButton, !button.isHidden, !button.title.isEmpty {
+                    strings.append(button.title)
+                }
+            }
+            for element in collectAccessibilityObjects(in: root) {
+                strings.append(contentsOf: axStringAttributes(of: element))
+            }
+            return strings
+        }
+
+        @MainActor
+        private static func findHostedButton(titled title: String, in root: NSView) -> (isEnabled: Bool, press: () -> Void)? {
+            for view in collectViewSubviews(in: root) {
+                if let button = view as? NSButton, !button.isHidden, button.title == title {
+                    return (
+                        isEnabled: button.isEnabled,
+                        press: { button.performClick(nil) }
+                    )
+                }
+            }
+            for element in collectAccessibilityObjects(in: root) where axRole(of: element) == .button {
+                if axStringAttributes(of: element).contains(title) {
+                    return (
+                        isEnabled: axIsEnabled(element),
+                        press: {
+                            if element.accessibilityPerformPress?() == true {
+                                return
+                            }
+                            if let actions = element.accessibilityActionNames?(), actions.contains(.press) {
+                                element.accessibilityPerformAction?(.press)
+                            }
+                        }
+                    )
+                }
+            }
+            return nil
+        }
+
+        @MainActor
+        private static func findHostedSwitchEnabledState(labeled label: String, in root: NSView) -> Bool? {
+            let switches = collectViewSubviews(in: root).compactMap { $0 as? NSSwitch }.filter { !$0.isHidden }
+            if let matchingSwitch = switches.first(where: { axStringAttributes(of: $0).contains(label) }) {
+                return matchingSwitch.isEnabled
+            }
+            if switches.count == 1 {
+                return switches[0].isEnabled
+            }
+            for element in collectAccessibilityObjects(in: root) {
+                let role = axRole(of: element)
+                if role == .checkBox || axSubrole(of: element) == .switch {
+                    if axStringAttributes(of: element).contains(label) {
+                        return axIsEnabled(element)
+                    }
+                }
+            }
+            return nil
+        }
+
         @Test(.timeLimit(.minutes(1)))
         @MainActor
         func changingAPreferenceInTheSettingsWindowSavesIt() async throws {
@@ -1692,6 +1933,336 @@ extension SharedProcessStateTests {
                 harness.preferencesStore.load().warnOnClearHistory != original
             }
             #expect(saved, "The view did not save the changed preference")
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func importExportSettingsViewReflectsStoreLockStateDisablesArchiveControlsAndUnlocks() async throws {
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let masterKey = SymmetricKey(size: .bits256)
+                let seededClip = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Seeded clip behind locked ImportExportSettingsView",
+                    copiedAt: Date(timeIntervalSince1970: 1_715_800_100)
+                )
+                do {
+                    let seedStore = GRDBHistoryStore(
+                        directory: supportDir,
+                        keyProvider: InMemoryDatabaseKeyProvider(key: masterKey)
+                    )
+                    defer { seedStore.close() }
+                    _ = try seedStore.saveAndReconcileItem(seededClip, convertingExternalAssets: true)
+                }
+
+                let toggleProvider = InMemoryDatabaseKeyProvider(
+                    key: nil,
+                    error: .encryptionKeyUnavailable(.interactionNotAllowed)
+                )
+                let lockedHarness = try Self.makeLockedCoordinatorHarness(
+                    supportDirectory: supportDir,
+                    keyProvider: toggleProvider
+                )
+                defer { lockedHarness.cleanup() }
+
+                #expect(lockedHarness.model.storeLockState == .locked(.interactionNotAllowed))
+
+                let hostingView = NSHostingView(
+                    rootView: ImportExportSettingsView(model: lockedHarness.model)
+                        .environmentObject(lockedHarness.coordinator)
+                )
+                hostingView.frame = NSRect(x: 0, y: 0, width: 680, height: 520)
+                let window = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 680, height: 520),
+                    styleMask: [.titled],
+                    backing: .buffered,
+                    defer: false
+                )
+                window.isReleasedWhenClosed = false
+                window.alphaValue = 0
+                window.contentView = hostingView
+                window.orderBack(nil)
+                defer {
+                    TestSupport.drainDelayedPerforms([window, hostingView])
+                    window.orderOut(nil)
+                    window.contentView = nil
+                    TestSupport.drainDelayedPerforms([window, hostingView])
+                }
+                hostingView.layoutSubtreeIfNeeded()
+                hostingView.displayIfNeeded()
+
+                let unlockTitle = L10n.string("Unlock History")
+                let exportTitle = L10n.string("Export...")
+                let importTitle = L10n.string("Import...")
+                let passphraseToggleLabel = L10n.string("Encrypt archive with passphrase")
+                let lockedState: StoreLockState = .locked(.interactionNotAllowed)
+                let lockedStatusTitle = PersistenceErrorLocalization.statusTitle(for: lockedState)
+                let lockedStatusMessage = PersistenceErrorLocalization.statusMessage(for: lockedState)
+
+                let axEnhancedAttr = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+                let previousEnhancedAX = (NSApp.accessibilityAttributeValue(axEnhancedAttr) as? Bool) ?? false
+                NSApp.accessibilitySetValue(true, forAttribute: axEnhancedAttr)
+                defer {
+                    NSApp.accessibilitySetValue(previousEnhancedAX, forAttribute: axEnhancedAttr)
+                }
+
+                // 1. While .locked(.interactionNotAllowed), warning banner + Unlock History button render and archive controls are disabled.
+                let lockedRendered = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    hostingView.layoutSubtreeIfNeeded()
+                    let fullText = Self.renderedStrings(in: hostingView).joined(separator: "\n")
+                    return fullText.contains(lockedStatusTitle)
+                        && fullText.contains(lockedStatusMessage)
+                        && Self.findHostedButton(titled: unlockTitle, in: hostingView) != nil
+                }
+                #expect(lockedRendered)
+
+                let unlockWhileLocked = try #require(Self.findHostedButton(titled: unlockTitle, in: hostingView))
+                let exportWhileLocked = try #require(Self.findHostedButton(titled: exportTitle, in: hostingView))
+                let importWhileLocked = try #require(Self.findHostedButton(titled: importTitle, in: hostingView))
+                #expect(unlockWhileLocked.isEnabled)
+                #expect(!exportWhileLocked.isEnabled)
+                #expect(!importWhileLocked.isEnabled)
+                #expect(Self.findHostedSwitchEnabledState(labeled: passphraseToggleLabel, in: hostingView) == false)
+
+                // 2. Pressing Unlock History with a wrong key invokes retryUnlockHistoryStore() and updates banner to .keyMismatch.
+                toggleProvider.setError(nil)
+                toggleProvider.setKey(SymmetricKey(size: .bits256))
+                unlockWhileLocked.press()
+                #expect(lockedHarness.model.storeLockState == .keyMismatch)
+
+                let mismatchStatusTitle = PersistenceErrorLocalization.statusTitle(for: .keyMismatch)
+                let mismatchStatusMessage = PersistenceErrorLocalization.statusMessage(for: .keyMismatch)
+                let mismatchRendered = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    hostingView.layoutSubtreeIfNeeded()
+                    let fullText = Self.renderedStrings(in: hostingView).joined(separator: "\n")
+                    return fullText.contains(mismatchStatusTitle) && fullText.contains(mismatchStatusMessage)
+                }
+                #expect(mismatchRendered)
+
+                let unlockWhileMismatch = try #require(Self.findHostedButton(titled: unlockTitle, in: hostingView))
+                let exportWhileMismatch = try #require(Self.findHostedButton(titled: exportTitle, in: hostingView))
+                let importWhileMismatch = try #require(Self.findHostedButton(titled: importTitle, in: hostingView))
+                #expect(unlockWhileMismatch.isEnabled)
+                #expect(!exportWhileMismatch.isEnabled)
+                #expect(!importWhileMismatch.isEnabled)
+                #expect(Self.findHostedSwitchEnabledState(labeled: passphraseToggleLabel, in: hostingView) == false)
+
+                // 3. Installing the matching key and pressing Unlock History unlocks the store, hides the banner, and enables controls.
+                toggleProvider.setKey(masterKey)
+                unlockWhileMismatch.press()
+                #expect(lockedHarness.model.storeLockState == .unlocked)
+                #expect(lockedHarness.model.items.map(\.id) == [seededClip.id])
+
+                let unlockedRendered = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    hostingView.layoutSubtreeIfNeeded()
+                    let fullText = Self.renderedStrings(in: hostingView).joined(separator: "\n")
+                    return Self.findHostedButton(titled: unlockTitle, in: hostingView) == nil
+                        && !fullText.contains(lockedStatusMessage)
+                        && !fullText.contains(mismatchStatusMessage)
+                        && !fullText.contains(mismatchStatusTitle)
+                        && (Self.findHostedButton(titled: exportTitle, in: hostingView)?.isEnabled == true)
+                }
+                #expect(unlockedRendered)
+
+                let exportWhenUnlocked = try #require(Self.findHostedButton(titled: exportTitle, in: hostingView))
+                let importWhenUnlocked = try #require(Self.findHostedButton(titled: importTitle, in: hostingView))
+                #expect(exportWhenUnlocked.isEnabled)
+                #expect(importWhenUnlocked.isEnabled)
+                #expect(Self.findHostedSwitchEnabledState(labeled: passphraseToggleLabel, in: hostingView) == true)
+            }
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func lockedHistoryViewAndAppDelegateTestStateReflectStoreLockTransitionsAndUnlock() async throws {
+            // Verify internal-accessible AppDelegate test-mode state without mutating production visibility or touching NSStatusBar.
+            #expect(AppDelegate.isRunningTests)
+            do {
+                let delegate = AppDelegate()
+                defer {
+                    delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+                }
+                #expect(delegate.model.storeLockState == .unlocked)
+            }
+
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let masterKey = SymmetricKey(size: .bits256)
+                let seededClip = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Clip revealed after LockedHistoryView unlock",
+                    copiedAt: Date(timeIntervalSince1970: 1_715_800_200)
+                )
+                do {
+                    let seedStore = GRDBHistoryStore(
+                        directory: supportDir,
+                        keyProvider: InMemoryDatabaseKeyProvider(key: masterKey)
+                    )
+                    defer { seedStore.close() }
+                    _ = try seedStore.saveAndReconcileItem(seededClip, convertingExternalAssets: true)
+                }
+
+                let toggleProvider = InMemoryDatabaseKeyProvider(
+                    key: nil,
+                    error: .encryptionKeyUnavailable(.interactionNotAllowed)
+                )
+                let lockedHarness = try Self.makeLockedCoordinatorHarness(
+                    supportDirectory: supportDir,
+                    keyProvider: toggleProvider
+                )
+                defer { lockedHarness.cleanup() }
+
+                let hostWindow = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 680, height: 480),
+                    styleMask: [.titled],
+                    backing: .buffered,
+                    defer: false
+                )
+                hostWindow.isReleasedWhenClosed = false
+                hostWindow.alphaValue = 0
+                let contentVC = HistoryContentViewController(
+                    model: lockedHarness.model,
+                    coordinator: lockedHarness.coordinator
+                )
+                hostWindow.contentViewController = contentVC
+                defer {
+                    TestSupport.drainDelayedPerforms([hostWindow, contentVC] + contentVC.children)
+                    hostWindow.orderOut(nil)
+                    hostWindow.contentViewController = nil
+                    TestSupport.drainDelayedPerforms([contentVC])
+                }
+                contentVC.view.layoutSubtreeIfNeeded()
+
+                let unlockTitle = L10n.string("Unlock History")
+                let emptyListTitle = L10n.string("No clipboard items")
+                let emptyTrashTitle = L10n.string("Trash is empty")
+                let emptySearchTitle = L10n.string("No results")
+
+                func visibleTextFieldStrings(in root: NSView) -> [String] {
+                    func walk(_ view: NSView) -> [String] {
+                        guard !view.isHidden else { return [] }
+                        var found: [String] = []
+                        if let tf = view as? NSTextField, !tf.stringValue.isEmpty {
+                            found.append(tf.stringValue)
+                        }
+                        for sub in view.subviews {
+                            found.append(contentsOf: walk(sub))
+                        }
+                        return found
+                    }
+                    return walk(root)
+                }
+
+                func findVisibleNSButton(titled title: String, in root: NSView) -> NSButton? {
+                    func walk(_ view: NSView) -> NSButton? {
+                        guard !view.isHidden else { return nil }
+                        if let button = view as? NSButton, button.title == title {
+                            return button
+                        }
+                        for sub in view.subviews {
+                            if let match = walk(sub) {
+                                return match
+                            }
+                        }
+                        return nil
+                    }
+                    return walk(root)
+                }
+
+                // 1. Initial .locked(.interactionNotAllowed) state shows LockedHistoryView and hides all EmptyHistory views.
+                let lockedState: StoreLockState = .locked(.interactionNotAllowed)
+                let initialTexts = visibleTextFieldStrings(in: contentVC.view)
+                #expect(initialTexts.contains(PersistenceErrorLocalization.statusTitle(for: lockedState)))
+                #expect(initialTexts.contains(PersistenceErrorLocalization.statusMessage(for: lockedState)))
+                #expect(!initialTexts.contains(emptyListTitle))
+                #expect(!initialTexts.contains(emptyTrashTitle))
+                #expect(!initialTexts.contains(emptySearchTitle))
+
+                // Trash filter and non-empty search query still keep LockedHistoryView visible while locked.
+                lockedHarness.model.selectedHistoryFilterContentTypes = [.trash]
+                lockedHarness.model.searchQuery = "unmatched"
+                let trashSearchSettled = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    contentVC.view.layoutSubtreeIfNeeded()
+                    let texts = visibleTextFieldStrings(in: contentVC.view)
+                    return texts.contains(PersistenceErrorLocalization.statusTitle(for: lockedState))
+                        && !texts.contains(emptyTrashTitle)
+                        && !texts.contains(emptySearchTitle)
+                }
+                #expect(trashSearchSettled)
+                lockedHarness.model.selectedHistoryFilterContentTypes = []
+                lockedHarness.model.searchQuery = ""
+
+                // 2. Clicking Unlock History with a wrong key transitions LockedHistoryView to .keyMismatch via Combine.
+                let unlockButtonLocked = try #require(findVisibleNSButton(titled: unlockTitle, in: contentVC.view))
+                #expect(unlockButtonLocked.isEnabled)
+                toggleProvider.setError(nil)
+                toggleProvider.setKey(SymmetricKey(size: .bits256))
+                unlockButtonLocked.performClick(nil)
+                #expect(lockedHarness.model.storeLockState == .keyMismatch)
+
+                let mismatchUpdated = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    contentVC.view.layoutSubtreeIfNeeded()
+                    let texts = visibleTextFieldStrings(in: contentVC.view)
+                    return texts.contains(PersistenceErrorLocalization.statusTitle(for: .keyMismatch))
+                        && texts.contains(PersistenceErrorLocalization.statusMessage(for: .keyMismatch))
+                }
+                #expect(mismatchUpdated)
+
+                // 3. Installing matching masterKey and clicking Unlock History unlocks the store and hides LockedHistoryView.
+                let unlockButtonMismatch = try #require(findVisibleNSButton(titled: unlockTitle, in: contentVC.view))
+                toggleProvider.setKey(masterKey)
+                unlockButtonMismatch.performClick(nil)
+                #expect(lockedHarness.model.storeLockState == .unlocked)
+                #expect(lockedHarness.model.items.map(\.id) == [seededClip.id])
+
+                let unlockedUpdated = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                    contentVC.view.layoutSubtreeIfNeeded()
+                    return findVisibleNSButton(titled: unlockTitle, in: contentVC.view) == nil
+                        && !visibleTextFieldStrings(in: contentVC.view).contains(
+                            PersistenceErrorLocalization.statusMessage(for: .keyMismatch)
+                        )
+                }
+                #expect(unlockedUpdated)
+
+                // 4. Direct History.reload(..., storeLockState:) with empty items restores EmptyHistory once .unlocked.
+                let standaloneHistory = History(frame: NSRect(x: 0, y: 0, width: 480, height: 320))
+                defer { TestSupport.drainDelayedPerforms([standaloneHistory]) }
+                standaloneHistory.reload(
+                    items: [],
+                    availableTags: [],
+                    selectedItemID: nil,
+                    selectedItemIDs: [],
+                    searchQuery: "",
+                    showCommandNumberShortcut: true,
+                    showPreviewForLinks: false,
+                    detectSensitiveContent: true,
+                    showDividers: false,
+                    preferPastingAsPlainText: true,
+                    groupPinnedFavorites: false,
+                    sectionDate: nil,
+                    storeLockState: .locked(.notFound),
+                    onSelectFirstItem: { _ in }
+                )
+                #expect(findVisibleNSButton(titled: unlockTitle, in: standaloneHistory) != nil)
+                #expect(!visibleTextFieldStrings(in: standaloneHistory).contains(emptyListTitle))
+
+                standaloneHistory.reload(
+                    items: [],
+                    availableTags: [],
+                    selectedItemID: nil,
+                    selectedItemIDs: [],
+                    searchQuery: "",
+                    showCommandNumberShortcut: true,
+                    showPreviewForLinks: false,
+                    detectSensitiveContent: true,
+                    showDividers: false,
+                    preferPastingAsPlainText: true,
+                    groupPinnedFavorites: false,
+                    sectionDate: nil,
+                    storeLockState: .unlocked,
+                    onSelectFirstItem: { _ in }
+                )
+                #expect(findVisibleNSButton(titled: unlockTitle, in: standaloneHistory) == nil)
+                #expect(visibleTextFieldStrings(in: standaloneHistory).contains(emptyListTitle))
+            }
         }
     }
 
@@ -1795,7 +2366,7 @@ extension SharedProcessStateTests {
             let historyView = History(frame: NSRect(x: 0, y: 0, width: 520, height: 360))
             historyView.preferDraggingAsPlainText = true
             historyView.loadContent = { [weak coordinator = harness.coordinator] item, scope in
-                coordinator?.loadingContent(of: item, scope: scope) ?? item
+                try coordinator?.loadingContent(of: item, scope: scope) ?? item
             }
             historyView.reload(
                 items: [textHeader, richHeader, imageHeader, fileHeader],
@@ -1856,7 +2427,7 @@ extension SharedProcessStateTests {
                 presentation: .sheet,
                 showsPreview: true,
                 loadContent: { [weak coordinator = harness.coordinator] item, scope in
-                    let loaded = coordinator?.loadingContent(of: item, scope: scope) ?? item
+                    let loaded = try coordinator?.loadingContent(of: item, scope: scope) ?? item
                     observedRichHydrated = loaded
                     return loaded
                 }
@@ -1882,7 +2453,7 @@ extension SharedProcessStateTests {
                 detectsSensitiveContent: true,
                 revealsSensitiveContent: false,
                 loadContent: { [weak coordinator = harness.coordinator] item, scope in
-                    coordinator?.loadingContent(of: item, scope: scope) ?? item
+                    try coordinator?.loadingContent(of: item, scope: scope) ?? item
                 }
             )
             defer { TestSupport.drainDelayedPerforms([imagePreview]) }
@@ -1892,7 +2463,7 @@ extension SharedProcessStateTests {
                 detectsSensitiveContent: true,
                 revealsSensitiveContent: false,
                 loadContent: { [weak coordinator = harness.coordinator] item, scope in
-                    coordinator?.loadingContent(of: item, scope: scope) ?? item
+                    try coordinator?.loadingContent(of: item, scope: scope) ?? item
                 }
             )
             defer { TestSupport.drainDelayedPerforms([filePreview]) }
@@ -1911,7 +2482,7 @@ extension SharedProcessStateTests {
                 presentation: .pane,
                 showsPreview: false,
                 loadContent: { [weak coordinator = harness.coordinator] item, scope in
-                    coordinator?.loadingContent(of: item, scope: scope) ?? item
+                    try coordinator?.loadingContent(of: item, scope: scope) ?? item
                 }
             )
             defer { TestSupport.drainDelayedPerforms([detailsOnlyPane]) }

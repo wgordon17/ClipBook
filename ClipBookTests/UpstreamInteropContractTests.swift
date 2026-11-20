@@ -730,7 +730,7 @@ struct UpstreamInteropContractTests {
                     #expect(tables == ["clips", "clip_contents", "clip_tags", "tags", "store_metadata"])
                 }
 
-                // 3. `clips` omits `payload`, `html`, `rtf`, and `searchText` (`SEC-006`), so legacy Upstream
+                // 3. `clips` omits `payload`, `html`, `rtf`, and `searchText`, so legacy Upstream
                 //    `SELECT payload FROM clips` fails `sqlite3_prepare_v2` cleanly before `removeOrphanedStoredFiles()` can run.
                 do {
                     var infoStmt: OpaquePointer?

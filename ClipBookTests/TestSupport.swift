@@ -91,6 +91,7 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
     }
 
     var lockState: StoreLockState { base.lockState }
+    var isOpen: Bool { base.isOpen }
     func retryUnlock() throws { try base.retryUnlock() }
     func flushPendingFreePageRelease() { base.flushPendingFreePageRelease() }
     func close() { base.close() }
@@ -539,7 +540,7 @@ enum TestSupport {
         let pasteService = PasteService(
             pasteboard: pasteboard,
             loadContent: { [historyStore] item, scope in
-                (try? historyStore.loadingContent(of: item, scope: scope)) ?? item
+                try historyStore.loadingContent(of: item, scope: scope)
             }
         )
         let coordinator = AppCoordinator(
@@ -580,7 +581,7 @@ enum TestSupport {
             .appendingPathComponent("ClipBookSpiedCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
 
-        let suiteName = "com.ikryanov.clipbook.spied.coordinator.tests.\(UUID().uuidString)"
+        let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
         let userDefaults = try #require(UserDefaults(suiteName: suiteName))
         userDefaults.removePersistentDomain(forName: suiteName)
 
@@ -616,7 +617,7 @@ enum TestSupport {
         let pasteService = PasteService(
             pasteboard: pasteboard,
             loadContent: { [spyStore] item, scope in
-                (try? spyStore.loadingContent(of: item, scope: scope)) ?? item
+                try spyStore.loadingContent(of: item, scope: scope)
             }
         )
         let coordinator = AppCoordinator(

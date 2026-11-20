@@ -1417,11 +1417,19 @@ enum PasteboardAndServicesTests {
                 do {
                     let transientStore = GRDBHistoryStore(directory: supportDir, keyProvider: sharedKeyProvider)
                     _ = try transientStore.fetchAll()
-                    // Re-register store2 by writing/opening on store2, then close store1 and let transientStore deinit:
-                    // wait — store2 opened before transientStore, so closing store1 must NOT unregister transientStore/store2!
+                    // Closing store1 and transientStore must leave store2 registered in ImageAssetStore.keyRegistry.
                     store1.close()
                     transientStore.close()
                 }
+
+                // Verify store2 remains able to decrypt assets right after transientStore closed!
+                let decryptedAfterTransientClose = try ImageAssetStore.readAssetData(
+                    at: encURL,
+                    role: .image,
+                    ownerClipID: clipID,
+                    requiresEncryption: true
+                )
+                #expect(decryptedAfterTransientClose == pngData, "Closing a transient store must not unregister an still-open store's keys")
 
                 // Re-open store3 after store1/transientStore closed and verify store2 closing cannot clobber store3!
                 let store3 = GRDBHistoryStore(directory: supportDir, keyProvider: sharedKeyProvider)

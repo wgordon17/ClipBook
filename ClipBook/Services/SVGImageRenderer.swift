@@ -10,8 +10,10 @@ import os
 /// The markup is parsed and drawn on a queue of its own: the first SVG a launch
 /// draws takes AppKit 40-60 ms to set up, which the history must not wait for.
 @MainActor
-final class SVGImageRenderer {
-  static let shared = SVGImageRenderer()
+final class SVGImageRenderer: @unchecked Sendable {
+  nonisolated static let shared = SVGImageRenderer()
+
+  nonisolated init() {}
 
   /// How bright the drawn parts of a picture are, so it can be put on a
   /// background it stays visible on: a black icon disappears on a dark row.
@@ -69,7 +71,7 @@ final class SVGImageRenderer {
 
   // Text that fails to render is remembered too, so a row does not parse it
   // again every time it is shown.
-  private final class CacheEntry {
+  private nonisolated final class CacheEntry: Sendable {
     let rendering: Rendering?
 
     init(_ rendering: Rendering?) {
@@ -77,18 +79,31 @@ final class SVGImageRenderer {
     }
   }
 
-  private let cache: NSCache<NSString, CacheEntry> = {
+  private struct PendingRender {
+    let id: UInt64
+    let startEpoch: UInt64
+    var callbacks: [(Rendering?) -> Void]
+  }
+
+  nonisolated(unsafe) private let cache: NSCache<NSString, CacheEntry> = {
     let cache = NSCache<NSString, CacheEntry>()
     cache.countLimit = 200
     return cache
   }()
+  private nonisolated let evictionEpoch = OSAllocatedUnfairLock<UInt64>(initialState: 0)
   private nonisolated static let loaders = OSAllocatedUnfairLock(
     initialState: [UUID: @Sendable (UUID) -> String?]()
   )
   // One document at a time: drawing SVG is quick once AppKit is set up, and
   // the rows ask for only the few in view.
-  private let renderQueue = DispatchQueue(label: "com.clipbook.svg-rendering", qos: .userInitiated)
-  private var pendingCompletions: [String: [(Rendering?) -> Void]] = [:]
+  private nonisolated let renderQueue = DispatchQueue(label: "com.clipbook.svg-rendering", qos: .userInitiated)
+  private var nextRenderID: UInt64 = 0
+  private var pendingCompletions: [String: PendingRender] = [:]
+
+  nonisolated func removeAll() {
+    evictionEpoch.withLock { $0 &+= 1 }
+    cache.removeAllObjects()
+  }
 
   nonisolated static func registerTextLoader(
     _ loader: @escaping @Sendable (UUID) -> String?,
@@ -99,6 +114,7 @@ final class SVGImageRenderer {
 
   nonisolated static func unregisterTextLoader(ownerID: UUID) {
     loaders.withLock { _ = $0.removeValue(forKey: ownerID) }
+    shared.removeAll()
   }
 
   private nonisolated static func loadRegisteredSVGText(for id: UUID) -> String? {
@@ -124,12 +140,16 @@ final class SVGImageRenderer {
       return entry.rendering
     }
 
+    let startEpoch = evictionEpoch.withLock { $0 }
     let inlineText = item.isContentLoaded ? item.text : nil
     guard let text = inlineText ?? Self.loadRegisteredSVGText(for: item.id) else {
       return nil
     }
 
     let rendering = Self.render(text)
+    guard evictionEpoch.withLock({ $0 == startEpoch }) else {
+      return nil
+    }
     cache.setObject(CacheEntry(rendering), forKey: key as NSString)
     return rendering
   }
@@ -147,25 +167,59 @@ final class SVGImageRenderer {
       return entry.rendering
     }
 
-    if pendingCompletions[key] != nil {
-      pendingCompletions[key]?.append(completion)
-      return nil
+    let startEpoch = evictionEpoch.withLock { $0 }
+    if var existing = pendingCompletions[key] {
+      if existing.startEpoch == startEpoch {
+        existing.callbacks.append(completion)
+        pendingCompletions[key] = existing
+        return nil
+      }
+      let superseded = existing.callbacks
+      DispatchQueue.main.async {
+        MainActor.assumeIsolated {
+          superseded.forEach { $0(nil) }
+        }
+      }
     }
 
+    nextRenderID &+= 1
+    let renderID = nextRenderID
     let itemID = item.id
     let inlineText = item.isContentLoaded ? item.text : nil
-    pendingCompletions[key] = [completion]
+    pendingCompletions[key] = PendingRender(
+      id: renderID,
+      startEpoch: startEpoch,
+      callbacks: [completion]
+    )
     renderQueue.async {
+      guard self.evictionEpoch.withLock({ $0 == startEpoch }) else {
+        DispatchQueue.main.async {
+          MainActor.assumeIsolated {
+            if self.pendingCompletions[key]?.id == renderID {
+              let callbacks = self.pendingCompletions.removeValue(forKey: key)?.callbacks ?? []
+              callbacks.forEach { $0(nil) }
+            }
+          }
+        }
+        return
+      }
       let resolvedText = inlineText ?? Self.loadRegisteredSVGText(for: itemID)
       let rendering = resolvedText.flatMap(Self.render)
       let didObtainText = resolvedText != nil
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
-          if didObtainText {
+          let isCurrentEpoch = self.evictionEpoch.withLock { $0 == startEpoch }
+          if isCurrentEpoch, didObtainText {
             self.cache.setObject(CacheEntry(rendering), forKey: key as NSString)
           }
-          let completions = self.pendingCompletions.removeValue(forKey: key) ?? []
-          completions.forEach { $0(rendering) }
+          let callbacks: [(Rendering?) -> Void]
+          if self.pendingCompletions[key]?.id == renderID {
+            callbacks = self.pendingCompletions.removeValue(forKey: key)?.callbacks ?? []
+          } else {
+            callbacks = []
+          }
+          let delivered = isCurrentEpoch ? rendering : nil
+          callbacks.forEach { $0(delivered) }
         }
       }
     }

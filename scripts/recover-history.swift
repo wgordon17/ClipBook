@@ -1049,31 +1049,47 @@ private enum CLIParser {
         var index = 0
         while index < arguments.count {
             let arg = arguments[index]
-            switch arg {
+            let flagName: String
+            let inlineValue: String?
+            if arg.hasPrefix("--"), let eqIndex = arg.firstIndex(of: "=") {
+                flagName = String(arg[..<eqIndex])
+                inlineValue = String(arg[arg.index(after: eqIndex)...])
+            } else {
+                flagName = arg
+                inlineValue = nil
+            }
+
+            switch flagName {
             case "-h", "--help":
+                try rejectInlineValue(inlineValue, for: flagName)
                 return .help
             case "--support-dir":
-                supportDirPath = try requireValue(for: arg, arguments: arguments, index: &index)
+                supportDirPath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
             case "--archive":
-                archivePath = try requireValue(for: arg, arguments: arguments, index: &index)
+                archivePath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
             case "--output-dir":
-                outputDirPath = try requireValue(for: arg, arguments: arguments, index: &index)
+                outputDirPath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
             case "--key-file":
-                keyFilePath = try requireValue(for: arg, arguments: arguments, index: &index)
+                keyFilePath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
             case "--key-hex-stdin":
+                try rejectInlineValue(inlineValue, for: flagName)
                 keyHexStdin = true
             case "--include-trashed":
+                try rejectInlineValue(inlineValue, for: flagName)
                 includeTrashed = true
             case "--strict":
+                try rejectInlineValue(inlineValue, for: flagName)
                 strict = true
             case "--passphrase-file":
-                passphraseFilePath = try requireValue(for: arg, arguments: arguments, index: &index)
+                passphraseFilePath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
             case "--passphrase-stdin":
+                try rejectInlineValue(inlineValue, for: flagName)
                 passphraseStdin = true
             case "--allow-test-iterations":
+                try rejectInlineValue(inlineValue, for: flagName)
                 allowTestIterations = true
             default:
-                let sanitizedFlag = arg.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? arg
+                let sanitizedFlag = flagName
                 if sanitizedFlag.hasPrefix("--key") || sanitizedFlag.hasPrefix("--pass") {
                     throw RecoveryFailure.usage(
                         "Raw secrets are never accepted as CLI arguments (\(sanitizedFlag)); use file or stdin flags."
@@ -1156,6 +1172,27 @@ private enum CLIParser {
         }
 
         throw RecoveryFailure.usage("Invalid command configuration.")
+    }
+
+    private static func rejectInlineValue(_ inlineValue: String?, for flag: String) throws {
+        if inlineValue != nil {
+            throw RecoveryFailure.usage("Option \(flag) does not take a value.")
+        }
+    }
+
+    private static func resolveOptionValue(
+        for flag: String,
+        inlineValue: String?,
+        arguments: [String],
+        index: inout Int
+    ) throws -> String {
+        if let inlineValue {
+            guard !inlineValue.isEmpty else {
+                throw RecoveryFailure.usage("Option \(flag) requires a non-empty value.")
+            }
+            return inlineValue
+        }
+        return try requireValue(for: flag, arguments: arguments, index: &index)
     }
 
     private static func requireValue(for flag: String, arguments: [String], index: inout Int) throws -> String {
@@ -1869,14 +1906,23 @@ private enum LocalStoreRecovery {
             throw RowCorruptionError.assetInvalidOrMissing(rawPath)
         }
 
+        let requiresEncryptedAsset = isEncryptedRow || hasEncryptedExtension(rawPath)
+
         let managedSubdirURL = supportDir.appendingPathComponent(role.managedSubdirectory, isDirectory: true)
         let managedSubdirNoSlash = URL(fileURLWithPath: managedSubdirURL.path, isDirectory: false)
         if (try? managedSubdirNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
             throw RowCorruptionError.assetInvalidOrMissing(managedSubdirURL.path)
         }
         var dirStat = stat()
-        guard Darwin.lstat(managedSubdirNoSlash.path, &dirStat) == 0,
-              (dirStat.st_mode & S_IFMT) == S_IFDIR else {
+        if Darwin.lstat(managedSubdirNoSlash.path, &dirStat) != 0 {
+            if errno == ENOENT,
+               !requiresEncryptedAsset,
+               !FileManager.default.fileExists(atPath: managedSubdirNoSlash.path) {
+                return nil
+            }
+            throw RowCorruptionError.assetInvalidOrMissing(managedSubdirURL.path)
+        }
+        guard (dirStat.st_mode & S_IFMT) == S_IFDIR else {
             throw RowCorruptionError.assetInvalidOrMissing(managedSubdirURL.path)
         }
 
@@ -1885,8 +1931,15 @@ private enum LocalStoreRecovery {
             throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
         }
         var fileStat = stat()
-        guard Darwin.lstat(sourceURL.path, &fileStat) == 0,
-              (fileStat.st_mode & S_IFMT) == S_IFREG else {
+        if Darwin.lstat(sourceURL.path, &fileStat) != 0 {
+            if errno == ENOENT,
+               !requiresEncryptedAsset,
+               !FileManager.default.fileExists(atPath: sourceURL.path) {
+                return nil
+            }
+            throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
+        }
+        guard (fileStat.st_mode & S_IFMT) == S_IFREG else {
             throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
         }
 

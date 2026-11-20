@@ -666,7 +666,7 @@ enum AppModelAndLocalizationTests {
             "zh-Hans"
         ]
 
-        private static let c7CatalogKeys: [String] = [
+        private static let persistenceAndArchiveCatalogKeys: [String] = [
             "History Unlocked",
             "History Locked",
             "History Encryption Key Mismatch",
@@ -741,7 +741,7 @@ enum AppModelAndLocalizationTests {
 
             let stringsDict = try #require(root["strings"] as? [String: Any])
 
-            for key in Self.c7CatalogKeys {
+            for key in Self.persistenceAndArchiveCatalogKeys {
                 let entry = try #require(stringsDict[key] as? [String: Any], Comment(rawValue: "Missing xcstrings key: \(key)"))
                 let localizations = try #require(
                     entry["localizations"] as? [String: Any],

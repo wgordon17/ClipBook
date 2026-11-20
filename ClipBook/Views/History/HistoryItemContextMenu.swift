@@ -803,7 +803,10 @@ final class HistoryItemContextMenu {
   // An item with content to hide can have it shown for now, or for good by saying it is
   // not sensitive. Any other item can be hidden by hand.
   private func addSensitiveContentItems(to menu: NSMenu, for item: ClipboardItem) {
-    guard item.kind.canHoldSensitiveContent || item.kind == .image || item.kind == .file,
+    guard item.kind.canHoldSensitiveContent
+            || item.kind == .image
+            || item.kind == .file
+            || item.kind == .color,
           let target else {
       return
     }
