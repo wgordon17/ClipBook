@@ -175,9 +175,9 @@ Fork and Upstream builds interoperate cleanly across preferences and archives wh
 
 - **`GRDB.swift v7.12.0` + `CryptoKit` encryption at rest:**
   - `GRDBHistoryStore` runs on a WAL-mode `DatabasePool` (`auto_vacuum = INCREMENTAL`, `secure_delete = ON`, `trusted_schema = OFF`, `cell_size_check = ON`, `temp_store = MEMORY`) with lazy `clip_contents` offloading (`text`, `qrCodeText`, `rtf`, `html`) so resident `AppModel` headers keep full bodies out of idle RAM and hydrate on demand (`searchQueue` incremental donor reuse for search).
-  - Certificate-signed Release builds store a 256-bit master key (encoded as 64 lowercase hex ASCII bytes) in `~/Library/Keychains/login.keychain-db` (`kSecClassGenericPassword`, service `com.ikryanov.clipbook.v2.encryption`, account `master-key-v1`, `kSecAttrSynchronizable = false`) and derive four domain-separated 256-bit `HKDF<SHA256>` subkeys (`dbColumnAEADKey`, `assetFileAEADKey`, `contentKeyHMACKey`, `keyVerifierHMACKey`, verified at startup against `store_metadata` `'key_verifier_v1'`).
+  - Certificate-signed Release builds store a 256-bit master key (encoded as 64 lowercase hex ASCII bytes) in `~/Library/Keychains/login.keychain-db` (`kSecClassGenericPassword`, service `com.ikryanov.clipbook.v2.encryption`, account `master-key-v1`, `kSecAttrSynchronizable = false`) and derive four domain-separated 256-bit `HKDF<SHA256>` subkeys (`dbColumnAEADKey`, `assetFileAEADKey`, `contentKeyHMACKey`, `keyVerifierHMACKey`, verified at startup against `store_metadata` `'key_verifier_v1'`). When Keychain is locked or the key is unavailable or mismatched at launch, ClipBook pauses clipboard capture instead of resetting `History.sqlite` and surfaces **Unlock History** controls in the History window, menu bar (**Unlock History...**), and **Settings -> Import & Export**.
   - Whenever `SensitiveContent.shouldEncryptAtRest` holds (explicit `.sensitive` mark, concealed clipboard types, or detected credentials/tokens/`otpauth://`/`WIFI:` QR payloads across untruncated `text`, `qrCodeText`, `html`, `rtfData`, `title`, `linkPreviewDetails`, or `filePaths`), all 11 sensitive `clips` and `clip_contents` columns are sealed with `0x01` + `AES-256-GCM` authenticated against `columnAAD(table:column:clipID:)`, and managed external assets under `Images/*.enc` and `LinkPreviews/*.enc` are sealed with `"CBENC01\0"` + `AES-256-GCM` authenticated against `assetAAD(role:clipID:)`.
-  - **Zero-plaintext screenshot staging:** New `.image` captures are written immediately as `0600` `Images/<id>.enc` before background Vision OCR runs on in-memory PNG bytes; once OCR finishes, secret or concealed captures stay encrypted (or purge immediately under `dontSave`) while benign captures demote cleanly to `.png`.
+  - **Zero-plaintext screenshot staging:** New `.image` captures are written immediately as `0600` `Images/<id>.enc` before background Vision OCR runs on in-memory PNG bytes; once OCR finishes, secret or concealed captures stay encrypted (or purge immediately under `dontSave`) while benign captures demote cleanly to `.png`. Any staged `.enc` image whose OCR was interrupted by quit or lock remains protected across export, paste, drag, and preview until recognition resumes on next launch or unlock.
 - **Development & ad-hoc Release storage isolation (`ClipBook2-Debug/`):**
   - `AppDirectories.usesIsolatedDebugStorage` inspects the running process via `SecCodeCopySigningInformation` and routes both `#if DEBUG` builds (`com.ikryanov.clipbook.v2.debug`) and any unsigned or ad-hoc `-configuration Release` build (for example `CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= CODE_SIGN_IDENTITY=-`, `./run.sh --configuration Release`, or `./scripts/release-fork.sh --smoke-test`) to `~/Library/Application Support/ClipBook2-Debug/` with a local `0600` `.devkey` (`FileDatabaseKeyProvider`). Local non-certificate builds never migrate production `~/Library/Application Support/ClipBook2/` or write `cdhash:`-pinned items into `login.keychain-db`.
 - **Unencrypted (`v1`) vs passphrase-encrypted (`v2`) `.clipbookarchive` exports:**
@@ -215,6 +215,24 @@ Fork and Upstream builds interoperate cleanly across preferences and archives wh
       --archive ~/Desktop/Backup.clipbookarchive \
       --output-dir ~/Desktop/Recovered.clipbookarchive
     ```
+
+  `./scripts/recover-history.swift` options (value-taking flags accept both `--flag <value>` and `--flag=<value>`; raw secrets are never accepted as CLI arguments):
+
+  | Option | Description |
+  | --- | --- |
+  | `--support-dir <path>` | Mode A: ClipBook support directory containing `History.sqlite` (`PRAGMA user_version = 5`). |
+  | `--archive <path>` | Mode B: Path to a passphrase-encrypted `formatVersion = 2` `.clipbookarchive`. |
+  | `--output-dir <path>` | Required destination directory for the recovered `formatVersion = 1` `.clipbookarchive`. |
+  | `--key-file <path>` | Mode A: Read 64-character lowercase hex master key from `<path>`. |
+  | `--key-hex-stdin` | Mode A: Read 64-character lowercase hex master key from `stdin`. |
+  | `--include-trashed` | Mode A: Also recover trashed items into `trashed-history.json`. |
+  | `--strict` | Mode A: Abort with exit `1` on any corrupt row or missing encrypted asset instead of isolating UUIDs into `corrupted-items.json`. |
+  | `--passphrase-file <path>` | Mode B: Read archive passphrase from `<path>`. |
+  | `--passphrase-stdin` | Mode B: Read archive passphrase from `stdin`. |
+  | `--allow-test-iterations` | Mode B: Allow PBKDF2 iteration counts down to `1,000` (test suites only). |
+  | `-h`, `--help` | Show help and exit `0`. |
+
+  Exit codes: `0` clean recovery completed, `1` invalid arguments / fatal I/O, schema, or archive error / `--strict` failure, `2` Mode A partial recovery completed (`corrupted-items.json` written), `3` master key or archive passphrase mismatch.
 
 ## License
 
