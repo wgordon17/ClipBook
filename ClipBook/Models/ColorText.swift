@@ -4,14 +4,14 @@ import Foundation
 ///
 /// Colors outside the sRGB gamut, which lab(), lch(), oklab() and oklch() can
 /// describe, are clamped to its nearest edge.
-struct ColorText: Equatable {
+nonisolated struct ColorText: Equatable, Sendable {
     var red: Double
     var green: Double
     var blue: Double
     var alpha: Double
 }
 
-extension ColorText {
+nonisolated extension ColorText {
     /// Reads six and eight digit hex colors and the CSS color functions rgb(),
     /// rgba(), hsl(), hsla(), hwb(), lab(), lch(), oklab() and oklch(), in both
     /// the comma separated and the space separated syntax that CSS allows for
@@ -260,7 +260,7 @@ extension ColorText {
 
     // MARK: - Arguments
 
-    private struct Arguments {
+    private nonisolated struct Arguments: Sendable {
         var channels: [Token]
         var alpha: Token?
 
@@ -303,7 +303,7 @@ extension ColorText {
         }
     }
 
-    private enum Token: Equatable {
+    private nonisolated enum Token: Equatable, Sendable {
         case number(Double)
         case percentage(Double)
         case angle(degrees: Double)

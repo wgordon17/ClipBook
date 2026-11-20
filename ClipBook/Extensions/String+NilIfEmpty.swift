@@ -1,7 +1,7 @@
 import Foundation
 
 extension String {
-    var nilIfEmpty: String? {
+    nonisolated var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
 }
