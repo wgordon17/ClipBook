@@ -835,15 +835,36 @@ struct UpstreamInteropContractTests {
             try fileManager.createDirectory(at: sourceSupport, withIntermediateDirectories: true)
             try fileManager.createDirectory(at: destSupport, withIntermediateDirectories: true)
 
-            let sourceImageURL = sourceSupport.appendingPathComponent("clip-image.png")
-            let sourcePreviewURL = sourceSupport.appendingPathComponent("og-preview.png")
-            let sourceFaviconURL = sourceSupport.appendingPathComponent("favicon.ico")
+            let sourceImagesDir = sourceSupport.appendingPathComponent("Images", isDirectory: true)
+            let sourcePreviewsDir = sourceSupport.appendingPathComponent("LinkPreviews", isDirectory: true)
+            try fileManager.createDirectory(at: sourceImagesDir, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: sourcePreviewsDir, withIntermediateDirectories: true)
+
+            let sourceStore = GRDBHistoryStore(
+                directory: sourceSupport,
+                keyProvider: InMemoryDatabaseKeyProvider()
+            )
+            defer { sourceStore.close() }
+
+            let sourceImageURL = sourceImagesDir.appendingPathComponent("clip-image.png")
             let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x11, 0x22])
             let previewBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x33, 0x44])
             let faviconBytes = Data([0x00, 0x00, 0x01, 0x00, 0x01, 0x00])
             try imageBytes.write(to: sourceImageURL)
-            try previewBytes.write(to: sourcePreviewURL)
-            try faviconBytes.write(to: sourceFaviconURL)
+
+            let linkItemID = UUID()
+            let sourcePreviewURL = try sourceStore.writeManagedAsset(
+                pngData: previewBytes,
+                role: .linkPreview,
+                clipID: linkItemID,
+                encrypted: true
+            )
+            let sourceFaviconURL = try sourceStore.writeManagedAsset(
+                pngData: faviconBytes,
+                role: .linkFavicon,
+                clipID: linkItemID,
+                encrypted: true
+            )
 
             let tag = Tag(id: 9, name: "ArchiveTag", color: "#00AA88")
             let rtfPayload = Data(#"{\rtf1\ansi\b Archived clip with tagOrders\b0}"#.utf8)
@@ -876,6 +897,7 @@ struct UpstreamInteropContractTests {
             )
 
             let linkItem = ClipboardItem.fixture(
+                id: linkItemID,
                 kind: .link,
                 text: "https://example.com/archive",
                 copiedAt: Date(timeIntervalSince1970: 1_700_001_020),
@@ -978,8 +1000,8 @@ struct UpstreamInteropContractTests {
                         url: "https://example.com/archive",
                         title: "Archive Preview",
                         description: "Preview body",
-                        imagePath: "assets/link-previews/og-preview.png",
-                        faviconPath: "assets/link-previews/favicon.ico",
+                        imagePath: "assets/link-previews/\(linkItemID.uuidString)-preview.png",
+                        faviconPath: "assets/link-previews/\(linkItemID.uuidString)-favicon.ico",
                         fetchedAt: Date(timeIntervalSince1970: 1_700_001_015)
                     )
             )
@@ -1016,6 +1038,7 @@ struct UpstreamInteropContractTests {
             #expect(!importedImageHeader.isContentLoaded)
             let importedImage = try destinationStore.loadingContent(of: importedImageHeader, scope: .body)
             #expect(importedImage.qrCodeText == "https://qr.example/archive")
+            #expect(importedImage.imageDigest == destinationStore.computeImageDigest(forPNGData: imageBytes))
             let importedAssetPath = try #require(importedImage.assetPath)
             #expect(try Data(contentsOf: URL(fileURLWithPath: importedAssetPath)) == imageBytes)
 
@@ -1026,6 +1049,182 @@ struct UpstreamInteropContractTests {
             #expect(importedLink.linkPreviewDetails?.title == "Archive Preview")
             #expect(importedLink.linkPreviewDetails?.description == "Preview body")
             #expect(importedLink.linkPreviewDetails?.fetchedAt == Date(timeIntervalSince1970: 1_700_001_015))
+            let destPreviewURL = URL(fileURLWithPath: try #require(importedLink.linkPreviewDetails?.imagePath))
+            let destFaviconURL = URL(fileURLWithPath: try #require(importedLink.linkPreviewDetails?.faviconPath))
+            #expect(destPreviewURL.pathExtension == "enc")
+            #expect(destFaviconURL.pathExtension == "enc")
+            #expect(
+                try ImageAssetStore.readAssetData(
+                    at: destPreviewURL,
+                    role: .linkPreview,
+                    ownerClipID: linkItem.id,
+                    requiresEncryption: true
+                ) == previewBytes
+            )
+            #expect(
+                try ImageAssetStore.readAssetData(
+                    at: destFaviconURL,
+                    role: .linkFavicon,
+                    ownerClipID: linkItem.id,
+                    requiresEncryption: true
+                ) == faviconBytes
+            )
+        }
+    }
+
+    @Test
+    func unencryptedV1ExportDecryptsLocalEncAssetsForUpstreamInterop() throws {
+        let fileManager = FileManager.default
+        try TestSupport.withTemporaryDirectory { workspace in
+            let sourceSupport = workspace.appendingPathComponent("SourceSupport", isDirectory: true)
+            let archiveURL = workspace.appendingPathComponent("UpstreamV1.clipbookarchive", isDirectory: true)
+            let sourceImagesDir = sourceSupport.appendingPathComponent("Images", isDirectory: true)
+            try fileManager.createDirectory(at: sourceImagesDir, withIntermediateDirectories: true)
+
+            let sourceStore = GRDBHistoryStore(
+                directory: sourceSupport,
+                keyProvider: InMemoryDatabaseKeyProvider()
+            )
+            defer { sourceStore.close() }
+
+            let opsTag = try sourceStore.createTag(name: "OpsInterop", color: "#FF6F00")
+            let secTag = try sourceStore.createTag(name: "SecInterop", color: "#3949AB")
+
+            let screenshotPNG = try TestSupport.makePNGData(pixelWidth: 30, pixelHeight: 18, color: .systemIndigo)
+            let previewPNG = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 12, color: .systemMint)
+            let faviconICO = Data([
+                0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10,
+                0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x55, 0xAA
+            ])
+
+            let screenshotID = UUID()
+            let initialPlainScreenshotURL = sourceImagesDir.appendingPathComponent("\(screenshotID.uuidString).png")
+            try screenshotPNG.write(to: initialPlainScreenshotURL)
+
+            let secretOCR = ["gh", "p_", "UPSTREAM_V1_ENC_SCREENSHOT_5566778899001122"].joined()
+            var screenshotItem = ClipboardItem.fixture(
+                id: screenshotID,
+                kind: .image,
+                title: "Encrypted Screenshot For V1 Export",
+                text: "Token \(secretOCR)",
+                qrCodeText: "https://vault.example/qr",
+                assetPath: initialPlainScreenshotURL.path,
+                copiedAt: Date(timeIntervalSince1970: 1_710_400_200),
+                firstCopiedAt: Date(timeIntervalSince1970: 1_710_400_100),
+                isFavorite: true,
+                tags: [opsTag.id, secTag.id],
+                favoriteOrder: 1,
+                sensitivity: .sensitive
+            )
+            screenshotItem.tagOrders = [opsTag.id: 3, secTag.id: 9]
+            let savedScreenshot = try sourceStore.saveAndReconcileItem(screenshotItem, convertingExternalAssets: true)
+            let localEncScreenshotURL = URL(fileURLWithPath: try #require(savedScreenshot.assetPath))
+            #expect(localEncScreenshotURL.pathExtension == "enc")
+            #expect(try Data(contentsOf: localEncScreenshotURL).prefix(ImageAssetStore.encryptedMagic.count) == ImageAssetStore.encryptedMagic)
+
+            let sensitiveLinkID = UUID()
+            let localEncPreviewURL = try sourceStore.writeManagedAsset(
+                pngData: previewPNG,
+                role: .linkPreview,
+                clipID: sensitiveLinkID,
+                encrypted: true
+            )
+            let localEncFaviconURL = try sourceStore.writeManagedAsset(
+                pngData: faviconICO,
+                role: .linkFavicon,
+                clipID: sensitiveLinkID,
+                encrypted: true
+            )
+            #expect(localEncPreviewURL.pathExtension == "enc")
+            #expect(localEncFaviconURL.pathExtension == "enc")
+
+            var sensitiveLinkItem = ClipboardItem.fixture(
+                id: sensitiveLinkID,
+                kind: .link,
+                text: "https://internal.example/portal",
+                copiedAt: Date(timeIntervalSince1970: 1_710_400_300),
+                firstCopiedAt: Date(timeIntervalSince1970: 1_710_400_150),
+                tags: [opsTag.id],
+                linkPreviewDetails: LinkPreviewDetails(
+                    url: "https://internal.example/portal",
+                    title: "Internal Portal",
+                    description: "Sensitive preview",
+                    imagePath: localEncPreviewURL.path,
+                    faviconPath: localEncFaviconURL.path,
+                    fetchedAt: Date(timeIntervalSince1970: 1_710_400_290)
+                ),
+                sensitivity: .sensitive
+            )
+            sensitiveLinkItem.tagOrders = [opsTag.id: 0]
+            _ = try sourceStore.saveAndReconcileItem(sensitiveLinkItem, convertingExternalAssets: false)
+
+            let exportService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: sourceSupport)
+            try exportService.export(
+                items: try sourceStore.fetchAll(),
+                tags: try sourceStore.fetchTags(),
+                to: archiveURL,
+                passphrase: nil,
+                loadItem: { try sourceStore.loadingContent(of: $0, scope: .full) }
+            )
+
+            #expect(try exportService.inspect(at: archiveURL) == ClipBookArchiveInspection(formatVersion: 1, isEncrypted: false))
+
+            // Verify manifest.json has formatVersion == 1, encryption == nil, and matches Upstream manifest keys.
+            let manifestBytes = try Data(contentsOf: archiveURL.appendingPathComponent("manifest.json"))
+            let manifestObj = try #require(try JSONSerialization.jsonObject(with: manifestBytes) as? [String: Any])
+            #expect(Set(manifestObj.keys).isSubset(of: UpstreamInteropStubs.expectedArchiveManifestKeys))
+            #expect(manifestObj["encryption"] == nil)
+
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let decodedFullManifest = try decoder.decode(ClipBookArchiveManifest.self, from: manifestBytes)
+            #expect(decodedFullManifest.formatVersion == 1)
+            #expect(decodedFullManifest.encryption == nil)
+            let upstreamManifest = try decoder.decode(UpstreamInteropStubs.UpstreamArchiveManifestStub.self, from: manifestBytes)
+            #expect(upstreamManifest.formatVersion == 1)
+
+            // Verify raw history.json contains ZERO v2-only keys and decodes cleanly under [UpstreamArchiveItemStub]!
+            let historyBytes = try Data(contentsOf: archiveURL.appendingPathComponent("history.json"))
+            let rawHistoryUTF8 = try #require(String(data: historyBytes, encoding: .utf8))
+            for forbiddenV2Key in ["assetExtension", "imageExtension", "faviconExtension", "expectedAssets"] {
+                #expect(!rawHistoryUTF8.contains("\"\(forbiddenV2Key)\""), "v1 history.json must omit v2 key \(forbiddenV2Key)")
+            }
+
+            let historyJSONArray = try #require(try JSONSerialization.jsonObject(with: historyBytes) as? [[String: Any]])
+            #expect(historyJSONArray.count == 2)
+            for itemDict in historyJSONArray {
+                #expect(Set(itemDict.keys).isSubset(of: UpstreamInteropStubs.expectedArchiveItemKeys))
+                if let previewDict = itemDict["linkPreviewDetails"] as? [String: Any] {
+                    #expect(Set(previewDict.keys).isSubset(of: UpstreamInteropStubs.expectedArchiveLinkPreviewDetailsKeys))
+                }
+            }
+
+            let upstreamItems = try decoder.decode([UpstreamInteropStubs.UpstreamArchiveItemStub].self, from: historyBytes)
+            let upstreamByID = Dictionary(uniqueKeysWithValues: upstreamItems.map { ($0.id, $0) })
+
+            let exportedScreenshot = try #require(upstreamByID[screenshotID])
+            #expect(exportedScreenshot.tagIDs == [String(opsTag.id), String(secTag.id)])
+            #expect(exportedScreenshot.tagNames == ["OpsInterop", "SecInterop"])
+            #expect(exportedScreenshot.tagOrders == [String(opsTag.id): 3, String(secTag.id): 9])
+            #expect(exportedScreenshot.sensitivity == ItemSensitivity.sensitive.rawValue)
+            let relImagePath = try #require(exportedScreenshot.assetPath)
+            #expect(relImagePath == "assets/images/\(screenshotID.uuidString).png")
+            let exportedImageData = try Data(contentsOf: archiveURL.appendingPathComponent(relImagePath))
+            #expect(exportedImageData.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+            #expect(exportedImageData == screenshotPNG)
+
+            let exportedLink = try #require(upstreamByID[sensitiveLinkID])
+            #expect(exportedLink.tagOrders == [String(opsTag.id): 0])
+            let relPreviewPath = try #require(exportedLink.linkPreviewDetails?.imagePath)
+            let relFaviconPath = try #require(exportedLink.linkPreviewDetails?.faviconPath)
+            #expect(relPreviewPath == "assets/link-previews/\(sensitiveLinkID.uuidString)-preview.png")
+            #expect(relFaviconPath == "assets/link-previews/\(sensitiveLinkID.uuidString)-favicon.ico")
+            let exportedPreviewData = try Data(contentsOf: archiveURL.appendingPathComponent(relPreviewPath))
+            let exportedFaviconData = try Data(contentsOf: archiveURL.appendingPathComponent(relFaviconPath))
+            #expect(exportedPreviewData.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+            #expect(exportedFaviconData.prefix(4) == Data([0x00, 0x00, 0x01, 0x00]))
+            #expect(exportedPreviewData == previewPNG)
+            #expect(exportedFaviconData == faviconICO)
         }
     }
 

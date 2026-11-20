@@ -45,12 +45,21 @@ nonisolated struct ClipBookDerivedKeys: Sendable {
     }
 }
 
+nonisolated struct ClipBookArchiveDerivedKeys: Sendable {
+    let aeadKey: SymmetricKey
+    let verifierHMACKey: SymmetricKey
+}
+
 nonisolated enum HistoryCrypto {
     static let columnFormatVersion: UInt8 = 0x01
     static let aadFormatVersion: UInt8 = 0x01
+    static let archiveFormatVersion: UInt8 = 0x02
     static let contentKeyFormatVersion: UInt8 = 0x01
     static let minimumSealedColumnLength = 29
+    static let archiveEntryMagic = Data("CBARC02\0".utf8)
+    static let minimumSealedArchiveEntryLength = 36
     static let keyVerifierContext = Data("clipbook-key-verifier-v1".utf8)
+    static let archiveKeyVerifierPrefix = "clipbook-archive-v2-verifier\0"
     static let imageDigestDomainPrefix = Data("image-v1\0".utf8)
 
     static let productionKDFIterations = 600_000
@@ -60,6 +69,7 @@ nonisolated enum HistoryCrypto {
     static let archiveSaltByteCount = 32
     static let archiveDerivedKeyByteCount = 32
     static let archiveAEADHKDFInfo = Data("clipbook.archive.aes256gcm.v2".utf8)
+    static let archiveKeyVerifierHKDFInfo = Data("clipbook.archive.keyverifier.hmacsha256.v2".utf8)
 
     static func columnAAD(table: String, column: String, clipID: UUID) -> Data {
         let tableUTF8 = Data(table.utf8)
@@ -204,13 +214,13 @@ nonisolated enum HistoryCrypto {
         return Data(hmac.finalize())
     }
 
-    static func deriveArchiveAEADKey(
+    static func deriveArchiveKeys(
         passphrase: String,
         salt: Data,
         iterations: Int,
         archiveID: UUID,
         allowTestIterations: Bool = false
-    ) throws -> SymmetricKey {
+    ) throws -> ClipBookArchiveDerivedKeys {
         let nfc = passphrase.precomposedStringWithCanonicalMapping
         let minIterations = allowTestIterations ? minimumTestKDFIterations : minimumProductionKDFIterations
         guard !nfc.isEmpty,
@@ -260,11 +270,146 @@ nonisolated enum HistoryCrypto {
         }
 
         let archiveMasterKey = derivedBytes.withUnsafeBytes { SymmetricKey(data: $0) }
-        return HKDF<SHA256>.deriveKey(
+        let hkdfSalt = Data(archiveID.uuidString.lowercased().utf8)
+        let aeadKey = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: archiveMasterKey,
-            salt: Data(archiveID.uuidString.lowercased().utf8),
+            salt: hkdfSalt,
             info: archiveAEADHKDFInfo,
             outputByteCount: 32
+        )
+        let verifierHMACKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: archiveMasterKey,
+            salt: hkdfSalt,
+            info: archiveKeyVerifierHKDFInfo,
+            outputByteCount: 32
+        )
+        return ClipBookArchiveDerivedKeys(aeadKey: aeadKey, verifierHMACKey: verifierHMACKey)
+    }
+
+    static func deriveArchiveAEADKey(
+        passphrase: String,
+        salt: Data,
+        iterations: Int,
+        archiveID: UUID,
+        allowTestIterations: Bool = false
+    ) throws -> SymmetricKey {
+        try deriveArchiveKeys(
+            passphrase: passphrase,
+            salt: salt,
+            iterations: iterations,
+            archiveID: archiveID,
+            allowTestIterations: allowTestIterations
+        ).aeadKey
+    }
+
+    static func archiveEntryAAD(
+        archiveID: UUID,
+        manifestDigest: Data,
+        relativePath: String
+    ) throws -> Data {
+        let pathUTF8 = Data(relativePath.utf8)
+        guard manifestDigest.count == SHA256.byteCount,
+              pathUTF8.count <= Int(UInt16.max) else {
+            throw HistoryStoreError.invalidArchiveKeyParameters
+        }
+
+        var aad = Data(capacity: 1 + 16 + SHA256.byteCount + 2 + pathUTF8.count)
+        aad.append(archiveFormatVersion)
+        withUnsafeBytes(of: archiveID.uuid) { uuidBytes in
+            aad.append(contentsOf: uuidBytes)
+        }
+        aad.append(manifestDigest)
+        var pathLengthBE = UInt16(pathUTF8.count).bigEndian
+        withUnsafeBytes(of: &pathLengthBE) { lengthBytes in
+            aad.append(contentsOf: lengthBytes)
+        }
+        aad.append(pathUTF8)
+        return aad
+    }
+
+    static func sealArchiveEntry(
+        _ plaintext: Data,
+        key: SymmetricKey,
+        archiveID: UUID,
+        manifestDigest: Data,
+        relativePath: String
+    ) throws -> Data {
+        let aad = try archiveEntryAAD(
+            archiveID: archiveID,
+            manifestDigest: manifestDigest,
+            relativePath: relativePath
+        )
+        let nonce = AES.GCM.Nonce()
+        let sealedBox: AES.GCM.SealedBox
+        do {
+            sealedBox = try AES.GCM.seal(
+                plaintext,
+                using: key,
+                nonce: nonce,
+                authenticating: aad
+            )
+        } catch {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        guard let combined = sealedBox.combined else {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        var blob = Data(capacity: archiveEntryMagic.count + combined.count)
+        blob.append(archiveEntryMagic)
+        blob.append(combined)
+        return blob
+    }
+
+    static func openArchiveEntry(
+        _ blob: Data,
+        key: SymmetricKey,
+        archiveID: UUID,
+        manifestDigest: Data,
+        relativePath: String
+    ) throws -> Data {
+        let aad = try archiveEntryAAD(
+            archiveID: archiveID,
+            manifestDigest: manifestDigest,
+            relativePath: relativePath
+        )
+        guard blob.count >= minimumSealedArchiveEntryLength,
+              blob.prefix(archiveEntryMagic.count) == archiveEntryMagic else {
+            throw HistoryStoreError.authenticationFailed
+        }
+
+        do {
+            let sealedBox = try AES.GCM.SealedBox(combined: Data(blob.dropFirst(archiveEntryMagic.count)))
+            return try AES.GCM.open(
+                sealedBox,
+                using: key,
+                authenticating: aad
+            )
+        } catch {
+            throw HistoryStoreError.authenticationFailed
+        }
+    }
+
+    static func makeArchiveKeyVerifier(verifierKey: SymmetricKey, archiveID: UUID) -> Data {
+        let context = Data((archiveKeyVerifierPrefix + archiveID.uuidString.lowercased()).utf8)
+        let mac = HMAC<SHA256>.authenticationCode(for: context, using: verifierKey)
+        return Data(mac)
+    }
+
+    static func verifyArchiveKeyVerifier(
+        _ verifier: Data,
+        verifierKey: SymmetricKey,
+        archiveID: UUID
+    ) -> Bool {
+        guard verifier.count == SHA256.byteCount else {
+            return false
+        }
+        let context = Data((archiveKeyVerifierPrefix + archiveID.uuidString.lowercased()).utf8)
+        return HMAC<SHA256>.isValidAuthenticationCode(
+            verifier,
+            authenticating: context,
+            using: verifierKey
         )
     }
 

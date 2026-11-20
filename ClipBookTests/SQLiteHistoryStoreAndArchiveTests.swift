@@ -2004,9 +2004,14 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let designTag = try sourceStore.createTag(name: "Design", color: "#E91E63")
                 let docsTag = try sourceStore.createTag(name: "Docs", color: "#2196F3")
 
-                let sourceImageURL = sourceSupportDir.appendingPathComponent("diagram.png")
-                let sourcePreviewImageURL = sourceSupportDir.appendingPathComponent("og-image.png")
-                let sourceFaviconURL = sourceSupportDir.appendingPathComponent("favicon.ico")
+                let sourceImagesDir = sourceSupportDir.appendingPathComponent("Images", isDirectory: true)
+                let sourcePreviewsDir = sourceSupportDir.appendingPathComponent("LinkPreviews", isDirectory: true)
+                try fileManager.createDirectory(at: sourceImagesDir, withIntermediateDirectories: true)
+                try fileManager.createDirectory(at: sourcePreviewsDir, withIntermediateDirectories: true)
+
+                let sourceImageURL = sourceImagesDir.appendingPathComponent("diagram.png")
+                let sourcePreviewImageURL = sourcePreviewsDir.appendingPathComponent("og-image.png")
+                let sourceFaviconURL = sourcePreviewsDir.appendingPathComponent("favicon.ico")
                 let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x10, 0x20, 0x30])
                 let previewImageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x40, 0x50, 0x60])
                 let faviconBytes = Data([0x00, 0x00, 0x01, 0x00, 0x01, 0x00])
@@ -2123,7 +2128,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let loadedImage = try targetStore.loadingContent(of: importedImage, scope: .body)
                 #expect(loadedImage.text == "OCR Diagram Text")
                 #expect(loadedImage.qrCodeText == "https://example.com/mockup")
-                #expect(importedImage.imageDigest == ContentDigest.sha256(imageBytes))
+                #expect(importedImage.imageDigest == targetStore.computeImageDigest(forPNGData: imageBytes))
                 let importedImagePath = try #require(importedImage.assetPath)
                 #expect(try Data(contentsOf: URL(fileURLWithPath: importedImagePath)) == imageBytes)
 
@@ -2314,6 +2319,1068 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let previewsDirectory = supportDir.appendingPathComponent("LinkPreviews", isDirectory: true)
                 #expect(((try? fileManager.contentsOfDirectory(atPath: previewsDirectory.path)) ?? []).isEmpty)
             }
+        }
+
+        @Test
+        func encryptedV2ArchiveRoundTripAndZeroCleartextScan() throws {
+            try TestSupport.withTemporaryDirectory { rootDir in
+                let fileManager = FileManager.default
+                let sourceSupportDir = rootDir.appendingPathComponent("SourceSupport", isDirectory: true)
+                let targetSupportDir = rootDir.appendingPathComponent("TargetSupport", isDirectory: true)
+                let archiveURL = rootDir.appendingPathComponent("Backup.clipbookarchive", isDirectory: true)
+                let sourceImagesDir = sourceSupportDir.appendingPathComponent("Images", isDirectory: true)
+                let sourcePreviewsDir = sourceSupportDir.appendingPathComponent("LinkPreviews", isDirectory: true)
+                try fileManager.createDirectory(at: sourceImagesDir, withIntermediateDirectories: true)
+                try fileManager.createDirectory(at: sourcePreviewsDir, withIntermediateDirectories: true)
+                try fileManager.createDirectory(at: targetSupportDir, withIntermediateDirectories: true)
+
+                let sourceKeyProvider = InMemoryDatabaseKeyProvider()
+                let targetKeyProvider = InMemoryDatabaseKeyProvider()
+                let sourceStore = GRDBHistoryStore(directory: sourceSupportDir, keyProvider: sourceKeyProvider)
+                defer { sourceStore.close() }
+
+                let vaultTagAlpha = try sourceStore.createTag(name: "VaultTagAlpha", color: "#E91E63")
+                let vaultTagBeta = try sourceStore.createTag(name: "VaultTagBeta", color: "#00BCD4")
+
+                let plainImageBytes = try TestSupport.makePNGData(pixelWidth: 28, pixelHeight: 20, color: .systemGreen)
+                let sensitiveImageBytes = try TestSupport.makePNGData(pixelWidth: 36, pixelHeight: 24, color: .systemOrange)
+                let plainPreviewBytes = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 16, color: .systemTeal)
+                let sensitivePreviewBytes = try TestSupport.makePNGData(pixelWidth: 22, pixelHeight: 18, color: .systemPurple)
+                let plainFaviconBytes = Data([
+                    0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10,
+                    0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0xAA, 0xBB
+                ])
+                let sensitiveFaviconBytes = Data([
+                    0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10,
+                    0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0xCC, 0xDD
+                ])
+
+                let plainImageID = UUID()
+                let plainImageURL = try sourceStore.writeManagedAsset(
+                    pngData: plainImageBytes,
+                    role: .image,
+                    clipID: plainImageID,
+                    encrypted: false
+                )
+
+                let plainLinkID = UUID()
+                let plainPreviewURL = try sourceStore.writeManagedAsset(
+                    pngData: plainPreviewBytes,
+                    role: .linkPreview,
+                    clipID: plainLinkID,
+                    encrypted: false
+                )
+                let plainFaviconURL = try sourceStore.writeManagedAsset(
+                    pngData: plainFaviconBytes,
+                    role: .linkFavicon,
+                    clipID: plainLinkID,
+                    encrypted: false,
+                    preferredPlainExtension: "ico"
+                )
+                #expect(plainFaviconURL.pathExtension == "ico")
+
+                let sensitiveImageID = UUID()
+                let stagedPlainBeforeEncrypt = sourceImagesDir.appendingPathComponent("\(sensitiveImageID.uuidString).png")
+                try sensitiveImageBytes.write(to: stagedPlainBeforeEncrypt)
+
+                let sensitiveLinkID = UUID()
+                let sensitivePreviewURL = try sourceStore.writeManagedAsset(
+                    pngData: sensitivePreviewBytes,
+                    role: .linkPreview,
+                    clipID: sensitiveLinkID,
+                    encrypted: true
+                )
+                let sensitiveFaviconURL = try sourceStore.writeManagedAsset(
+                    pngData: sensitiveFaviconBytes,
+                    role: .linkFavicon,
+                    clipID: sensitiveLinkID,
+                    encrypted: true
+                )
+
+                let secretOCRToken = ["gh", "p_", "V2ArchiveSensitiveOCRToken8877665544332211"].joined()
+                let secretTextToken = ["sk", "-proj-", "V2ArchiveSecretBodyToken9988776655443322"].joined()
+                let richBodyText = "FormattedArchiveBodyCanary2026"
+                let richHTML = "<article><strong>FormattedArchiveBodyCanary2026</strong></article>"
+                let richRTF = try TestSupport.makeRTFData(text: richBodyText)
+
+                var richItem = ClipboardItem.fixture(
+                    kind: .richText,
+                    title: "RichSpecCanaryTitle",
+                    text: richBodyText,
+                    rtfData: richRTF,
+                    html: richHTML,
+                    copiedAt: Date(timeIntervalSince1970: 1_710_200_100),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_710_200_000),
+                    isFavorite: true,
+                    tags: [vaultTagAlpha.id, vaultTagBeta.id],
+                    copyCount: 3,
+                    favoriteOrder: 4,
+                    sensitivity: .notSensitive
+                )
+                richItem.tagOrders = [vaultTagAlpha.id: 2, vaultTagBeta.id: 7]
+
+                let plainImageItem = ClipboardItem.fixture(
+                    id: plainImageID,
+                    kind: .image,
+                    title: "PlainDiagramCanaryTitle",
+                    text: "PlainDiagramOCRCanaryText",
+                    qrCodeText: "https://plain-qr.example/diagram-canary",
+                    assetPath: plainImageURL.path,
+                    imageDigest: sourceStore.computeImageDigest(forPNGData: plainImageBytes),
+                    copiedAt: Date(timeIntervalSince1970: 1_710_200_200),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_710_200_010),
+                    tags: [vaultTagAlpha.id]
+                )
+
+                let plainLinkItem = ClipboardItem.fixture(
+                    id: plainLinkID,
+                    kind: .link,
+                    text: "https://public-docs.example/reference-canary",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_200_300),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_710_200_020),
+                    tags: [vaultTagBeta.id],
+                    linkPreviewDetails: LinkPreviewDetails(
+                        url: "https://public-docs.example/reference-canary",
+                        title: "PublicReferencePreviewCanary",
+                        description: "PublicPreviewDescriptionCanary",
+                        imagePath: plainPreviewURL.path,
+                        faviconPath: plainFaviconURL.path,
+                        fetchedAt: Date(timeIntervalSince1970: 1_710_200_290)
+                    )
+                )
+
+                var sensitiveImageItem = ClipboardItem.fixture(
+                    id: sensitiveImageID,
+                    kind: .image,
+                    title: "SensitiveReceiptCanaryTitle",
+                    text: "OCR Prefix \(secretOCRToken)",
+                    qrCodeText: "otpauth://totp/VaultExample:alice?secret=JBSWY3DPEHPK3PXP",
+                    assetPath: stagedPlainBeforeEncrypt.path,
+                    copiedAt: Date(timeIntervalSince1970: 1_710_200_400),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_710_200_030),
+                    tags: [vaultTagAlpha.id]
+                )
+                sensitiveImageItem.tagOrders = [vaultTagAlpha.id: 1]
+
+                let sensitiveLinkItem = ClipboardItem.fixture(
+                    id: sensitiveLinkID,
+                    kind: .link,
+                    text: "https://internal-vault.example/admin-token-canary",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_200_500),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_710_200_040),
+                    linkPreviewDetails: LinkPreviewDetails(
+                        url: "https://internal-vault.example/admin-token-canary",
+                        title: "InternalAdminPreviewCanary",
+                        description: "SensitiveLinkDescriptionCanary",
+                        imagePath: sensitivePreviewURL.path,
+                        faviconPath: sensitiveFaviconURL.path,
+                        fetchedAt: Date(timeIntervalSince1970: 1_710_200_490)
+                    ),
+                    sensitivity: .sensitive
+                )
+
+                let secretTextItem = ClipboardItem.fixture(
+                    kind: .text,
+                    title: "ProdAPIKeyCanaryTitle",
+                    text: "API credential \(secretTextToken)",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_200_600),
+                    firstCopiedAt: Date(timeIntervalSince1970: 1_710_200_050),
+                    isFavorite: true,
+                    tags: [vaultTagBeta.id],
+                    favoriteOrder: 1
+                )
+
+                #expect(SensitiveContent.shouldEncryptAtRest(sensitiveImageItem))
+                #expect(SensitiveContent.shouldEncryptAtRest(sensitiveLinkItem))
+                #expect(SensitiveContent.shouldEncryptAtRest(secretTextItem))
+
+                _ = try sourceStore.saveAndReconcileItem(richItem, convertingExternalAssets: true)
+                _ = try sourceStore.saveAndReconcileItem(plainImageItem, convertingExternalAssets: true)
+                _ = try sourceStore.saveAndReconcileItem(plainLinkItem, convertingExternalAssets: true)
+                let savedSensitiveImage = try sourceStore.saveAndReconcileItem(sensitiveImageItem, convertingExternalAssets: true)
+                _ = try sourceStore.saveAndReconcileItem(sensitiveLinkItem, convertingExternalAssets: false)
+                _ = try sourceStore.saveAndReconcileItem(secretTextItem, convertingExternalAssets: true)
+
+                #expect(URL(fileURLWithPath: try #require(savedSensitiveImage.assetPath)).pathExtension == "enc")
+                #expect(!fileManager.fileExists(atPath: stagedPlainBeforeEncrypt.path))
+
+                let unloadedSourceItems = try sourceStore.fetchAll()
+                #expect(unloadedSourceItems.count == 6)
+                #expect(unloadedSourceItems.allSatisfy { !$0.isContentLoaded })
+
+                // Production 600,000 PBKDF2 iterations with NFD passphrase -> NFC verification & import.
+                let sourceArchiveService = ClipBookArchiveService(
+                    fileManager: fileManager,
+                    supportDirectory: sourceSupportDir
+                )
+                #expect(sourceArchiveService.kdfIterations == 600_000)
+                #expect(!sourceArchiveService.allowTestIterations)
+
+                let nfdPassphrase = "caf\u{0065}\u{0301}-backup"
+                let nfcPassphrase = "caf\u{00E9}-backup"
+                #expect(Array(nfdPassphrase.utf8) != Array(nfcPassphrase.utf8))
+
+                try sourceArchiveService.export(
+                    items: unloadedSourceItems,
+                    tags: try sourceStore.fetchTags(),
+                    to: archiveURL,
+                    passphrase: nfdPassphrase,
+                    loadItem: { item in
+                        try sourceStore.loadingContent(of: item, scope: .full)
+                    }
+                )
+
+                let inspection = try sourceArchiveService.inspect(at: archiveURL)
+                #expect(inspection == ClipBookArchiveInspection(formatVersion: 2, isEncrypted: true))
+
+                // Enumerate every file in Backup.clipbookarchive normalizing symlinked /var -> /private/var paths.
+                let canonicalArchiveRoot = archiveURL.resolvingSymlinksInPath().standardizedFileURL
+                let rootPrefix = canonicalArchiveRoot.path.hasSuffix("/")
+                    ? canonicalArchiveRoot.path
+                    : (canonicalArchiveRoot.path + "/")
+                let enumerator = try #require(
+                    fileManager.enumerator(
+                        at: canonicalArchiveRoot,
+                        includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+                        options: []
+                    )
+                )
+                var relativeRegularFiles: [String: URL] = [:]
+                for case let entryURL as URL in enumerator {
+                    let resolvedEntry = entryURL.resolvingSymlinksInPath().standardizedFileURL
+                    #expect(resolvedEntry.path.hasPrefix(rootPrefix))
+                    let relPath = String(resolvedEntry.path.dropFirst(rootPrefix.count))
+                    let values = try resolvedEntry.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+                    if values.isRegularFile == true {
+                        relativeRegularFiles[relPath] = resolvedEntry
+                    }
+                }
+
+                let expectedEncryptedAssetPaths: Set<String> = [
+                    "assets/images/\(plainImageID.uuidString).enc",
+                    "assets/images/\(sensitiveImageID.uuidString).enc",
+                    "assets/link-previews/\(plainLinkID.uuidString)-preview.enc",
+                    "assets/link-previews/\(plainLinkID.uuidString)-favicon.enc",
+                    "assets/link-previews/\(sensitiveLinkID.uuidString)-preview.enc",
+                    "assets/link-previews/\(sensitiveLinkID.uuidString)-favicon.enc"
+                ]
+                let expectedAllFiles = Set(["manifest.json", "tags.json.enc", "history.json.enc"]).union(expectedEncryptedAssetPaths)
+                #expect(Set(relativeRegularFiles.keys) == expectedAllFiles)
+
+                let manifestBytes = try Data(contentsOf: try #require(relativeRegularFiles["manifest.json"]))
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let manifest = try decoder.decode(ClipBookArchiveManifest.self, from: manifestBytes)
+                #expect(manifest.formatVersion == 2)
+                #expect(manifest.encryption?.kdf == "PBKDF2-HMAC-SHA256")
+                #expect(manifest.encryption?.algorithm == "AES-256-GCM")
+                #expect(manifest.encryption?.iterations == 600_000)
+
+                // Zero-cleartext scan across UTF-8, UTF-16LE, UTF-16BE, Base64 alignments, and PNG/ICO magic headers!
+                let cleartextStrings = [
+                    "VaultTagAlpha",
+                    "VaultTagBeta",
+                    richBodyText,
+                    "RichSpecCanaryTitle",
+                    "PlainDiagramCanaryTitle",
+                    "PlainDiagramOCRCanaryText",
+                    "https://plain-qr.example/diagram-canary",
+                    "https://public-docs.example/reference-canary",
+                    "PublicReferencePreviewCanary",
+                    "PublicPreviewDescriptionCanary",
+                    "SensitiveReceiptCanaryTitle",
+                    secretOCRToken,
+                    "otpauth://totp/VaultExample:alice",
+                    "https://internal-vault.example/admin-token-canary",
+                    "InternalAdminPreviewCanary",
+                    "SensitiveLinkDescriptionCanary",
+                    "ProdAPIKeyCanaryTitle",
+                    secretTextToken
+                ]
+                var allForbiddenPatterns: [(label: String, bytes: Data)] = []
+                for needle in cleartextStrings {
+                    for encoded in Self.encodedPatterns(for: needle) {
+                        allForbiddenPatterns.append(("\(needle)[\(encoded.label)]", encoded.bytes))
+                    }
+                }
+                let pngMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+                let icoMagic = Data([0x00, 0x00, 0x01, 0x00, 0x01, 0x00])
+
+                for (relPath, fileURL) in relativeRegularFiles {
+                    let rawData = try Data(contentsOf: fileURL)
+                    for pattern in allForbiddenPatterns {
+                        #expect(
+                            rawData.range(of: pattern.bytes) == nil,
+                            "Cleartext pattern \(pattern.label) leaked into \(relPath)"
+                        )
+                    }
+                    if relPath != "manifest.json" {
+                        #expect(relPath.hasSuffix(".enc"))
+                        #expect(rawData.prefix(HistoryCrypto.archiveEntryMagic.count) == HistoryCrypto.archiveEntryMagic)
+                        #expect(rawData.range(of: pngMagic) == nil, "PNG magic leaked into \(relPath)")
+                        #expect(rawData.range(of: icoMagic) == nil, "ICO magic leaked into \(relPath)")
+                    }
+                }
+
+                // Import into targetStore with a DISTINCT keyProvider using NFC passphrase!
+                let targetStore = GRDBHistoryStore(directory: targetSupportDir, keyProvider: targetKeyProvider)
+                defer { targetStore.close() }
+                #expect(
+                    sourceStore.computeImageDigest(forPNGData: plainImageBytes)
+                        != targetStore.computeImageDigest(forPNGData: plainImageBytes)
+                )
+
+                let targetArchiveService = ClipBookArchiveService(
+                    fileManager: fileManager,
+                    supportDirectory: targetSupportDir
+                )
+                try targetArchiveService.verifyPassphrase(nfcPassphrase, at: archiveURL)
+
+                let importResult = try targetArchiveService.import(
+                    from: archiveURL,
+                    into: targetStore,
+                    passphrase: nfcPassphrase
+                )
+                #expect(importResult.itemCount == 6)
+                #expect(importResult.tagCount == 2)
+
+                let importedTags = try targetStore.fetchTags()
+                let tagIDByName = Dictionary(uniqueKeysWithValues: importedTags.map { ($0.name, $0.id) })
+                let targetAlphaID = try #require(tagIDByName["VaultTagAlpha"])
+                let targetBetaID = try #require(tagIDByName["VaultTagBeta"])
+
+                let importedByID = Dictionary(uniqueKeysWithValues: try targetStore.fetchAll().map { ($0.id, $0) })
+                let targetDBURL = targetSupportDir.appendingPathComponent("History.sqlite")
+
+                // 1. Rich non-sensitive item: isEncrypted == 0, preserves tagOrders, favoriteOrder, HTML, and RTF.
+                let importedRich = try targetStore.loadingContent(of: try #require(importedByID[richItem.id]), scope: .full)
+                #expect(try Self.queryIsEncrypted(at: targetDBURL, clipID: richItem.id) == 0)
+                #expect(importedRich.favoriteOrder == 4)
+                #expect(importedRich.tagOrders == [targetAlphaID: 2, targetBetaID: 7])
+                #expect(importedRich.html == richHTML)
+                #expect(importedRich.rtfData == richRTF)
+
+                // 2. Non-sensitive image & link-preview: sanitized .png / .ico extensions (NEVER .enc), isEncrypted == 0, keyed imageDigest.
+                let importedPlainImage = try targetStore.loadingContent(of: try #require(importedByID[plainImageID]), scope: .body)
+                #expect(try Self.queryIsEncrypted(at: targetDBURL, clipID: plainImageID) == 0)
+                #expect(importedPlainImage.imageDigest == targetStore.computeImageDigest(forPNGData: plainImageBytes))
+                #expect(importedPlainImage.imageDimensions?.width == 28)
+                #expect(importedPlainImage.imageDimensions?.height == 20)
+                let targetPlainImageURL = URL(fileURLWithPath: try #require(importedPlainImage.assetPath))
+                #expect(targetPlainImageURL.pathExtension == "png")
+                #expect(try Data(contentsOf: targetPlainImageURL) == plainImageBytes)
+
+                let importedPlainLink = try #require(importedByID[plainLinkID])
+                #expect(try Self.queryIsEncrypted(at: targetDBURL, clipID: plainLinkID) == 0)
+                let targetPlainPreviewURL = URL(fileURLWithPath: try #require(importedPlainLink.linkPreviewDetails?.imagePath))
+                let targetPlainFaviconURL = URL(fileURLWithPath: try #require(importedPlainLink.linkPreviewDetails?.faviconPath))
+                #expect(targetPlainPreviewURL.pathExtension == "png")
+                #expect(targetPlainFaviconURL.pathExtension == "ico")
+                #expect(try Data(contentsOf: targetPlainPreviewURL) == plainPreviewBytes)
+                #expect(try Data(contentsOf: targetPlainFaviconURL) == plainFaviconBytes)
+
+                // 3. Sensitive image, sensitive link-preview, and secret text: .enc in TargetSupport, isEncrypted == 1, readable under targetStore's distinct key!
+                let importedSensImage = try targetStore.loadingContent(of: try #require(importedByID[sensitiveImageID]), scope: .body)
+                #expect(try Self.queryIsEncrypted(at: targetDBURL, clipID: sensitiveImageID) == 1)
+                #expect(importedSensImage.tagOrders == [targetAlphaID: 1])
+                #expect(importedSensImage.imageDigest == targetStore.computeImageDigest(forPNGData: sensitiveImageBytes))
+                #expect(importedSensImage.text == "OCR Prefix \(secretOCRToken)")
+                let targetSensImageURL = URL(fileURLWithPath: try #require(importedSensImage.assetPath))
+                #expect(targetSensImageURL.pathExtension == "enc")
+                #expect(try Data(contentsOf: targetSensImageURL).prefix(ImageAssetStore.encryptedMagic.count) == ImageAssetStore.encryptedMagic)
+                #expect(
+                    try ImageAssetStore.readAssetData(
+                        at: targetSensImageURL,
+                        role: .image,
+                        ownerClipID: sensitiveImageID,
+                        requiresEncryption: true
+                    ) == sensitiveImageBytes
+                )
+
+                let importedSensLink = try #require(importedByID[sensitiveLinkID])
+                #expect(try Self.queryIsEncrypted(at: targetDBURL, clipID: sensitiveLinkID) == 1)
+                let targetSensPreviewURL = URL(fileURLWithPath: try #require(importedSensLink.linkPreviewDetails?.imagePath))
+                let targetSensFaviconURL = URL(fileURLWithPath: try #require(importedSensLink.linkPreviewDetails?.faviconPath))
+                #expect(targetSensPreviewURL.pathExtension == "enc")
+                #expect(targetSensFaviconURL.pathExtension == "enc")
+                #expect(
+                    try ImageAssetStore.readAssetData(
+                        at: targetSensPreviewURL,
+                        role: .linkPreview,
+                        ownerClipID: sensitiveLinkID,
+                        requiresEncryption: true
+                    ) == sensitivePreviewBytes
+                )
+                #expect(
+                    try ImageAssetStore.readAssetData(
+                        at: targetSensFaviconURL,
+                        role: .linkFavicon,
+                        ownerClipID: sensitiveLinkID,
+                        requiresEncryption: true
+                    ) == sensitiveFaviconBytes
+                )
+
+                let importedSecretText = try targetStore.loadingContent(of: try #require(importedByID[secretTextItem.id]), scope: .body)
+                #expect(try Self.queryIsEncrypted(at: targetDBURL, clipID: secretTextItem.id) == 1)
+                #expect(importedSecretText.favoriteOrder == 1)
+                #expect(importedSecretText.text == "API credential \(secretTextToken)")
+            }
+        }
+
+        @Test
+        func encryptedV2TamperKDFBoundsSymlinkContainmentAndMidTransactionRollbackChecks() throws {
+            try TestSupport.withTemporaryDirectory { rootDir in
+                let fileManager = FileManager.default
+                let passphrase = "test-v2-archive-passphrase"
+
+                let sourceSupportDir = rootDir.appendingPathComponent("Source", isDirectory: true)
+                try fileManager.createDirectory(at: sourceSupportDir, withIntermediateDirectories: true)
+                let sourceStore = GRDBHistoryStore(directory: sourceSupportDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { sourceStore.close() }
+
+                let tag = try sourceStore.createTag(name: "SecTag", color: "#FF5722")
+                let samplePNG = try TestSupport.makePNGData(pixelWidth: 16, pixelHeight: 16, color: .systemRed)
+                let clipID = UUID()
+                let stagedImageURL = try sourceStore.writeManagedAsset(
+                    pngData: samplePNG,
+                    role: .image,
+                    clipID: clipID,
+                    encrypted: true
+                )
+                let seededItem = ClipboardItem.fixture(
+                    id: clipID,
+                    kind: .image,
+                    title: "Protected Clip",
+                    text: ["Authorization", ": Bearer ", "NEG_ARCHIVE_TOKEN_", "1122334455667788"].joined(),
+                    assetPath: stagedImageURL.path,
+                    copiedAt: Date(timeIntervalSince1970: 1_710_300_100),
+                    tags: [tag.id],
+                    sensitivity: .sensitive
+                )
+                _ = try sourceStore.saveAndReconcileItem(seededItem, convertingExternalAssets: false)
+
+                let fastExportService = ClipBookArchiveService(
+                    fileManager: fileManager,
+                    supportDirectory: sourceSupportDir,
+                    kdfIterations: 1_000,
+                    allowTestIterations: true
+                )
+                let baseArchiveURL = rootDir.appendingPathComponent("BaseV2.clipbookarchive", isDirectory: true)
+                try fastExportService.export(
+                    items: try sourceStore.fetchAll(),
+                    tags: try sourceStore.fetchTags(),
+                    to: baseArchiveURL,
+                    passphrase: passphrase,
+                    loadItem: { try sourceStore.loadingContent(of: $0, scope: .full) }
+                )
+
+                // 1. KDF iteration bounds: allowTestIterations == false rejects 1,000 and 50,000,000 with .invalidKeyParameters!
+                do {
+                    let strictExportLow = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: sourceSupportDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: false
+                    )
+                    #expect(throws: ClipBookArchiveError.invalidKeyParameters) {
+                        try strictExportLow.export(
+                            items: [],
+                            tags: [],
+                            to: rootDir.appendingPathComponent("StrictLow.clipbookarchive", isDirectory: true),
+                            passphrase: passphrase
+                        )
+                    }
+
+                    let (strictDir, strictStore, _) = try Self.makeImportTarget(in: rootDir.appendingPathComponent("StrictTarget", isDirectory: true))
+                    defer { strictStore.close() }
+                    let strictImportService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: strictDir,
+                        allowTestIterations: false
+                    )
+                    #expect(throws: ClipBookArchiveError.invalidKeyParameters) {
+                        try strictImportService.verifyPassphrase(passphrase, at: baseArchiveURL)
+                    }
+                    #expect(throws: ClipBookArchiveError.invalidKeyParameters) {
+                        _ = try strictImportService.import(from: baseArchiveURL, into: strictStore, passphrase: passphrase)
+                    }
+
+                    let hugeIterURL = rootDir.appendingPathComponent("HugeIter.clipbookarchive", isDirectory: true)
+                    try fileManager.copyItem(at: baseArchiveURL, to: hugeIterURL)
+                    let manifestFile = hugeIterURL.appendingPathComponent("manifest.json")
+                    var manifestObj = try #require(
+                        try JSONSerialization.jsonObject(with: Data(contentsOf: manifestFile)) as? [String: Any]
+                    )
+                    var encObj = try #require(manifestObj["encryption"] as? [String: Any])
+                    encObj["iterations"] = 50_000_000
+                    manifestObj["encryption"] = encObj
+                    try JSONSerialization.data(withJSONObject: manifestObj, options: [.prettyPrinted, .sortedKeys])
+                        .write(to: manifestFile)
+
+                    #expect(throws: ClipBookArchiveError.invalidKeyParameters) {
+                        try strictImportService.verifyPassphrase(passphrase, at: hugeIterURL)
+                    }
+                    #expect(throws: ClipBookArchiveError.invalidKeyParameters) {
+                        _ = try strictImportService.import(from: hugeIterURL, into: strictStore, passphrase: passphrase)
+                    }
+                }
+
+                // 2. Passphrase & missing manifest negative checks (0 rows & 0 files written on failure).
+                do {
+                    let (checkDir, checkStore, _) = try Self.makeImportTarget(in: rootDir.appendingPathComponent("PassphraseChecks", isDirectory: true))
+                    defer { checkStore.close() }
+                    let fastTargetService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: checkDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: true
+                    )
+
+                    #expect(throws: ClipBookArchiveError.emptyPassphrase) {
+                        try fastExportService.export(
+                            items: [],
+                            tags: [],
+                            to: rootDir.appendingPathComponent("EmptyPass.clipbookarchive", isDirectory: true),
+                            passphrase: ""
+                        )
+                    }
+                    #expect(throws: ClipBookArchiveError.emptyPassphrase) {
+                        try fastTargetService.verifyPassphrase("", at: baseArchiveURL)
+                    }
+                    #expect(throws: ClipBookArchiveError.emptyPassphrase) {
+                        _ = try fastTargetService.import(from: baseArchiveURL, into: checkStore, passphrase: "")
+                    }
+                    #expect(throws: ClipBookArchiveError.passphraseRequired) {
+                        _ = try fastTargetService.import(from: baseArchiveURL, into: checkStore, passphrase: nil)
+                    }
+                    #expect(throws: ClipBookArchiveError.incorrectPassphrase) {
+                        try fastTargetService.verifyPassphrase("wrong-passphrase", at: baseArchiveURL)
+                    }
+                    #expect(throws: ClipBookArchiveError.incorrectPassphrase) {
+                        _ = try fastTargetService.import(from: baseArchiveURL, into: checkStore, passphrase: "wrong-passphrase")
+                    }
+                    #expect(try checkStore.fetchAll().isEmpty)
+                    #expect(try checkStore.fetchTags().isEmpty)
+                    #expect(((try? fileManager.contentsOfDirectory(atPath: checkDir.appendingPathComponent("Images").path)) ?? []).isEmpty)
+
+                    let emptyFolderURL = rootDir.appendingPathComponent("EmptyFolder.clipbookarchive", isDirectory: true)
+                    try fileManager.createDirectory(at: emptyFolderURL, withIntermediateDirectories: true)
+                    #expect(throws: ClipBookArchiveError.missingFile("manifest.json")) {
+                        _ = try fastTargetService.inspect(at: emptyFolderURL)
+                    }
+                    #expect(throws: ClipBookArchiveError.missingFile("manifest.json")) {
+                        _ = try fastTargetService.import(from: emptyFolderURL, into: checkStore)
+                    }
+                }
+
+                // 3. Manifest AAD tampering (exportedAt / appVersion), entry swapping, bit-flips & expectedAssets SHA-256 checks.
+                do {
+                    let (tamperDir, tamperStore, _) = try Self.makeImportTarget(in: rootDir.appendingPathComponent("TamperChecks", isDirectory: true))
+                    defer { tamperStore.close() }
+                    let tamperService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: tamperDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: true
+                    )
+
+                    let tamperMutations: [(label: String, mutate: (URL) throws -> Void)] = [
+                        (
+                            label: "edit exportedAt in manifest.json",
+                            mutate: { copyURL in
+                                let manifestFile = copyURL.appendingPathComponent("manifest.json")
+                                var obj = try #require(
+                                    try JSONSerialization.jsonObject(with: Data(contentsOf: manifestFile)) as? [String: Any]
+                                )
+                                obj["exportedAt"] = "2020-01-01T00:00:00Z"
+                                try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+                                    .write(to: manifestFile)
+                            }
+                        ),
+                        (
+                            label: "edit appVersion in manifest.json",
+                            mutate: { copyURL in
+                                let manifestFile = copyURL.appendingPathComponent("manifest.json")
+                                var obj = try #require(
+                                    try JSONSerialization.jsonObject(with: Data(contentsOf: manifestFile)) as? [String: Any]
+                                )
+                                obj["appVersion"] = "99.99.99-tampered"
+                                try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+                                    .write(to: manifestFile)
+                            }
+                        ),
+                        (
+                            label: "swap tags.json.enc and history.json.enc",
+                            mutate: { copyURL in
+                                let tagsEnc = copyURL.appendingPathComponent("tags.json.enc")
+                                let histEnc = copyURL.appendingPathComponent("history.json.enc")
+                                let tagsBytes = try Data(contentsOf: tagsEnc)
+                                let histBytes = try Data(contentsOf: histEnc)
+                                try histBytes.write(to: tagsEnc)
+                                try tagsBytes.write(to: histEnc)
+                            }
+                        ),
+                        (
+                            label: "flip 1 bit in history.json.enc",
+                            mutate: { copyURL in
+                                let histEnc = copyURL.appendingPathComponent("history.json.enc")
+                                var bytes = try Data(contentsOf: histEnc)
+                                let idx = bytes.count - 1
+                                bytes[idx] ^= 0x01
+                                try bytes.write(to: histEnc)
+                            }
+                        ),
+                        (
+                            label: "delete assets/images/<id>.enc",
+                            mutate: { copyURL in
+                                try fileManager.removeItem(
+                                    at: copyURL.appendingPathComponent("assets/images/\(clipID.uuidString).enc")
+                                )
+                            }
+                        ),
+                        (
+                            label: "modify 1 byte of assets/images/<id>.enc",
+                            mutate: { copyURL in
+                                let assetFile = copyURL.appendingPathComponent("assets/images/\(clipID.uuidString).enc")
+                                var bytes = try Data(contentsOf: assetFile)
+                                bytes[bytes.count - 1] ^= 0x80
+                                try bytes.write(to: assetFile)
+                            }
+                        )
+                    ]
+
+                    for (index, mutation) in tamperMutations.enumerated() {
+                        let copyURL = rootDir.appendingPathComponent("Tamper-\(index).clipbookarchive", isDirectory: true)
+                        try fileManager.copyItem(at: baseArchiveURL, to: copyURL)
+                        try mutation.mutate(copyURL)
+
+                        let err = #expect(throws: ClipBookArchiveError.self, Comment(rawValue: mutation.label)) {
+                            _ = try tamperService.import(from: copyURL, into: tamperStore, passphrase: passphrase)
+                        }
+                        var isCorrupted = false
+                        if case .corruptedEncryptedArchive? = err {
+                            isCorrupted = true
+                        }
+                        #expect(isCorrupted, Comment(rawValue: mutation.label))
+                        #expect(try tamperStore.fetchAll().isEmpty)
+                    }
+                }
+
+                // 4. Mid-transaction pre-existing <id_1>.enc backup-and-restore rollback test (v2 GCM tag tamper + v1 ../escape.png)!
+                do {
+                    let rollbackTargetDir = rootDir.appendingPathComponent("RollbackLiveTarget", isDirectory: true)
+                    try fileManager.createDirectory(at: rollbackTargetDir, withIntermediateDirectories: true)
+                    let rollbackStore = GRDBHistoryStore(directory: rollbackTargetDir, keyProvider: InMemoryDatabaseKeyProvider())
+                    defer { rollbackStore.close() }
+                    let rollbackService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: rollbackTargetDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: true
+                    )
+
+                    let id1 = UUID()
+                    let id2 = UUID()
+                    let originalID1PNG = try TestSupport.makePNGData(pixelWidth: 18, pixelHeight: 18, color: .systemBlue)
+                    let originalSecret = ["gh", "p_", "LIVE_ORIGINAL_TARGET_ASSET_998877665544"].joined()
+                    let initialStageURL = try rollbackStore.writeManagedAsset(
+                        pngData: originalID1PNG,
+                        role: .image,
+                        clipID: id1,
+                        encrypted: true
+                    )
+                    let liveSeeded = try rollbackStore.saveAndReconcileItem(
+                        ClipboardItem.fixture(
+                            id: id1,
+                            kind: .image,
+                            title: "Live Original Title",
+                            text: originalSecret,
+                            assetPath: initialStageURL.path,
+                            copiedAt: Date(timeIntervalSince1970: 1_710_310_000),
+                            sensitivity: .sensitive
+                        ),
+                        convertingExternalAssets: false
+                    )
+                    let liveEncURL = URL(fileURLWithPath: try #require(liveSeeded.assetPath))
+                    let originalEncOnDiskBytes = try Data(contentsOf: liveEncURL)
+
+                    // Build a 2-item v2 archive where item 1 overwrites id1 inside performInTransaction and item 2 fails openArchiveEntry!
+                    let stagingSourceDir = rootDir.appendingPathComponent("RollbackSource", isDirectory: true)
+                    try fileManager.createDirectory(at: stagingSourceDir, withIntermediateDirectories: true)
+                    let stagingSourceStore = GRDBHistoryStore(directory: stagingSourceDir, keyProvider: InMemoryDatabaseKeyProvider())
+                    defer { stagingSourceStore.close() }
+
+                    let replacementPNG1 = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemYellow)
+                    let item2PNG = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20, color: .systemPink)
+                    let srcURL1 = try stagingSourceStore.writeManagedAsset(pngData: replacementPNG1, role: .image, clipID: id1, encrypted: true)
+                    let srcURL2 = try stagingSourceStore.writeManagedAsset(pngData: item2PNG, role: .image, clipID: id2, encrypted: false)
+
+                    let overwriteItem1 = ClipboardItem.fixture(
+                        id: id1,
+                        kind: .image,
+                        title: "Overwritten Title Should Roll Back",
+                        text: ["sk", "-proj-", "OVERWRITTEN_SECRET_SHOULD_ROLL_BACK_123456"].joined(),
+                        assetPath: srcURL1.path,
+                        copiedAt: Date(timeIntervalSince1970: 1_710_310_500),
+                        sensitivity: .sensitive
+                    )
+                    let secondItem2 = ClipboardItem.fixture(
+                        id: id2,
+                        kind: .image,
+                        title: "Second Item",
+                        text: "Benign second image",
+                        assetPath: srcURL2.path,
+                        copiedAt: Date(timeIntervalSince1970: 1_710_310_400)
+                    )
+
+                    let midFailV2URL = rootDir.appendingPathComponent("MidFailV2.clipbookarchive", isDirectory: true)
+                    let stagingExportService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: stagingSourceDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: true
+                    )
+                    try stagingExportService.export(
+                        items: [overwriteItem1, secondItem2],
+                        tags: [],
+                        to: midFailV2URL,
+                        passphrase: passphrase
+                    )
+
+                    // Corrupt item 2's CBARC02\0 GCM tag and plant its new SHA-256 in history.json.enc expectedAssets
+                    // so pre-transaction inventory checks pass and failure happens AFTER item 1 overwrites id1!
+                    let rawManifestBytes = try Data(contentsOf: midFailV2URL.appendingPathComponent("manifest.json"))
+                    let decoder = JSONDecoder()
+                    decoder.dateDecodingStrategy = .iso8601
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .iso8601
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+                    let v2Manifest = try decoder.decode(ClipBookArchiveManifest.self, from: rawManifestBytes)
+                    let encMeta = try #require(v2Manifest.encryption)
+                    let salt = try #require(Data(base64Encoded: encMeta.saltBase64))
+                    let archiveKeys = try HistoryCrypto.deriveArchiveKeys(
+                        passphrase: passphrase,
+                        salt: salt,
+                        iterations: encMeta.iterations,
+                        archiveID: encMeta.archiveID,
+                        allowTestIterations: true
+                    )
+                    let manifestDigest = Data(SHA256.hash(data: rawManifestBytes))
+
+                    let item2RelPath = "assets/images/\(id2.uuidString).enc"
+                    let item2EncFile = midFailV2URL.appendingPathComponent(item2RelPath)
+                    var corruptedItem2Bytes = try Data(contentsOf: item2EncFile)
+                    corruptedItem2Bytes[corruptedItem2Bytes.count - 1] ^= 0xFF
+                    try corruptedItem2Bytes.write(to: item2EncFile)
+
+                    let historyEncFile = midFailV2URL.appendingPathComponent("history.json.enc")
+                    let openedHistoryBytes = try HistoryCrypto.openArchiveEntry(
+                        Data(contentsOf: historyEncFile),
+                        key: archiveKeys.aeadKey,
+                        archiveID: encMeta.archiveID,
+                        manifestDigest: manifestDigest,
+                        relativePath: "history.json.enc"
+                    )
+                    var historyPayload = try decoder.decode(ClipBookEncryptedHistoryPayload.self, from: openedHistoryBytes)
+                    #expect(historyPayload.items.map(\.id) == [id1, id2])
+                    historyPayload.expectedAssets[item2RelPath] = ContentDigest.sha256(corruptedItem2Bytes)
+                    let resealedHistory = try HistoryCrypto.sealArchiveEntry(
+                        try encoder.encode(historyPayload),
+                        key: archiveKeys.aeadKey,
+                        archiveID: encMeta.archiveID,
+                        manifestDigest: manifestDigest,
+                        relativePath: "history.json.enc"
+                    )
+                    try resealedHistory.write(to: historyEncFile)
+
+                    let v2Err = #expect(throws: ClipBookArchiveError.self) {
+                        _ = try rollbackService.import(from: midFailV2URL, into: rollbackStore, passphrase: passphrase)
+                    }
+                    if case .corruptedEncryptedArchive? = v2Err {} else {
+                        Issue.record("Expected .corruptedEncryptedArchive on mid-transaction v2 GCM failure, got \(String(describing: v2Err))")
+                    }
+
+                    // Verify live Images/<id1>.enc bytes AND SQLite row restored byte-for-byte!
+                    #expect(try Data(contentsOf: liveEncURL) == originalEncOnDiskBytes)
+                    #expect(!fileManager.fileExists(atPath: rollbackTargetDir.appendingPathComponent("Images/\(id2.uuidString).png").path))
+                    #expect(!fileManager.fileExists(atPath: rollbackTargetDir.appendingPathComponent("Images/\(id2.uuidString).enc").path))
+                    let supportEntriesAfterV2 = try fileManager.contentsOfDirectory(atPath: rollbackTargetDir.path)
+                    #expect(!supportEntriesAfterV2.contains { $0.hasPrefix(".import-rollback-") })
+
+                    let survivingAfterV2 = try rollbackStore.fetchAll()
+                    #expect(survivingAfterV2.map(\.id) == [id1])
+                    let hydratedAfterV2 = try rollbackStore.loadingContent(of: survivingAfterV2[0], scope: .body)
+                    #expect(hydratedAfterV2.title == "Live Original Title")
+                    #expect(hydratedAfterV2.text == originalSecret)
+                    #expect(
+                        try ImageAssetStore.readAssetData(
+                            at: liveEncURL,
+                            role: .image,
+                            ownerClipID: id1,
+                            requiresEncryption: true
+                        ) == originalID1PNG
+                    )
+
+                    // Also test v1 mid-transaction rollback where item 1 overwrites id1 and item 2 has "../escape.png"!
+                    let midFailV1URL = rootDir.appendingPathComponent("MidFailV1.clipbookarchive", isDirectory: true)
+                    try Self.writeCustomArchive(
+                        at: midFailV1URL,
+                        items: [
+                            (id: id1, kind: "image", text: overwriteItem1.text, assetPath: "assets/images/replacement.png"),
+                            (id: id2, kind: "image", text: nil, assetPath: "../escape.png")
+                        ],
+                        setupFiles: { archiveDir in
+                            try replacementPNG1.write(to: archiveDir.appendingPathComponent("assets/images/replacement.png"))
+                        }
+                    )
+                    let v1Err = #expect(throws: ClipBookArchiveError.self) {
+                        _ = try rollbackService.import(from: midFailV1URL, into: rollbackStore)
+                    }
+                    if case .invalidAssetPath? = v1Err {} else {
+                        Issue.record("Expected .invalidAssetPath on v1 ../escape.png, got \(String(describing: v1Err))")
+                    }
+
+                    #expect(try Data(contentsOf: liveEncURL) == originalEncOnDiskBytes)
+                    let survivingAfterV1 = try rollbackStore.fetchAll()
+                    #expect(survivingAfterV1.map(\.id) == [id1])
+                    #expect(try rollbackStore.loadingContent(of: survivingAfterV1[0], scope: .body).text == originalSecret)
+                }
+
+                // 5. Archive metadata/intermediate symlink rejection, export containment, cross-clip .enc AAD anti-transplant & atomic export!
+                do {
+                    let (symTargetDir, symTargetStore, symTargetService) = try Self.makeImportTarget(
+                        in: rootDir.appendingPathComponent("SymTarget", isDirectory: true)
+                    )
+                    defer { symTargetStore.close() }
+                    _ = symTargetDir
+
+                    let outsideManifest = rootDir.appendingPathComponent("outside-manifest.json")
+                    try Data(contentsOf: baseArchiveURL.appendingPathComponent("manifest.json")).write(to: outsideManifest)
+
+                    // Symlinked manifest.json -> .invalidAssetPath
+                    let symManifestArchive = rootDir.appendingPathComponent("SymManifest.clipbookarchive", isDirectory: true)
+                    try fileManager.copyItem(at: baseArchiveURL, to: symManifestArchive)
+                    try fileManager.removeItem(at: symManifestArchive.appendingPathComponent("manifest.json"))
+                    try fileManager.createSymbolicLink(
+                        at: symManifestArchive.appendingPathComponent("manifest.json"),
+                        withDestinationURL: outsideManifest
+                    )
+                    #expect(throws: ClipBookArchiveError.invalidAssetPath("manifest.json")) {
+                        _ = try symTargetService.inspect(at: symManifestArchive)
+                    }
+                    #expect(throws: ClipBookArchiveError.invalidAssetPath("manifest.json")) {
+                        _ = try symTargetService.import(from: symManifestArchive, into: symTargetStore, passphrase: passphrase)
+                    }
+
+                    // Dangling symlink on tags.json -> .invalidAssetPath (checked before fileExists!)
+                    let danglingTagsArchive = rootDir.appendingPathComponent("DanglingTags.clipbookarchive", isDirectory: true)
+                    try Self.writeCustomArchive(at: danglingTagsArchive, items: [], setupFiles: { _ in })
+                    try fileManager.removeItem(at: danglingTagsArchive.appendingPathComponent("tags.json"))
+                    try fileManager.createSymbolicLink(
+                        at: danglingTagsArchive.appendingPathComponent("tags.json"),
+                        withDestinationURL: rootDir.appendingPathComponent("nonexistent-dangling-target.json")
+                    )
+                    #expect(throws: ClipBookArchiveError.invalidAssetPath("tags.json")) {
+                        _ = try symTargetService.import(from: danglingTagsArchive, into: symTargetStore)
+                    }
+
+                    // Symlinked intermediate assets/images directory -> .invalidAssetPath
+                    let symImagesDirArchive = rootDir.appendingPathComponent("SymImagesDir.clipbookarchive", isDirectory: true)
+                    try fileManager.copyItem(at: baseArchiveURL, to: symImagesDirArchive)
+                    let realOutsideImages = rootDir.appendingPathComponent("RealOutsideImages", isDirectory: true)
+                    try fileManager.moveItem(
+                        at: symImagesDirArchive.appendingPathComponent("assets/images"),
+                        to: realOutsideImages
+                    )
+                    try fileManager.createSymbolicLink(
+                        at: symImagesDirArchive.appendingPathComponent("assets/images"),
+                        withDestinationURL: realOutsideImages
+                    )
+                    let fastSymTargetService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: symTargetDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: true
+                    )
+                    let symImagesErr = #expect(throws: ClipBookArchiveError.self) {
+                        _ = try fastSymTargetService.import(from: symImagesDirArchive, into: symTargetStore, passphrase: passphrase)
+                    }
+                    if case .invalidAssetPath? = symImagesErr {} else {
+                        Issue.record("Expected .invalidAssetPath on symlinked assets/images, got \(String(describing: symImagesErr))")
+                    }
+
+                    // Export source containment & cross-clip .enc AAD anti-transplant checks!
+                    let exportGuardDir = rootDir.appendingPathComponent("ExportGuardSupport", isDirectory: true)
+                    let exportGuardImages = exportGuardDir.appendingPathComponent("Images", isDirectory: true)
+                    let exportGuardPreviews = exportGuardDir.appendingPathComponent("LinkPreviews", isDirectory: true)
+                    try fileManager.createDirectory(at: exportGuardImages, withIntermediateDirectories: true)
+                    try fileManager.createDirectory(at: exportGuardPreviews, withIntermediateDirectories: true)
+
+                    let devKeyProvider = FileDatabaseKeyProvider(supportDirectory: exportGuardDir)
+                    let exportGuardStore = GRDBHistoryStore(directory: exportGuardDir, keyProvider: devKeyProvider)
+                    defer { exportGuardStore.close() }
+                    let victimID = UUID()
+                    let victimEncURL = try exportGuardStore.writeManagedAsset(
+                        pngData: samplePNG,
+                        role: .image,
+                        clipID: victimID,
+                        encrypted: true
+                    )
+                    let devKeyURL = exportGuardDir.appendingPathComponent(".devkey")
+                    #expect(fileManager.fileExists(atPath: devKeyURL.path))
+
+                    let outsidePNG = rootDir.appendingPathComponent("outside-user-photo.png")
+                    try samplePNG.write(to: outsidePNG)
+                    let symlinkInsideImages = exportGuardImages.appendingPathComponent("symlink-inside.png")
+                    try fileManager.createSymbolicLink(at: symlinkInsideImages, withDestinationURL: outsidePNG)
+                    let wrongSubdirPreview = exportGuardImages.appendingPathComponent("wrong-subdir.png")
+                    try samplePNG.write(to: wrongSubdirPreview)
+
+                    let exportGuardService = ClipBookArchiveService(
+                        fileManager: fileManager,
+                        supportDirectory: exportGuardDir,
+                        kdfIterations: 1_000,
+                        allowTestIterations: true
+                    )
+
+                    let badExportItems: [(label: String, item: ClipboardItem)] = [
+                        (
+                            label: "assetPath outside supportDirectory/Images",
+                            item: .fixture(kind: .image, assetPath: outsidePNG.path)
+                        ),
+                        (
+                            label: "assetPath pointing to supportDirectory/.devkey",
+                            item: .fixture(kind: .image, assetPath: devKeyURL.path)
+                        ),
+                        (
+                            label: "assetPath pointing through symlink inside Images/",
+                            item: .fixture(kind: .image, assetPath: symlinkInsideImages.path)
+                        ),
+                        (
+                            label: "linkPreviewDetails.imagePath outside LinkPreviews/",
+                            item: .fixture(
+                                kind: .link,
+                                text: "https://example.com",
+                                linkPreviewDetails: LinkPreviewDetails(
+                                    url: "https://example.com",
+                                    title: "Bad Preview",
+                                    description: nil,
+                                    imagePath: wrongSubdirPreview.path,
+                                    faviconPath: nil,
+                                    fetchedAt: Date(timeIntervalSince1970: 1_710_300_000)
+                                )
+                            )
+                        )
+                    ]
+
+                    for (idx, badCase) in badExportItems.enumerated() {
+                        let outURL = rootDir.appendingPathComponent("BlockedExport-\(idx).clipbookarchive", isDirectory: true)
+                        let err = #expect(throws: ClipBookArchiveError.self, Comment(rawValue: badCase.label)) {
+                            try exportGuardService.export(items: [badCase.item], tags: [], to: outURL)
+                        }
+                        if case .invalidAssetPath? = err {} else {
+                            Issue.record("Expected .invalidAssetPath for \(badCase.label), got \(String(describing: err))")
+                        }
+                        #expect(!fileManager.fileExists(atPath: outURL.path))
+                    }
+
+                    // Non-sensitive (isEncrypted == 0) item pointing at another clip's Images/<victimID>.enc fails assetAAD!
+                    let attackerItem = ClipboardItem.fixture(
+                        id: UUID(),
+                        kind: .image,
+                        text: "Benign attacker clip",
+                        assetPath: victimEncURL.path,
+                        sensitivity: .notSensitive
+                    )
+                    #expect(!SensitiveContent.shouldEncryptAtRest(attackerItem))
+                    #expect(throws: HistoryStoreError.authenticationFailed) {
+                        try exportGuardService.export(
+                            items: [attackerItem],
+                            tags: [],
+                            to: rootDir.appendingPathComponent("TransplantPlain.clipbookarchive", isDirectory: true),
+                            passphrase: nil
+                        )
+                    }
+                    #expect(throws: HistoryStoreError.authenticationFailed) {
+                        try exportGuardService.export(
+                            items: [attackerItem],
+                            tags: [],
+                            to: rootDir.appendingPathComponent("TransplantV2.clipbookarchive", isDirectory: true),
+                            passphrase: passphrase
+                        )
+                    }
+
+                    // Failing export mid-flight (loadItem throwing) leaves an existing destination .clipbookarchive untouched!
+                    let existingDestURL = rootDir.appendingPathComponent("ExistingIntact.clipbookarchive", isDirectory: true)
+                    try fileManager.copyItem(at: baseArchiveURL, to: existingDestURL)
+                    let preManifestBytes = try Data(contentsOf: existingDestURL.appendingPathComponent("manifest.json"))
+                    let preHistoryEncBytes = try Data(contentsOf: existingDestURL.appendingPathComponent("history.json.enc"))
+
+                    let unloadedFirst = ClipboardItem.fixture(kind: .text, text: "First Loaded Item")
+                    var unloadedSecond = ClipboardItem.fixture(kind: .text, text: "Second Failing Item").unloadingContent()
+                    unloadedSecond.title = "Unloaded Trigger"
+                    #expect(!unloadedSecond.isContentLoaded)
+
+                    #expect(throws: HistoryStoreError.authenticationFailed) {
+                        try exportGuardService.export(
+                            items: [unloadedFirst, unloadedSecond],
+                            tags: [],
+                            to: existingDestURL,
+                            passphrase: passphrase,
+                            loadItem: { _ in
+                                throw HistoryStoreError.authenticationFailed
+                            }
+                        )
+                    }
+                    #expect(try Data(contentsOf: existingDestURL.appendingPathComponent("manifest.json")) == preManifestBytes)
+                    #expect(try Data(contentsOf: existingDestURL.appendingPathComponent("history.json.enc")) == preHistoryEncBytes)
+                }
+            }
+        }
+
+        private static func encodedPatterns(for needle: String) -> [(label: String, bytes: Data)] {
+            var patterns: [(String, Data)] = [
+                ("utf8", Data(needle.utf8))
+            ]
+            if let utf16LE = needle.data(using: .utf16LittleEndian) {
+                patterns.append(("utf16LE", utf16LE))
+            }
+            if let utf16BE = needle.data(using: .utf16BigEndian) {
+                patterns.append(("utf16BE", utf16BE))
+            }
+            let rawUTF8 = Data(needle.utf8)
+            for padLen in 0..<3 {
+                let padded = Data(repeating: 0x41, count: padLen) + rawUTF8
+                let b64 = padded.base64EncodedString()
+                let dropLeadingChars = padLen == 0 ? 0 : 4
+                let usableChars = ((padded.count) / 3) * 4 - dropLeadingChars
+                if usableChars >= 8 {
+                    let start = b64.index(b64.startIndex, offsetBy: dropLeadingChars)
+                    let end = b64.index(start, offsetBy: usableChars)
+                    patterns.append(("base64-align\(padLen)", Data(b64[start..<end].utf8)))
+                }
+            }
+            return patterns
+        }
+
+        private static func queryIsEncrypted(at dbURL: URL, clipID: UUID) throws -> Int? {
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
+                if let db { sqlite3_close(db) }
+                throw HistoryStoreError.openFailed
+            }
+            defer { sqlite3_close(db) }
+            let sql = "SELECT isEncrypted FROM clips WHERE id = '\(clipID.uuidString)' LIMIT 1;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                throw HistoryStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW else {
+                return nil
+            }
+            return Int(sqlite3_column_int(stmt, 0))
         }
 
         /// An empty support directory under `rootDir` with a store and an archive service on it.

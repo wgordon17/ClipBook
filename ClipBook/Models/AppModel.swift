@@ -221,6 +221,7 @@ final class AppModel: ObservableObject {
         didSet { invalidateFilteredItems() }
     }
     @Published var isPaused = false
+    @Published var storeLockState: StoreLockState = .unlocked
     @Published var lastError: String?
     // The search and the list of source applications compare text the way the
     // app language does.

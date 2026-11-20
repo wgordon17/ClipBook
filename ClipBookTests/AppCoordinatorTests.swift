@@ -485,6 +485,7 @@ enum AppCoordinatorTests {
         private static func makeCustomHarness(
             supportDirectory: URL? = nil,
             keyProvider: any DatabaseKeyProvider = InMemoryDatabaseKeyProvider(),
+            probeStoreBeforeInit: Bool = false,
             now: @escaping @Sendable () -> Date = { Date() },
             recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = { _ in .empty },
             recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = { _ in .empty },
@@ -511,6 +512,9 @@ enum AppCoordinatorTests {
                 directory: resolvedSupportDir,
                 keyProvider: keyProvider
             )
+            if probeStoreBeforeInit {
+                _ = try? historyStore.fetchAll()
+            }
             let preferencesStore = PreferencesStore(userDefaults: userDefaults)
 
             var initialPreferences = AppPreferences()
@@ -1558,6 +1562,376 @@ enum AppCoordinatorTests {
                 lockedHarness.model.selectedHistoryFilterContentTypes = [.trash]
                 #expect(lockedHarness.model.trashedItems.map(\.id) == [survivingClip.id])
             }
+        }
+
+        @Test
+        @MainActor
+        func storeLockStateInitRetryUnlockAndArchiveExportImportModesEndToEnd() async throws {
+            let fileManager = FileManager.default
+            let workspace = fileManager.temporaryDirectory
+                .appendingPathComponent("ClipBookC7Archive-\(UUID().uuidString)", isDirectory: true)
+            try fileManager.createDirectory(at: workspace, withIntermediateDirectories: true)
+            defer { try? fileManager.removeItem(at: workspace) }
+
+            // Part 1: AppModel.storeLockState initialization, archive guard while locked/mismatched,
+            // and retryUnlockHistoryStore() transitions (without calling start() or mutating global L10n!).
+                do {
+                    let lockedDir = workspace.appendingPathComponent("LockedStoreInit", isDirectory: true)
+                    try fileManager.createDirectory(at: lockedDir, withIntermediateDirectories: true)
+
+                    let masterKey = SymmetricKey(size: .bits256)
+                    let seededItem = ClipboardItem.fixture(
+                        kind: .text,
+                        text: "Unlocked after retry item",
+                        copiedAt: Date(timeIntervalSince1970: 1_710_500_100)
+                    )
+                    do {
+                        let seedStore = GRDBHistoryStore(
+                            directory: lockedDir,
+                            keyProvider: InMemoryDatabaseKeyProvider(key: masterKey)
+                        )
+                        defer { seedStore.close() }
+                        _ = try seedStore.saveAndReconcileItem(seededItem, convertingExternalAssets: true)
+                    }
+
+                    let toggleProvider = InMemoryDatabaseKeyProvider(
+                        key: nil,
+                        error: .encryptionKeyUnavailable(.interactionNotAllowed)
+                    )
+                    let lockedHarness = try Self.makeCustomHarness(
+                        supportDirectory: lockedDir,
+                        keyProvider: toggleProvider,
+                        probeStoreBeforeInit: true
+                    )
+                    defer { lockedHarness.cleanup() }
+
+                    // AppCoordinator.init initializes model.storeLockState directly from historyStore.lockState!
+                    #expect(lockedHarness.model.storeLockState == .locked(.interactionNotAllowed))
+                    let dummyArchiveURL = workspace.appendingPathComponent("ShouldNotStart.clipbookarchive", isDirectory: true)
+                    #expect(
+                        !lockedHarness.coordinator.beginExportHistoryArchive(
+                            mode: .unencryptedIncludingSensitive,
+                            destinationURL: dummyArchiveURL,
+                            progress: { _ in },
+                            completion: { _ in }
+                        )
+                    )
+                    #expect(
+                        !lockedHarness.coordinator.performImportHistoryArchive(
+                            from: dummyArchiveURL,
+                            passphrase: nil,
+                            progress: { _ in },
+                            completion: { _ in }
+                        )
+                    )
+
+                    // Wrong key transitions model.storeLockState to .keyMismatch and keeps export/import blocked.
+                    toggleProvider.setError(nil)
+                    toggleProvider.setKey(SymmetricKey(size: .bits256))
+                    #expect(!lockedHarness.coordinator.retryUnlockHistoryStore())
+                    #expect(lockedHarness.model.storeLockState == .keyMismatch)
+                    #expect(lockedHarness.model.lastError != nil)
+                    #expect(lockedHarness.clipboardMonitor.isPaused)
+                    #expect(
+                        !lockedHarness.coordinator.beginExportHistoryArchive(
+                            mode: .unencryptedIncludingSensitive,
+                            destinationURL: dummyArchiveURL,
+                            progress: { _ in },
+                            completion: { _ in }
+                        )
+                    )
+
+                    // Providing the matching master key unlocks the store, updates model.storeLockState, and loads history.
+                    toggleProvider.setKey(masterKey)
+                    #expect(lockedHarness.coordinator.retryUnlockHistoryStore())
+                    #expect(lockedHarness.model.storeLockState == .unlocked)
+                    #expect(lockedHarness.model.lastError == nil)
+                    #expect(!lockedHarness.clipboardMonitor.isPaused)
+                    #expect(lockedHarness.model.items.map(\.id) == [seededItem.id])
+                }
+
+                // Part 2: exportableHistoryContainsSensitiveItems(), all 3 ArchiveExportMode branches,
+                // verifyArchivePassphrase (async throws), and performImportHistoryArchive end-to-end!
+                let sourceDir = workspace.appendingPathComponent("ExportSource", isDirectory: true)
+                let sourceHarness = try Self.makeCustomHarness(supportDirectory: sourceDir)
+                defer { sourceHarness.cleanup() }
+
+                #expect(sourceHarness.model.storeLockState == .unlocked)
+                #expect(!sourceHarness.coordinator.exportableHistoryContainsSensitiveItems())
+
+                let generalTag = try sourceHarness.historyStore.createTag(name: "GeneralExport", color: "#2196F3")
+                let opsTag = try sourceHarness.historyStore.createTag(name: "OpsExport", color: "#E91E63")
+
+                let plainTextItem = ClipboardItem.fixture(
+                    kind: .text,
+                    title: "Public Release Notes",
+                    text: "PublicCoordPlainBody2026",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_500_200),
+                    tags: [generalTag.id]
+                )
+
+                let plainImageBytes = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 16, color: .systemGreen)
+                let plainImageID = UUID()
+                let plainImageURL = try sourceHarness.historyStore.writeManagedAsset(
+                    pngData: plainImageBytes,
+                    role: .image,
+                    clipID: plainImageID,
+                    encrypted: false
+                )
+                let plainImageItem = ClipboardItem.fixture(
+                    id: plainImageID,
+                    kind: .image,
+                    title: "Public Diagram",
+                    text: "PublicImageOCRText",
+                    assetPath: plainImageURL.path,
+                    imageDigest: sourceHarness.historyStore.computeImageDigest(forPNGData: plainImageBytes),
+                    copiedAt: Date(timeIntervalSince1970: 1_710_500_300),
+                    tags: [generalTag.id]
+                )
+
+                let secretToken = ["sk", "-proj-", "COORD_EXPORT_SECRET_TOKEN_1122334455667788"].joined()
+                let overriddenNotSensitive = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Overridden \(secretToken)",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_500_350),
+                    sensitivity: .notSensitive
+                )
+                var expiringSensitiveItem = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Ephemeral \(secretToken)",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_500_360)
+                )
+                expiringSensitiveItem.expiresAt = Date().addingTimeInterval(600)
+
+                // Verify expiring sensitive items and .notSensitive overrides do NOT trigger sensitive export warning!
+                try sourceHarness.seedHistory([plainTextItem, plainImageItem, overriddenNotSensitive, expiringSensitiveItem])
+                #expect(!sourceHarness.coordinator.exportableHistoryContainsSensitiveItems())
+
+                // Add persistent sensitive text and sensitive .enc image -> exportableHistoryContainsSensitiveItems() == true!
+                let sensitiveTextItem = ClipboardItem.fixture(
+                    kind: .text,
+                    title: "Prod Credential",
+                    text: "Credential \(secretToken)",
+                    copiedAt: Date(timeIntervalSince1970: 1_710_500_400),
+                    tags: [opsTag.id]
+                )
+                let sensitiveImageBytes = try TestSupport.makePNGData(pixelWidth: 28, pixelHeight: 20, color: .systemRed)
+                let sensitiveImageID = UUID()
+                let sensitiveImageURL = try sourceHarness.historyStore.writeManagedAsset(
+                    pngData: sensitiveImageBytes,
+                    role: .image,
+                    clipID: sensitiveImageID,
+                    encrypted: true
+                )
+                let sensitiveImageItem = ClipboardItem.fixture(
+                    id: sensitiveImageID,
+                    kind: .image,
+                    title: "Secret Screenshot",
+                    text: "SecretImageOCRMarker",
+                    assetPath: sensitiveImageURL.path,
+                    imageDigest: sourceHarness.historyStore.computeImageDigest(forPNGData: sensitiveImageBytes),
+                    copiedAt: Date(timeIntervalSince1970: 1_710_500_500),
+                    tags: [opsTag.id],
+                    sensitivity: .sensitive
+                )
+                _ = try sourceHarness.historyStore.saveAndReconcileItem(sensitiveTextItem, convertingExternalAssets: true)
+                _ = try sourceHarness.historyStore.saveAndReconcileItem(sensitiveImageItem, convertingExternalAssets: false)
+                #expect(sourceHarness.coordinator.loadHistory(sweepsCaches: false))
+                #expect(sourceHarness.model.items.count == 6)
+                #expect(sourceHarness.model.items.allSatisfy { !$0.isContentLoaded })
+                #expect(sourceHarness.coordinator.exportableHistoryContainsSensitiveItems())
+
+                // Helper to await beginExportHistoryArchive cleanly on @MainActor.
+                @MainActor
+                func runExport(
+                    mode: ArchiveExportMode,
+                    to destinationURL: URL
+                ) async throws -> (result: ClipBookArchiveExportResult, progress: [ClipBookArchiveProgress]) {
+                    var recordedProgress: [ClipBookArchiveProgress] = []
+                    let outcome: Result<ClipBookArchiveExportResult, Error> = await withCheckedContinuation { continuation in
+                        let started = sourceHarness.coordinator.beginExportHistoryArchive(
+                            mode: mode,
+                            destinationURL: destinationURL,
+                            progress: { step in
+                                recordedProgress.append(step)
+                            },
+                            completion: { completionResult in
+                                continuation.resume(returning: completionResult)
+                            }
+                        )
+                        #expect(started)
+                    }
+                    return (try outcome.get(), recordedProgress)
+                }
+
+                // Mode A: .encrypted(passphrase:) exports formatVersion == 2 (5 non-expiring items, 2 tags).
+                let nfdPassphrase = "caf\u{0065}\u{0301}-coord"
+                let nfcPassphrase = "caf\u{00E9}-coord"
+                let encryptedArchiveURL = workspace.appendingPathComponent("ModeEncrypted.clipbookarchive", isDirectory: true)
+                let (encExportResult, encProgress) = try await runExport(
+                    mode: .encrypted(passphrase: nfdPassphrase),
+                    to: encryptedArchiveURL
+                )
+                #expect(encExportResult == ClipBookArchiveExportResult(url: encryptedArchiveURL, itemCount: 5, tagCount: 2))
+                #expect(encProgress.last == ClipBookArchiveProgress(completedItemCount: 5, totalItemCount: 5))
+                #expect(
+                    try sourceHarness.coordinator.inspectArchive(at: encryptedArchiveURL)
+                        == ClipBookArchiveInspection(formatVersion: 2, isEncrypted: true)
+                )
+
+                // verifyArchivePassphrase (async throws): NFC succeeds, wrong throws .incorrectPassphrase, empty throws .emptyPassphrase.
+                sourceHarness.clipboardMonitor.isPaused = false
+                try await sourceHarness.coordinator.verifyArchivePassphrase(nfcPassphrase, for: encryptedArchiveURL)
+                #expect(!sourceHarness.clipboardMonitor.isPaused)
+                await #expect(throws: ClipBookArchiveError.incorrectPassphrase) {
+                    try await sourceHarness.coordinator.verifyArchivePassphrase("wrong-passphrase", for: encryptedArchiveURL)
+                }
+                await #expect(throws: ClipBookArchiveError.emptyPassphrase) {
+                    try await sourceHarness.coordinator.verifyArchivePassphrase("", for: encryptedArchiveURL)
+                }
+
+                // Mode B: .unencryptedSkippingSensitive omits the 2 sensitive items + expiring item (exports 3 plain items, retains 2 tags).
+                let skipArchiveURL = workspace.appendingPathComponent("ModeSkipSensitive.clipbookarchive", isDirectory: true)
+                let (skipExportResult, skipProgress) = try await runExport(
+                    mode: .unencryptedSkippingSensitive,
+                    to: skipArchiveURL
+                )
+                #expect(skipExportResult == ClipBookArchiveExportResult(url: skipArchiveURL, itemCount: 3, tagCount: 2))
+                #expect(skipProgress.last == ClipBookArchiveProgress(completedItemCount: 3, totalItemCount: 3))
+                #expect(
+                    try sourceHarness.coordinator.inspectArchive(at: skipArchiveURL)
+                        == ClipBookArchiveInspection(formatVersion: 1, isEncrypted: false)
+                )
+                let skipHistoryText = try String(
+                    contentsOf: skipArchiveURL.appendingPathComponent("history.json"),
+                    encoding: .utf8
+                )
+                #expect(!skipHistoryText.contains("Credential \(secretToken)"))
+                #expect(!skipHistoryText.contains("SecretImageOCRMarker"))
+                #expect(!skipHistoryText.contains("Ephemeral \(secretToken)"))
+                #expect(skipHistoryText.contains("PublicCoordPlainBody2026"))
+
+                // Mode C: .unencryptedIncludingSensitive exports all 5 non-expiring items as formatVersion == 1 (decrypting .enc image to .png).
+                let includeArchiveURL = workspace.appendingPathComponent("ModeIncludeSensitive.clipbookarchive", isDirectory: true)
+                let (inclExportResult, _) = try await runExport(
+                    mode: .unencryptedIncludingSensitive,
+                    to: includeArchiveURL
+                )
+                #expect(inclExportResult == ClipBookArchiveExportResult(url: includeArchiveURL, itemCount: 5, tagCount: 2))
+                #expect(
+                    try sourceHarness.coordinator.inspectArchive(at: includeArchiveURL)
+                        == ClipBookArchiveInspection(formatVersion: 1, isEncrypted: false)
+                )
+                let inclHistoryText = try String(
+                    contentsOf: includeArchiveURL.appendingPathComponent("history.json"),
+                    encoding: .utf8
+                )
+                #expect(inclHistoryText.contains("Credential \(secretToken)"))
+                #expect(!inclHistoryText.contains("Ephemeral \(secretToken)"))
+                let decryptedV1ImageURL = includeArchiveURL
+                    .appendingPathComponent("assets/images/\(sensitiveImageID.uuidString).png")
+                #expect(try Data(contentsOf: decryptedV1ImageURL) == sensitiveImageBytes)
+
+                // End-to-end performImportHistoryArchive into fresh destination coordinators!
+                let destEncryptedHarness = try Self.makeCustomHarness(
+                    supportDirectory: workspace.appendingPathComponent("ImportDestEncrypted", isDirectory: true)
+                )
+                defer { destEncryptedHarness.cleanup() }
+
+                @MainActor
+                func runImport(
+                    into targetHarness: TestCoordinatorHarness,
+                    from url: URL,
+                    passphrase: String?
+                ) async -> (outcome: Result<ClipBookArchiveImportResult, Error>, progress: [ClipBookArchiveProgress]) {
+                    var steps: [ClipBookArchiveProgress] = []
+                    let outcome: Result<ClipBookArchiveImportResult, Error> = await withCheckedContinuation { continuation in
+                        let started = targetHarness.coordinator.performImportHistoryArchive(
+                            from: url,
+                            passphrase: passphrase,
+                            progress: { step in
+                                steps.append(step)
+                            },
+                            completion: { result in
+                                continuation.resume(returning: result)
+                            }
+                        )
+                        #expect(started)
+                    }
+                    return (outcome, steps)
+                }
+
+                // 1) Missing passphrase on v2 archive fails with .passphraseRequired and restores clipboardMonitor state.
+                let (missingPassOutcome, _) = await runImport(
+                    into: destEncryptedHarness,
+                    from: encryptedArchiveURL,
+                    passphrase: nil
+                )
+                #expect(throws: ClipBookArchiveError.passphraseRequired) {
+                    _ = try missingPassOutcome.get()
+                }
+                #expect(destEncryptedHarness.model.items.isEmpty)
+                #expect(!destEncryptedHarness.clipboardMonitor.isPaused)
+
+                // 2) Wrong passphrase fails with .incorrectPassphrase.
+                let (wrongPassOutcome, _) = await runImport(
+                    into: destEncryptedHarness,
+                    from: encryptedArchiveURL,
+                    passphrase: "wrong"
+                )
+                #expect(throws: ClipBookArchiveError.incorrectPassphrase) {
+                    _ = try wrongPassOutcome.get()
+                }
+                #expect(destEncryptedHarness.model.items.isEmpty)
+
+                // 3) Valid NFC passphrase imports all 5 items & 2 tags, keeping headers unloaded and sensitive assets .enc!
+                let (validV2Outcome, validV2Steps) = await runImport(
+                    into: destEncryptedHarness,
+                    from: encryptedArchiveURL,
+                    passphrase: nfcPassphrase
+                )
+                let v2ImportResult = try validV2Outcome.get()
+                #expect(v2ImportResult.itemCount == 5)
+                #expect(v2ImportResult.tagCount == 2)
+                #expect(validV2Steps.last == ClipBookArchiveProgress(completedItemCount: 5, totalItemCount: 5))
+                #expect(destEncryptedHarness.model.items.count == 5)
+                #expect(destEncryptedHarness.model.items.allSatisfy { !$0.isContentLoaded })
+                #expect(destEncryptedHarness.model.tags.count == 2)
+                #expect(!destEncryptedHarness.clipboardMonitor.isPaused)
+
+                let destSensImg = try #require(destEncryptedHarness.currentItem(sensitiveImageID))
+                let destSensImgURL = URL(fileURLWithPath: try #require(destSensImg.assetPath))
+                #expect(destSensImgURL.pathExtension == "enc")
+                #expect(
+                    try ImageAssetStore.readAssetData(
+                        at: destSensImgURL,
+                        role: .image,
+                        ownerClipID: sensitiveImageID,
+                        requiresEncryption: true
+                    ) == sensitiveImageBytes
+                )
+                let destPlainImg = try #require(destEncryptedHarness.currentItem(plainImageID))
+                let destPlainImgURL = URL(fileURLWithPath: try #require(destPlainImg.assetPath))
+                #expect(destPlainImgURL.pathExtension == "png")
+                #expect(try Data(contentsOf: destPlainImgURL) == plainImageBytes)
+
+                // 4) Unencrypted skip-sensitive v1 archive imports the 3 plain items & 2 tags cleanly.
+                let destSkipHarness = try Self.makeCustomHarness(
+                    supportDirectory: workspace.appendingPathComponent("ImportDestSkip", isDirectory: true)
+                )
+                defer { destSkipHarness.cleanup() }
+                let (skipImportOutcome, _) = await runImport(
+                    into: destSkipHarness,
+                    from: skipArchiveURL,
+                    passphrase: nil
+                )
+                let skipImportResult = try skipImportOutcome.get()
+                #expect(skipImportResult.itemCount == 3)
+                #expect(skipImportResult.tagCount == 2)
+                #expect(
+                    Set(destSkipHarness.model.items.map(\.id))
+                        == Set([plainTextItem.id, plainImageID, overriddenNotSensitive.id])
+                )
         }
     }
 }

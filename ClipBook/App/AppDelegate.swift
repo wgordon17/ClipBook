@@ -247,7 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    item.button?.image = Self.statusBarImage(isPaused: model.isPaused)
+    item.button?.image = Self.statusBarImage(isPaused: model.isPaused || model.storeLockState != .unlocked)
     item.button?.imagePosition = .imageOnly
     item.button?.toolTip = "ClipBook"
     if model.preferences.openHistoryOnMenuBarIconClick {
@@ -271,6 +271,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private func observeStatusItemState() {
     model.$items
       .combineLatest(model.$isPaused, model.$selectedItemID, model.$preferences)
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.configureStatusItem()
+        self?.configureHistoryMenu()
+      }
+      .store(in: &statusCancellables)
+
+    model.$storeLockState
       .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
         self?.configureStatusItem()
@@ -358,6 +366,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       openClipBookItem.keyEquivalentModifierMask = shortcut.modifierFlags
     }
     menu.addItem(openClipBookItem)
+    if model.storeLockState != .unlocked {
+      menu.addItem(.separator())
+      let lockStatusItem = NSMenuItem(
+        title: PersistenceErrorLocalization.statusTitle(for: model.storeLockState),
+        action: nil,
+        keyEquivalent: ""
+      )
+      lockStatusItem.isEnabled = false
+      menu.addItem(lockStatusItem)
+      menu.addItem(
+        menuItem(
+          L10n.string("Unlock History..."),
+          action: #selector(retryUnlockHistory),
+          systemImage: "lock.open"
+        )
+      )
+    }
     menu.addItem(.separator())
     menu.addItem(menuItem(L10n.string("About ClipBook"), action: #selector(aboutClipBook), systemImage: "info.circle"))
     menu.addItem(menuItem(L10n.string("Check for Updates..."), action: #selector(checkForUpdates), systemImage: "arrow.clockwise"))
@@ -449,6 +474,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc private func togglePaused() {
     coordinator.togglePaused()
+    configureStatusItem()
+    configureHistoryMenu()
+  }
+
+  @objc private func retryUnlockHistory() {
+    coordinator.retryUnlockHistoryStore()
     configureStatusItem()
     configureHistoryMenu()
   }

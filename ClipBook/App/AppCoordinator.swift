@@ -21,6 +21,12 @@ private enum ClipboardImageExportError: LocalizedError {
   }
 }
 
+nonisolated enum ArchiveExportMode: Equatable, Sendable {
+  case unencryptedIncludingSensitive
+  case unencryptedSkippingSensitive
+  case encrypted(passphrase: String)
+}
+
 @MainActor
 final class AppCoordinator: ObservableObject {
   let model: AppModel
@@ -121,6 +127,7 @@ final class AppCoordinator: ObservableObject {
       directory: supportDirectory.appendingPathComponent("FilePreviews", isDirectory: true),
       fileManager: fileManager
     )
+    model.storeLockState = historyStore.lockState
     licensingService.$state
       .sink { [weak self] state in
         self?.licenseState = state
@@ -163,9 +170,10 @@ final class AppCoordinator: ObservableObject {
     if shouldSavePreferences {
       preferencesStore.save(model.preferences)
     }
-    if historyStore.lockState == .unlocked {
+    let initialLockState = syncStoreLockState()
+    if initialLockState == .unlocked {
       let didLoadHistory = loadHistory(sweepsCaches: false)
-      if historyStore.lockState == .unlocked {
+      if syncStoreLockState() == .unlocked {
         clearHistoryAfterRebootIfNeeded()
         applyRetention()
         deleteExpiredItems()
@@ -175,7 +183,7 @@ final class AppCoordinator: ObservableObject {
         }
       }
     } else {
-      model.lastError = Self.lockedStoreErrorMessage(for: historyStore.lockState)
+      model.lastError = Self.lockedStoreErrorMessage(for: initialLockState)
     }
     scheduleRetentionChecks()
     if !hasBoundLifecycleObservers {
@@ -222,8 +230,9 @@ final class AppCoordinator: ObservableObject {
     model.lastError = nil
     do {
       try historyStore.retryUnlock()
+      _ = syncStoreLockState()
       let didLoadHistory = loadHistory(sweepsCaches: false)
-      if historyStore.lockState == .unlocked {
+      if syncStoreLockState() == .unlocked {
         clearHistoryAfterRebootIfNeeded()
         applyRetention()
         deleteExpiredItems()
@@ -232,13 +241,24 @@ final class AppCoordinator: ObservableObject {
           removeOrphanedStoredFiles()
         }
       }
-      clipboardMonitor.isPaused = model.isPaused || historyStore.lockState != .unlocked
-      return historyStore.lockState == .unlocked
+      let isUnlocked = syncStoreLockState() == .unlocked
+      clipboardMonitor.isPaused = model.isPaused || !isUnlocked
+      return isUnlocked
     } catch {
-      model.lastError = error.localizedDescription
-      clipboardMonitor.isPaused = model.isPaused || historyStore.lockState != .unlocked
+      let currentLockState = syncStoreLockState()
+      model.lastError = PersistenceErrorLocalization.message(for: error)
+      clipboardMonitor.isPaused = model.isPaused || currentLockState != .unlocked
       return false
     }
+  }
+
+  @discardableResult
+  private func syncStoreLockState() -> StoreLockState {
+    let current = historyStore.lockState
+    if model.storeLockState != current {
+      model.storeLockState = current
+    }
+    return current
   }
 
   private static func lockedStoreErrorMessage(for lockState: StoreLockState) -> String? {
@@ -246,9 +266,9 @@ final class AppCoordinator: ObservableObject {
     case .unlocked:
       return nil
     case .locked(let reason):
-      return HistoryStoreError.encryptionKeyUnavailable(reason).localizedDescription
+      return PersistenceErrorLocalization.message(for: HistoryStoreError.encryptionKeyUnavailable(reason))
     case .keyMismatch:
-      return HistoryStoreError.encryptionKeyMismatch.localizedDescription
+      return PersistenceErrorLocalization.message(for: HistoryStoreError.encryptionKeyMismatch)
     }
   }
 
@@ -397,23 +417,49 @@ final class AppCoordinator: ObservableObject {
     settingsWindow?.show()
   }
 
+  func exportableHistoryContainsSensitiveItems() -> Bool {
+    model.items.contains { $0.expiresAt == nil && SensitiveContent.shouldEncryptAtRest($0) }
+  }
+
   @discardableResult
   func beginExportHistoryArchive(
+    mode: ArchiveExportMode = .unencryptedIncludingSensitive,
+    destinationURL: URL? = nil,
     progress: @escaping (ClipBookArchiveProgress) -> Void,
     completion: @escaping (Result<ClipBookArchiveExportResult, Error>) -> Void
   ) -> Bool {
-    let panel = NSSavePanel()
-    panel.title = L10n.string("Export History and Tags")
-    panel.nameFieldStringValue = "ClipBook Export.clipbookarchive"
-    panel.canCreateDirectories = true
-    panel.isExtensionHidden = false
-
-    guard panel.runModal() == .OK, let url = panel.url else {
+    guard !isHistoryArchiveOperationRunning, syncStoreLockState() == .unlocked else {
       return false
     }
 
+    let url: URL
+    if let destinationURL {
+      url = destinationURL
+    } else {
+      let panel = NSSavePanel()
+      panel.title = L10n.string("Export History and Tags")
+      panel.nameFieldStringValue = "ClipBook Export.clipbookarchive"
+      panel.canCreateDirectories = true
+      panel.isExtensionHidden = false
+
+      guard panel.runModal() == .OK, let selectedURL = panel.url else {
+        return false
+      }
+      url = selectedURL
+    }
+
     // Content kept for a limited time does not outlive it in an archive.
-    let items = model.items.filter { $0.expiresAt == nil }
+    var items = model.items.filter { $0.expiresAt == nil }
+    let passphrase: String?
+    switch mode {
+    case .unencryptedIncludingSensitive:
+      passphrase = nil
+    case .unencryptedSkippingSensitive:
+      items = items.filter { !SensitiveContent.shouldEncryptAtRest($0) }
+      passphrase = nil
+    case .encrypted(let exportPassphrase):
+      passphrase = exportPassphrase
+    }
     let tags = model.tags
     // FileManager is thread-safe; the archive is written on a background queue.
     nonisolated(unsafe) let fileManager = self.fileManager
@@ -429,9 +475,16 @@ final class AppCoordinator: ObservableObject {
     DispatchQueue.global(qos: .userInitiated).async {
       let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
       do {
-        // The archive keeps the full body and formatting, which the history's items come without.
-        let items = items.map { (try? historyStore.loadingContent(of: $0, scope: .full)) ?? $0 }
-        try archiveService.export(items: items, tags: tags, to: url, progress: reportProgress)
+        try archiveService.export(
+          items: items,
+          tags: tags,
+          to: url,
+          passphrase: passphrase,
+          loadItem: { item in
+            try historyStore.loadingContent(of: item, scope: .full)
+          },
+          progress: reportProgress
+        )
         let result = ClipBookArchiveExportResult(url: url, itemCount: items.count, tagCount: tags.count)
         DispatchQueue.main.async {
           self.isHistoryArchiveOperationRunning = false
@@ -450,18 +503,48 @@ final class AppCoordinator: ObservableObject {
     return true
   }
 
-  @discardableResult
-  func beginImportHistoryArchive(
-    progress: @escaping (ClipBookArchiveProgress) -> Void,
-    completion: @escaping (Result<ClipBookArchiveImportResult, Error>) -> Void
-  ) -> Bool {
+  func chooseImportArchiveURL() -> URL? {
     let panel = NSOpenPanel()
     panel.title = L10n.string("Import History and Tags")
     panel.canChooseFiles = false
     panel.canChooseDirectories = true
     panel.allowsMultipleSelection = false
 
-    guard panel.runModal() == .OK, let url = panel.url else {
+    guard panel.runModal() == .OK else {
+      return nil
+    }
+    return panel.url
+  }
+
+  func inspectArchive(at url: URL) throws -> ClipBookArchiveInspection {
+    let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
+    return try archiveService.inspect(at: url)
+  }
+
+  func verifyArchivePassphrase(_ passphrase: String, for url: URL) async throws {
+    nonisolated(unsafe) let fileManager = self.fileManager
+    let supportDirectory = self.supportDirectory
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
+        do {
+          try archiveService.verifyPassphrase(passphrase, at: url)
+          continuation.resume()
+        } catch {
+          continuation.resume(throwing: error)
+        }
+      }
+    }
+  }
+
+  @discardableResult
+  func performImportHistoryArchive(
+    from url: URL,
+    passphrase: String? = nil,
+    progress: @escaping (ClipBookArchiveProgress) -> Void,
+    completion: @escaping (Result<ClipBookArchiveImportResult, Error>) -> Void
+  ) -> Bool {
+    guard !isHistoryArchiveOperationRunning, syncStoreLockState() == .unlocked else {
       return false
     }
 
@@ -482,17 +565,23 @@ final class AppCoordinator: ObservableObject {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
       do {
-        let result = try archiveService.import(from: url, into: historyStore, progress: reportProgress)
+        let result = try archiveService.import(
+          from: url,
+          into: historyStore,
+          passphrase: passphrase,
+          progress: reportProgress
+        )
         DispatchQueue.main.async { [weak self] in
           guard let self else {
             return
           }
+          ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: self.supportDirectory)
           // Checked before anything can run the retention check again, which
           // would delete the expired items without asking.
           let expiredItems = self.expiredItems(among: result.itemIDs)
           self.isRetentionPromptPresented = !expiredItems.isEmpty
           self.clipboardMonitor.start(preferences: self.model.preferences)
-          self.clipboardMonitor.isPaused = self.model.isPaused || self.historyStore.lockState != .unlocked
+          self.clipboardMonitor.isPaused = self.model.isPaused || self.syncStoreLockState() != .unlocked
           let didLoadHistory = self.loadHistory(sweepsCaches: false)
           self.isHistoryArchiveOperationRunning = false
           self.deleteExpiredItems()
@@ -510,8 +599,9 @@ final class AppCoordinator: ObservableObject {
           guard let self else {
             return
           }
+          ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: self.supportDirectory)
           self.clipboardMonitor.start(preferences: self.model.preferences)
-          self.clipboardMonitor.isPaused = self.model.isPaused || self.historyStore.lockState != .unlocked
+          self.clipboardMonitor.isPaused = self.model.isPaused || self.syncStoreLockState() != .unlocked
           self.isHistoryArchiveOperationRunning = false
           self.deleteExpiredItems()
           completion(.failure(error))
@@ -786,8 +876,9 @@ final class AppCoordinator: ObservableObject {
   /// Deletes the history for good, the Trash included, as clearing it on quit
   /// or after a restart is meant to leave nothing behind.
   func clearHistory() {
-    guard historyStore.lockState == .unlocked else {
-      model.lastError = Self.lockedStoreErrorMessage(for: historyStore.lockState)
+    let lockState = syncStoreLockState()
+    guard lockState == .unlocked else {
+      model.lastError = Self.lockedStoreErrorMessage(for: lockState)
       return
     }
     cancelOrphanedFileSweeps(waitUntilDone: false)
@@ -811,7 +902,8 @@ final class AppCoordinator: ObservableObject {
       model.remove(Set(deletedItems.map(\.id)))
       HistoryRowTextCache.removeAll()
     } catch {
-      model.lastError = error.localizedDescription
+      _ = syncStoreLockState()
+      model.lastError = PersistenceErrorLocalization.message(for: error)
     }
   }
 
@@ -3373,14 +3465,15 @@ final class AppCoordinator: ObservableObject {
   
   @discardableResult
   func loadHistory(sweepsCaches: Bool = true) -> Bool {
-    guard historyStore.lockState == .unlocked else {
+    let lockState = syncStoreLockState()
+    guard lockState == .unlocked else {
       model.tags = []
       model.items = []
       model.trashedItems = []
       model.selectedItemID = nil
       model.selectedItemIDs = []
       model.selectedItemIDsInSelectionOrder = []
-      model.lastError = Self.lockedStoreErrorMessage(for: historyStore.lockState)
+      model.lastError = Self.lockedStoreErrorMessage(for: lockState)
       return false
     }
 
@@ -3390,6 +3483,7 @@ final class AppCoordinator: ObservableObject {
       if model.isShowingTrash {
         model.trashedItems = try historyStore.fetchTrashedItems()
       }
+      _ = syncStoreLockState()
       if sweepsCaches {
         pruneFilePreviewCache()
         removeOrphanedStoredFiles()
@@ -3399,7 +3493,8 @@ final class AppCoordinator: ObservableObject {
       model.selectedItemIDsInSelectionOrder = model.selectedItemID.map { [$0] } ?? []
       return true
     } catch {
-      model.lastError = error.localizedDescription
+      _ = syncStoreLockState()
+      model.lastError = PersistenceErrorLocalization.message(for: error)
       return false
     }
   }
