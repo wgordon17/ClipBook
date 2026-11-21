@@ -1045,13 +1045,6 @@ final class AppModel: ObservableObject {
         clearUnavailableHistorySourceApplicationFilter()
     }
 
-    func incrementCopyCount(_ id: ClipboardItem.ID) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else {
-            return
-        }
-        items[index].copyCount += 1
-    }
-
     private func clearUnavailableHistorySourceApplicationFilter() {
         guard !selectedHistoryFilterSourceApplicationIDs.isEmpty else {
             return

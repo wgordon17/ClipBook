@@ -286,22 +286,6 @@ nonisolated enum HistoryCrypto {
         return ClipBookArchiveDerivedKeys(aeadKey: aeadKey, verifierHMACKey: verifierHMACKey)
     }
 
-    static func deriveArchiveAEADKey(
-        passphrase: String,
-        salt: Data,
-        iterations: Int,
-        archiveID: UUID,
-        allowTestIterations: Bool = false
-    ) throws -> SymmetricKey {
-        try deriveArchiveKeys(
-            passphrase: passphrase,
-            salt: salt,
-            iterations: iterations,
-            archiveID: archiveID,
-            allowTestIterations: allowTestIterations
-        ).aeadKey
-    }
-
     static func archiveEntryAAD(
         archiveID: UUID,
         manifestDigest: Data,

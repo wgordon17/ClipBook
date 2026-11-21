@@ -12,9 +12,6 @@ nonisolated enum KeyUnavailableReason: Equatable, Sendable {
 
 nonisolated enum HistoryStoreError: LocalizedError, Equatable, Sendable {
     case openFailed
-    case prepareFailed(String)
-    case stepFailed(String)
-    case bindFailed
     case encryptionKeyUnavailable(KeyUnavailableReason)
     case encryptionKeyMismatch
     case authenticationFailed
@@ -25,12 +22,6 @@ nonisolated enum HistoryStoreError: LocalizedError, Equatable, Sendable {
         switch self {
         case .openFailed:
             "Unable to open the ClipBook history database."
-        case .prepareFailed(let message):
-            "Unable to prepare the history database statement: \(message)"
-        case .stepFailed(let message):
-            "Unable to write to the history database: \(message)"
-        case .bindFailed:
-            "Unable to bind a history database value."
         case .encryptionKeyUnavailable(let reason):
             switch reason {
             case .notFound:
@@ -101,12 +92,6 @@ enum PersistenceErrorLocalization {
         switch error {
         case .openFailed:
             return L10n.string("Unable to open the ClipBook history database.")
-        case .prepareFailed(let message):
-            return L10n.string("Unable to prepare the history database statement: %@", message)
-        case .stepFailed(let message):
-            return L10n.string("Unable to write to the history database: %@", message)
-        case .bindFailed:
-            return L10n.string("Unable to bind a history database value.")
         case .encryptionKeyUnavailable(let reason):
             return keyUnavailableMessage(for: reason)
         case .encryptionKeyMismatch:

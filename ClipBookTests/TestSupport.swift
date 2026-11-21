@@ -14,6 +14,20 @@ import UniformTypeIdentifiers
 @Suite(.serialized)
 enum SharedProcessStateTests {}
 
+nonisolated enum TestSQLiteFixtureError: LocalizedError, Equatable, Sendable {
+    case prepareFailed(String)
+    case stepFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .prepareFailed(let message):
+            "Test SQLite prepare failed: \(message)"
+        case .stepFailed(let message):
+            "Test SQLite step failed: \(message)"
+        }
+    }
+}
+
 final class TestNoOpUpdateService: UpdateService {
     var isRelaunchingToInstallUpdate: Bool = false
     private(set) var automaticChecksEnabledValues: [Bool] = []
@@ -182,7 +196,6 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
     func delete(ids: [UUID]) throws { try base.delete(ids: ids) }
     func clear() throws { try base.clear() }
     func clear(keepingFavoritesAndTaggedItems: Bool) throws { try base.clear(keepingFavoritesAndTaggedItems: keepingFavoritesAndTaggedItems) }
-    func incrementCopyCount(_ id: UUID) throws { try base.incrementCopyCount(id) }
     func recordAction(_ id: UUID, copiedAt: Date?, incrementsCopyCount: Bool) throws -> ClipboardItem? {
         try base.recordAction(id, copiedAt: copiedAt, incrementsCopyCount: incrementsCopyCount)
     }
@@ -207,7 +220,7 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
             return state.shouldThrowOnFetchSearchTexts
         }
         if shouldThrow {
-            throw HistoryStoreError.stepFailed("Simulated fetchSearchTexts failure")
+            throw TestSQLiteFixtureError.stepFailed("Simulated fetchSearchTexts failure")
         }
         return try base.fetchSearchTexts(
             for: ids,

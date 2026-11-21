@@ -1611,8 +1611,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     add: { _, _ in
                         addCallCount.withLock { $0 += 1 }
                         return errSecSuccess
-                    },
-                    delete: { _ in errSecSuccess }
+                    }
                 )
                 let keychainProvider = SystemKeychainKeyProvider(client: mockClient, allowsTestClient: true)
 
@@ -1714,7 +1713,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     try Self.withDatabase(at: scratchDB) { db in
                         func exec(_ sql: String) throws {
                             guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
-                                throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                                throw TestSQLiteFixtureError.stepFailed(String(cString: sqlite3_errmsg(db)))
                             }
                         }
 
@@ -2489,7 +2488,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
             try withDatabase(at: dbURL) { db in
                 func exec(_ sql: String) throws {
                     guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
-                        throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                        throw TestSQLiteFixtureError.stepFailed(String(cString: sqlite3_errmsg(db)))
                     }
                 }
 
@@ -2876,7 +2875,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
         private static func executeSQL(at dbURL: URL, _ sql: String) throws {
             try withDatabase(at: dbURL) { db in
                 guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
-                    throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                    throw TestSQLiteFixtureError.stepFailed(String(cString: sqlite3_errmsg(db)))
                 }
             }
         }
@@ -2885,7 +2884,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
             try withDatabase(at: dbURL) { db in
                 var statement: OpaquePointer?
                 guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-                    throw HistoryStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+                    throw TestSQLiteFixtureError.prepareFailed(String(cString: sqlite3_errmsg(db)))
                 }
                 defer { sqlite3_finalize(statement) }
                 guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
@@ -3004,7 +3003,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let itemsForExport = try sourceStore.fetchAll().map { try sourceStore.loadingContent(of: $0, scope: .full) }
                 let tagsForExport = try sourceStore.fetchTags()
                 let sourceArchiveService = ClipBookArchiveService(
-                    fileManager: fileManager,
                     supportDirectory: sourceSupportDir
                 )
 
@@ -3025,7 +3023,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 )
                 defer { targetStore.close() }
                 let targetArchiveService = ClipBookArchiveService(
-                    fileManager: fileManager,
                     supportDirectory: targetSupportDir
                 )
 
@@ -3445,7 +3442,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
 
                 // Production 600,000 PBKDF2 iterations with NFD passphrase -> NFC verification & import.
                 let sourceArchiveService = ClipBookArchiveService(
-                    fileManager: fileManager,
                     supportDirectory: sourceSupportDir
                 )
                 #expect(sourceArchiveService.kdfIterations == 600_000)
@@ -3566,7 +3562,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 )
 
                 let targetArchiveService = ClipBookArchiveService(
-                    fileManager: fileManager,
                     supportDirectory: targetSupportDir
                 )
                 try targetArchiveService.verifyPassphrase(nfcPassphrase, at: archiveURL)
@@ -3695,7 +3690,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 _ = try sourceStore.saveAndReconcileItem(seededItem, convertingExternalAssets: false)
 
                 let fastExportService = ClipBookArchiveService(
-                    fileManager: fileManager,
                     supportDirectory: sourceSupportDir,
                     kdfIterations: 1_000,
                     allowTestIterations: true
@@ -3712,7 +3706,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 // 1. KDF iteration bounds: allowTestIterations == false rejects 1,000 and 50,000,000 with .invalidKeyParameters!
                 do {
                     let strictExportLow = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: sourceSupportDir,
                         kdfIterations: 1_000,
                         allowTestIterations: false
@@ -3729,7 +3722,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     let (strictDir, strictStore, _) = try Self.makeImportTarget(in: rootDir.appendingPathComponent("StrictTarget", isDirectory: true))
                     defer { strictStore.close() }
                     let strictImportService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: strictDir,
                         allowTestIterations: false
                     )
@@ -3765,7 +3757,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     let (checkDir, checkStore, _) = try Self.makeImportTarget(in: rootDir.appendingPathComponent("PassphraseChecks", isDirectory: true))
                     defer { checkStore.close() }
                     let fastTargetService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: checkDir,
                         kdfIterations: 1_000,
                         allowTestIterations: true
@@ -3813,7 +3804,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     let (tamperDir, tamperStore, _) = try Self.makeImportTarget(in: rootDir.appendingPathComponent("TamperChecks", isDirectory: true))
                     defer { tamperStore.close() }
                     let tamperService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: tamperDir,
                         kdfIterations: 1_000,
                         allowTestIterations: true
@@ -3908,7 +3898,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     let rollbackStore = GRDBHistoryStore(directory: rollbackTargetDir, keyProvider: InMemoryDatabaseKeyProvider())
                     defer { rollbackStore.close() }
                     let rollbackService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: rollbackTargetDir,
                         kdfIterations: 1_000,
                         allowTestIterations: true
@@ -3970,7 +3959,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
 
                     let midFailV2URL = rootDir.appendingPathComponent("MidFailV2.clipbookarchive", isDirectory: true)
                     let stagingExportService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: stagingSourceDir,
                         kdfIterations: 1_000,
                         allowTestIterations: true
@@ -4133,7 +4121,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                         withDestinationURL: realOutsideImages
                     )
                     let fastSymTargetService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: symTargetDir,
                         kdfIterations: 1_000,
                         allowTestIterations: true
@@ -4173,7 +4160,6 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     try samplePNG.write(to: wrongSubdirPreview)
 
                     let exportGuardService = ClipBookArchiveService(
-                        fileManager: fileManager,
                         supportDirectory: exportGuardDir,
                         kdfIterations: 1_000,
                         allowTestIterations: true
@@ -4309,7 +4295,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
             let sql = "SELECT isEncrypted FROM clips WHERE id = '\(clipID.uuidString)' LIMIT 1;"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
-                throw HistoryStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+                throw TestSQLiteFixtureError.prepareFailed(String(cString: sqlite3_errmsg(db)))
             }
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_step(stmt) == SQLITE_ROW else {
@@ -4327,7 +4313,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
             return (
                 supportDir,
                 GRDBHistoryStore(directory: supportDir, keyProvider: InMemoryDatabaseKeyProvider()),
-                ClipBookArchiveService(fileManager: .default, supportDirectory: supportDir)
+                ClipBookArchiveService(supportDirectory: supportDir)
             )
         }
 

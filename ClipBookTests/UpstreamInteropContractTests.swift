@@ -915,7 +915,7 @@ struct UpstreamInteropContractTests {
                 sensitivity: .sensitive
             )
 
-            let exportService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: sourceSupport)
+            let exportService = ClipBookArchiveService(supportDirectory: sourceSupport)
             try exportService.export(items: [richItem, imageItem, linkItem], tags: [tag], to: archiveURL)
 
             let manifestURL = archiveURL.appendingPathComponent("manifest.json")
@@ -1018,7 +1018,7 @@ struct UpstreamInteropContractTests {
                 keyProvider: InMemoryDatabaseKeyProvider()
             )
             defer { destinationStore.close() }
-            let importService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: destSupport)
+            let importService = ClipBookArchiveService(supportDirectory: destSupport)
             let importResult = try importService.import(from: archiveURL, into: destinationStore)
             #expect(importResult.itemCount == 3)
             #expect(importResult.tagCount == 1)
@@ -1158,7 +1158,7 @@ struct UpstreamInteropContractTests {
             sensitiveLinkItem.tagOrders = [opsTag.id: 0]
             _ = try sourceStore.saveAndReconcileItem(sensitiveLinkItem, convertingExternalAssets: false)
 
-            let exportService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: sourceSupport)
+            let exportService = ClipBookArchiveService(supportDirectory: sourceSupport)
             try exportService.export(
                 items: try sourceStore.fetchAll(),
                 tags: try sourceStore.fetchTags(),

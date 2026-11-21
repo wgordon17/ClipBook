@@ -673,9 +673,6 @@ enum AppModelAndLocalizationTests {
             "%@ Unlock Keychain and click Unlock History to resume clipboard capture.",
             "The history database was encrypted with a different key than the current Keychain key. Restore the matching Keychain key and click Unlock History.",
             "Unable to open the ClipBook history database.",
-            "Unable to prepare the history database statement: %@",
-            "Unable to write to the history database: %@",
-            "Unable to bind a history database value.",
             "The history database was encrypted with a different key than the current Keychain key.",
             "Unable to verify or decrypt protected history data.",
             "The archive encryption passphrase or key derivation parameters are invalid.",
@@ -867,9 +864,6 @@ extension SharedProcessStateTests {
 
             let errorCases: [(label: String, error: Error, expectedSubstring: String?)] = [
                 ("openFailed", HistoryStoreError.openFailed, nil),
-                ("prepareFailed", HistoryStoreError.prepareFailed("SELECT_ERR_TOKEN"), "SELECT_ERR_TOKEN"),
-                ("stepFailed", HistoryStoreError.stepFailed("WRITE_ERR_TOKEN"), "WRITE_ERR_TOKEN"),
-                ("bindFailed", HistoryStoreError.bindFailed, nil),
                 ("keyNotFound", HistoryStoreError.encryptionKeyUnavailable(.notFound), nil),
                 ("interactionNotAllowed", HistoryStoreError.encryptionKeyUnavailable(.interactionNotAllowed), nil),
                 ("userCanceled", HistoryStoreError.encryptionKeyUnavailable(.userCanceled), nil),

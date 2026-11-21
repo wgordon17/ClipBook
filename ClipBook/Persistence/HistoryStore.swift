@@ -61,7 +61,6 @@ nonisolated protocol HistoryStore: Sendable {
     /// Deletes the history and the whole Trash, sparing the favorites and
     /// tagged items in the history when asked to.
     func clear(keepingFavoritesAndTaggedItems: Bool) throws
-    func incrementCopyCount(_ id: UUID) throws
     func recordAction(_ id: UUID, copiedAt: Date?, incrementsCopyCount: Bool) throws -> ClipboardItem?
     func fetchItems(expiredBy policy: HistoryRetentionPolicy) throws -> [ClipboardItem]
     /// The items whose own expiry date is at or before `date`, the items in

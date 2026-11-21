@@ -3,7 +3,6 @@ import AppKit
 import CryptoKit
 import Darwin
 import Foundation
-import os
 import SQLite3
 import Testing
 
@@ -2009,7 +2008,7 @@ extension SharedProcessStateTests {
 
             let sqlTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
             guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
-                throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                throw TestSQLiteFixtureError.stepFailed(String(cString: sqlite3_errmsg(db)))
             }
 
             let clipSQL = """
@@ -2046,7 +2045,7 @@ extension SharedProcessStateTests {
                 sqlite3_finalize(clipStmt)
                 sqlite3_finalize(contentStmt)
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                throw HistoryStoreError.prepareFailed(msg)
+                throw TestSQLiteFixtureError.prepareFailed(msg)
             }
             defer {
                 sqlite3_finalize(clipStmt)
@@ -2229,12 +2228,12 @@ extension SharedProcessStateTests {
                       sqlite3_step(contentStmt) == SQLITE_DONE else {
                     let msg = String(cString: sqlite3_errmsg(db))
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    throw HistoryStoreError.stepFailed(msg)
+                    throw TestSQLiteFixtureError.stepFailed(msg)
                 }
             }
 
             guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                throw TestSQLiteFixtureError.stepFailed(String(cString: sqlite3_errmsg(db)))
             }
 
             return BulkSeedStats(

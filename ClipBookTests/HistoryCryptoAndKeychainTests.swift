@@ -39,7 +39,6 @@ nonisolated private final class MockSecItemKeychain: Sendable {
         var onDuplicatePopulateData: Data?
         var copyMatchingQueries: [RecordedQuery] = []
         var addQueries: [RecordedQuery] = []
-        var deleteCount = 0
     }
 
     private let state: OSAllocatedUnfairLock<State>
@@ -123,16 +122,6 @@ nonisolated private final class MockSecItemKeychain: Sendable {
                     if let data = recorded.valueData {
                         state.storedPayload = .data(data)
                     }
-                    return errSecSuccess
-                }
-            },
-            delete: { [state] _ in
-                state.withLock { state in
-                    state.deleteCount += 1
-                    guard state.storedPayload != nil else {
-                        return errSecItemNotFound
-                    }
-                    state.storedPayload = nil
                     return errSecSuccess
                 }
             }
@@ -609,7 +598,7 @@ struct HistoryCryptoAndKeychainTests {
     // MARK: - 4. Archive Passphrase KDF (NFC Normalization, 600,000 Production Rounds & Bounds)
 
     @Test
-    func deriveArchiveAEADKeyNormalizesNFCValidatesBoundsAndRunsProductionIterations() throws {
+    func deriveArchiveKeysNormalizesNFCValidatesBoundsAndRunsProductionIterations() throws {
         let salt = Data((0..<32).map { UInt8(0xA0 &+ $0) })
         let otherSalt = Data((0..<32).map { UInt8(0xB0 &+ $0) })
         let archiveID = UUID()
@@ -620,120 +609,120 @@ struct HistoryCryptoAndKeychainTests {
         #expect(Array(nfcCafe.unicodeScalars).count == 4)
         #expect(Array(nfdCafe.unicodeScalars).count == 5)
 
-        let keyFromNFC = try HistoryCrypto.deriveArchiveAEADKey(
+        let keyFromNFC = try HistoryCrypto.deriveArchiveKeys(
             passphrase: nfcCafe,
             salt: salt,
             iterations: HistoryCrypto.minimumTestKDFIterations,
             archiveID: archiveID,
             allowTestIterations: true
-        )
-        let keyFromNFD = try HistoryCrypto.deriveArchiveAEADKey(
+        ).aeadKey
+        let keyFromNFD = try HistoryCrypto.deriveArchiveKeys(
             passphrase: nfdCafe,
             salt: salt,
             iterations: HistoryCrypto.minimumTestKDFIterations,
             archiveID: archiveID,
             allowTestIterations: true
-        )
+        ).aeadKey
         #expect(CryptoTestHelpers.keyBytes(keyFromNFC).count == 32)
         #expect(keyFromNFC == keyFromNFD)
 
         // Different salt or archiveID yields distinct keys.
-        let keyDifferentSalt = try HistoryCrypto.deriveArchiveAEADKey(
+        let keyDifferentSalt = try HistoryCrypto.deriveArchiveKeys(
             passphrase: nfcCafe,
             salt: otherSalt,
             iterations: HistoryCrypto.minimumTestKDFIterations,
             archiveID: archiveID,
             allowTestIterations: true
-        )
-        let keyDifferentArchiveID = try HistoryCrypto.deriveArchiveAEADKey(
+        ).aeadKey
+        let keyDifferentArchiveID = try HistoryCrypto.deriveArchiveKeys(
             passphrase: nfcCafe,
             salt: salt,
             iterations: HistoryCrypto.minimumTestKDFIterations,
             archiveID: otherArchiveID,
             allowTestIterations: true
-        )
+        ).aeadKey
         #expect(keyFromNFC != keyDifferentSalt)
         #expect(keyFromNFC != keyDifferentArchiveID)
 
         // Production KDF iterations (600,000) succeeds with allowTestIterations == false.
         #expect(HistoryCrypto.productionKDFIterations == 600_000)
         let prodPhrase = ["correct", "horse", "archive", "phrase"].joined(separator: "-")
-        let prodKey = try HistoryCrypto.deriveArchiveAEADKey(
+        let prodKey = try HistoryCrypto.deriveArchiveKeys(
             passphrase: prodPhrase,
             salt: salt,
             iterations: HistoryCrypto.productionKDFIterations,
             archiveID: archiveID
-        )
+        ).aeadKey
         #expect(CryptoTestHelpers.keyBytes(prodKey).count == 32)
         #expect(prodKey != keyFromNFC)
 
         // Boundary at minimumProductionKDFIterations (100,000) succeeds.
-        let minProdKey = try HistoryCrypto.deriveArchiveAEADKey(
+        let minProdKey = try HistoryCrypto.deriveArchiveKeys(
             passphrase: nfcCafe,
             salt: salt,
             iterations: HistoryCrypto.minimumProductionKDFIterations,
             archiveID: archiveID,
             allowTestIterations: false
-        )
+        ).aeadKey
         #expect(CryptoTestHelpers.keyBytes(minProdKey).count == 32)
 
         // Invalid parameters throw .invalidArchiveKeyParameters.
         #expect(throws: HistoryStoreError.invalidArchiveKeyParameters) {
-            _ = try HistoryCrypto.deriveArchiveAEADKey(
+            _ = try HistoryCrypto.deriveArchiveKeys(
                 passphrase: "",
                 salt: salt,
                 iterations: HistoryCrypto.minimumProductionKDFIterations,
                 archiveID: archiveID
-            )
+            ).aeadKey
         }
         for invalidSaltLength in [0, 16, 31, 33, 64] {
             #expect(throws: HistoryStoreError.invalidArchiveKeyParameters) {
-                _ = try HistoryCrypto.deriveArchiveAEADKey(
+                _ = try HistoryCrypto.deriveArchiveKeys(
                     passphrase: nfcCafe,
                     salt: Data(repeating: 0x11, count: invalidSaltLength),
                     iterations: HistoryCrypto.minimumProductionKDFIterations,
                     archiveID: archiveID
-                )
+                ).aeadKey
             }
         }
         for tooLowProductionIterations in [-1, 0, 999, 1_000, 99_999] {
             #expect(throws: HistoryStoreError.invalidArchiveKeyParameters) {
-                _ = try HistoryCrypto.deriveArchiveAEADKey(
+                _ = try HistoryCrypto.deriveArchiveKeys(
                     passphrase: nfcCafe,
                     salt: salt,
                     iterations: tooLowProductionIterations,
                     archiveID: archiveID,
                     allowTestIterations: false
-                )
+                ).aeadKey
             }
         }
         #expect(throws: HistoryStoreError.invalidArchiveKeyParameters) {
-            _ = try HistoryCrypto.deriveArchiveAEADKey(
+            _ = try HistoryCrypto.deriveArchiveKeys(
                 passphrase: nfcCafe,
                 salt: salt,
                 iterations: 999,
                 archiveID: archiveID,
                 allowTestIterations: true
-            )
+            ).aeadKey
         }
         for tooHighIterations in [10_000_001, Int.max] {
             #expect(throws: HistoryStoreError.invalidArchiveKeyParameters) {
-                _ = try HistoryCrypto.deriveArchiveAEADKey(
+                _ = try HistoryCrypto.deriveArchiveKeys(
                     passphrase: nfcCafe,
                     salt: salt,
                     iterations: tooHighIterations,
                     archiveID: archiveID,
                     allowTestIterations: false
-                )
+                ).aeadKey
             }
             #expect(throws: HistoryStoreError.invalidArchiveKeyParameters) {
-                _ = try HistoryCrypto.deriveArchiveAEADKey(
+                _ = try HistoryCrypto.deriveArchiveKeys(
                     passphrase: nfcCafe,
                     salt: salt,
                     iterations: tooHighIterations,
                     archiveID: archiveID,
                     allowTestIterations: true
-                )
+                ).aeadKey
             }
         }
     }

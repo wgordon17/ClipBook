@@ -268,7 +268,7 @@ struct RecoveryScriptIntegrationTests {
         var selectStmt: OpaquePointer?
         guard sqlite3_prepare_v2(sqliteDB, selectSQL, -1, &selectStmt, nil) == SQLITE_OK,
               let preparedSelect = selectStmt else {
-            throw HistoryStoreError.prepareFailed(String(cString: sqlite3_errmsg(sqliteDB)))
+            throw TestSQLiteFixtureError.prepareFailed(String(cString: sqlite3_errmsg(sqliteDB)))
         }
         defer {
             sqlite3_finalize(preparedSelect)
@@ -279,13 +279,13 @@ struct RecoveryScriptIntegrationTests {
         }
         guard sqlite3_step(preparedSelect) == SQLITE_ROW,
               sqlite3_column_type(preparedSelect, 0) == SQLITE_BLOB else {
-            throw HistoryStoreError.stepFailed("Expected encrypted BLOB in \(table).\(column)")
+            throw TestSQLiteFixtureError.stepFailed("Expected encrypted BLOB in \(table).\(column)")
         }
 
         let blobLength = Int(sqlite3_column_bytes(preparedSelect, 0))
         guard blobLength >= HistoryCrypto.minimumSealedColumnLength,
               let blobPtr = sqlite3_column_blob(preparedSelect, 0) else {
-            throw HistoryStoreError.stepFailed("Encrypted BLOB shorter than minimum sealed length")
+            throw TestSQLiteFixtureError.stepFailed("Encrypted BLOB shorter than minimum sealed length")
         }
 
         var tampered = Data(bytes: blobPtr, count: blobLength)
@@ -295,7 +295,7 @@ struct RecoveryScriptIntegrationTests {
         var updateStmt: OpaquePointer?
         guard sqlite3_prepare_v2(sqliteDB, updateSQL, -1, &updateStmt, nil) == SQLITE_OK,
               let preparedUpdate = updateStmt else {
-            throw HistoryStoreError.prepareFailed(String(cString: sqlite3_errmsg(sqliteDB)))
+            throw TestSQLiteFixtureError.prepareFailed(String(cString: sqlite3_errmsg(sqliteDB)))
         }
         defer {
             sqlite3_finalize(preparedUpdate)
@@ -309,7 +309,7 @@ struct RecoveryScriptIntegrationTests {
         }
         guard sqlite3_step(preparedUpdate) == SQLITE_DONE,
               sqlite3_changes(sqliteDB) == 1 else {
-            throw HistoryStoreError.stepFailed("Failed updating \(table).\(column)")
+            throw TestSQLiteFixtureError.stepFailed("Failed updating \(table).\(column)")
         }
     }
 

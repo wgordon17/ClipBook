@@ -1027,18 +1027,6 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     }
 
     @MainActor
-    var subtitle: String {
-        switch kind {
-        case .file:
-            return filePaths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
-        case .image:
-            return assetPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Captured image"
-        default:
-            return previewText
-        }
-    }
-
-    @MainActor
     var previewText: String {
         rawPreviewText ?? kind.title
     }

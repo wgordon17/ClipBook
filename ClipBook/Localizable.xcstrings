@@ -2053,52 +2053,6 @@
         }
       }
     },
-    "Unable to bind a history database value." : {
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ein Wert der Verlaufsdatenbank konnte nicht gebunden werden."
-          }
-        },
-        "en-GB" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Unable to bind a history database value."
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "No se pudo enlazar un valor de la base de datos del historial."
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Impossibile associare un valore del database della cronologia."
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "履歴データベースの値をバインドできません。"
-          }
-        },
-        "pt-BR" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Não foi possível vincular um valor do banco de dados do histórico."
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "无法绑定历史记录数据库值。"
-          }
-        }
-      }
-    },
     "Unable to migrate the history database: %@" : {
       "localizations" : {
         "de" : {
@@ -2191,52 +2145,6 @@
         }
       }
     },
-    "Unable to prepare the history database statement: %@" : {
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Die Anweisung für die Verlaufsdatenbank konnte nicht vorbereitet werden: %@"
-          }
-        },
-        "en-GB" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Unable to prepare the history database statement: %@"
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "No se pudo preparar la sentencia de la base de datos del historial: %@"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Impossibile preparare l’istruzione del database della cronologia: %@"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "履歴データベースのステートメントを準備できません: %@"
-          }
-        },
-        "pt-BR" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Não foi possível preparar a instrução do banco de dados do histórico: %@"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "无法准备历史记录数据库语句：%@"
-          }
-        }
-      }
-    },
     "Unable to verify or decrypt protected history data." : {
       "localizations" : {
         "de" : {
@@ -2279,52 +2187,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无法验证或解密受保护的历史记录数据。"
-          }
-        }
-      }
-    },
-    "Unable to write to the history database: %@" : {
-      "localizations" : {
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "In die Verlaufsdatenbank konnte nicht geschrieben werden: %@"
-          }
-        },
-        "en-GB" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Unable to write to the history database: %@"
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "No se pudo escribir en la base de datos del historial: %@"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Impossibile scrivere nel database della cronologia: %@"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "履歴データベースに書き込めません: %@"
-          }
-        },
-        "pt-BR" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Não foi possível gravar no banco de dados do histórico: %@"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "无法写入历史记录数据库：%@"
           }
         }
       }

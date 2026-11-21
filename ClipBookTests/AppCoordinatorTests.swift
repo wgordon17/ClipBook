@@ -1467,7 +1467,6 @@ extension SharedProcessStateTests {
                     try FileManager.default.setAttributes([.modificationDate: twentyMinutesAgo], ofItemAtPath: exportedSourcePNG.path)
 
                     let sourceArchiveService = ClipBookArchiveService(
-                        fileManager: .default,
                         supportDirectory: archiveParent.appendingPathComponent("SourceSupport", isDirectory: true)
                     )
                     let archiveItem = ClipboardItem.fixture(
@@ -1481,7 +1480,7 @@ extension SharedProcessStateTests {
                     // Trigger an orphan sweep and cancel it immediately before importing, matching archive import flow.
                     _ = harness.coordinator.loadHistory(sweepsCaches: true)
                     harness.coordinator.cancelOrphanedFileSweeps(waitUntilDone: true)
-                    let targetArchiveService = ClipBookArchiveService(fileManager: .default, supportDirectory: supportDir)
+                    let targetArchiveService = ClipBookArchiveService(supportDirectory: supportDir)
                     _ = try targetArchiveService.import(from: archiveURL, into: harness.historyStore, progress: { _ in })
                     #expect(harness.coordinator.loadHistory(sweepsCaches: false))
                     let importedStored = try #require(harness.currentItem(importedID))

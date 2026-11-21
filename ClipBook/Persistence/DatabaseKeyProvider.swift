@@ -88,16 +88,13 @@ nonisolated enum MasterKeyHexCodec {
 nonisolated struct SecItemClient: Sendable {
     var copyMatching: @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
     var add: @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
-    var delete: @Sendable (CFDictionary) -> OSStatus
 
     init(
         copyMatching: @escaping @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = { SecItemCopyMatching($0, $1) },
-        add: @escaping @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = { SecItemAdd($0, $1) },
-        delete: @escaping @Sendable (CFDictionary) -> OSStatus = { SecItemDelete($0) }
+        add: @escaping @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = { SecItemAdd($0, $1) }
     ) {
         self.copyMatching = copyMatching
         self.add = add
-        self.delete = delete
     }
 
     static let live = SecItemClient()
@@ -365,10 +362,6 @@ nonisolated final class InMemoryDatabaseKeyProvider: DatabaseKeyProvider, Sendab
 
     init(key: SymmetricKey? = SymmetricKey(size: .bits256), error: HistoryStoreError? = nil) {
         self.state = OSAllocatedUnfairLock(initialState: State(key: key, error: error))
-    }
-
-    var currentKey: SymmetricKey? {
-        state.withLock { $0.key }
     }
 
     func setKey(_ key: SymmetricKey?) {

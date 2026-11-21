@@ -927,15 +927,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    func incrementCopyCount(_ id: UUID) throws {
-        try withWrite { db, _ in
-            let stmt = try db.cachedStatement(
-                sql: "UPDATE clips SET copyCount = copyCount + 1 WHERE id = ? AND deletedAt IS NULL"
-            )
-            try stmt.execute(arguments: [id.uuidString])
-        }
-    }
-
     func recordAction(_ id: UUID, copiedAt: Date?, incrementsCopyCount: Bool) throws -> ClipboardItem? {
         try withWrite { db, keys in
             let idString = id.uuidString

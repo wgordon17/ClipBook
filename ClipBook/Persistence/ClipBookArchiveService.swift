@@ -169,12 +169,10 @@ nonisolated final class ClipBookArchiveService: Sendable {
     }
 
     init(
-        fileManager: FileManager = .default,
         supportDirectory: URL,
         kdfIterations: Int = HistoryCrypto.productionKDFIterations,
         allowTestIterations: Bool = false
     ) {
-        _ = fileManager
         self.supportDirectory = supportDirectory
         self.kdfIterations = kdfIterations
         self.allowTestIterations = allowTestIterations
