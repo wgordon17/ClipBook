@@ -84,7 +84,7 @@ private struct DerivedArchiveKeys {
     let verifierHMACKey: SymmetricKey
 }
 
-// MARK: - Wire Codable Types (matching ClipBookArchiveModels.swift)
+// MARK: - Wire Codable Types (matching ClipBookArchiveService.swift)
 
 private struct ClipBookArchiveEncryptionMetadata: Codable {
     var archiveID: UUID
