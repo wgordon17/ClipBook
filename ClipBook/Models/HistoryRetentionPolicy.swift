@@ -3,10 +3,11 @@ import Foundation
 /// Which history items have outlived their "Keep history" period. Every kind
 /// gets its own cutoff date; kinds that are kept forever have none, and a
 /// kind kept for zero days expires outright.
-struct HistoryRetentionPolicy {
+nonisolated struct HistoryRetentionPolicy: Sendable {
     let cutoffsByKind: [ClipboardKind: Date]
     let keepsFavoritesAndTaggedItems: Bool
 
+    @MainActor
     init(
         preferences: AppPreferences,
         kinds: Set<ClipboardKind> = Set(ClipboardKind.allCases),

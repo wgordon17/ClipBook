@@ -1,6 +1,10 @@
 @testable import ClipBook
 import AppKit
+import CryptoKit
+import Darwin
 import Foundation
+import os
+import SQLite3
 import Testing
 
 @Suite
@@ -882,6 +886,7 @@ extension SharedProcessStateTests {
             ])
 
             let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([controller] + controller.children) }
             _ = controller.view
             let toolbar = HistoryToolbar()
             toolbar.delegate = controller
@@ -911,6 +916,7 @@ extension SharedProcessStateTests {
             try harness.seedHistory([secondMatch, firstMatch, unrelated])
 
             let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([controller] + controller.children) }
             _ = controller.view
             let toolbar = HistoryToolbar()
             toolbar.delegate = controller
@@ -948,6 +954,7 @@ extension SharedProcessStateTests {
             try harness.seedHistory([targetSecond, targetFirst, unrelatedTop])
 
             let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([controller] + controller.children) }
             _ = controller.view
             let toolbar = HistoryToolbar()
             toolbar.delegate = controller
@@ -977,6 +984,7 @@ extension SharedProcessStateTests {
             try harness.seedHistory([targetSecond, targetFirst, unrelatedTop])
 
             let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([controller] + controller.children) }
             _ = controller.view
             let toolbar = HistoryToolbar()
             toolbar.delegate = controller
@@ -1020,6 +1028,7 @@ extension SharedProcessStateTests {
             try harness.seedHistory([alpha, beta, gamma])
 
             let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([controller] + controller.children) }
             _ = controller.view
             let toolbar = HistoryToolbar()
             toolbar.delegate = controller
@@ -1446,5 +1455,832 @@ extension SharedProcessStateTests {
             #expect(history.rowsView === history.tableView)
             #expect(history.tableView.numberOfRows == history.tableRows.count)
         }
+
+        @Test
+        @MainActor
+        func lazySearchLifecyclePrefixReuseIncrementalDonorReuseFallbackAndTrashIsolation() async throws {
+            TestSupport.ensureAppKitInitialized()
+
+            URLProtocol.registerClass(SearchTestLinkPreviewURLProtocol.self)
+            defer { URLProtocol.unregisterClass(SearchTestLinkPreviewURLProtocol.self) }
+
+            let (harness, spyStore, _) = try TestSupport.makeSpiedTestCoordinator()
+            defer { harness.cleanup() }
+
+            let baseTime = Date(timeIntervalSince1970: 1_710_300_000)
+            let tagAlpha = try spyStore.createTag(name: "ProjectAlpha", color: "#3B85ED")
+            let tagBeta = try spyStore.createTag(name: "KeepBeta", color: "#22AA66")
+
+            let sentinel40KB = "TAIL_SENTINEL_AT_40KB"
+            let body40KB = "confidential_header " + String(repeating: "d", count: 40_000) + " " + sentinel40KB
+            let secretToken = ["sk", "-live-search-", String(repeating: "m4N6pQ8r", count: 4)].joined()
+            let secretBody = "Bearer \(secretToken) confidential_vault_secret"
+            #expect(SensitiveContent.shouldEncryptAtRest(.fixture(kind: .text, text: secretBody)))
+
+            let pngData = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24)
+            let ocrImgID = UUID()
+            let ocrImgURL = try spyStore.writeManagedAsset(pngData: pngData, role: .image, clipID: ocrImgID, encrypted: true)
+
+            let item40KB = ClipboardItem.fixture(
+                kind: .text,
+                text: body40KB,
+                copiedAt: baseTime.addingTimeInterval(10)
+            )
+            let itemSecret = ClipboardItem.fixture(
+                kind: .text,
+                text: secretBody,
+                copiedAt: baseTime.addingTimeInterval(20)
+            )
+            let itemUnicode = ClipboardItem.fixture(
+                kind: .text,
+                text: "Straße Maß ﬁlter Cafe\u{0301} confidential_unicode",
+                copiedAt: baseTime.addingTimeInterval(30)
+            )
+            let itemTagged = ClipboardItem.fixture(
+                kind: .text,
+                text: "Tagged engineering note",
+                copiedAt: baseTime.addingTimeInterval(40),
+                tags: [tagAlpha.id, tagBeta.id]
+            )
+            let itemDeletable = ClipboardItem.fixture(
+                kind: .text,
+                text: "Disposable filler item",
+                copiedAt: baseTime.addingTimeInterval(50)
+            )
+            let itemLink = ClipboardItem.fixture(
+                kind: .link,
+                text: "https://linkpreview-search-test.clipbook.invalid/doc?" + String(repeating: "u", count: 9_000),
+                copiedAt: baseTime.addingTimeInterval(60)
+            )
+            let itemPendingOCR = ClipboardItem.fixture(
+                id: ocrImgID,
+                kind: .image,
+                text: nil,
+                assetPath: ocrImgURL.path,
+                copiedAt: baseTime.addingTimeInterval(70)
+            )
+            let itemTrashed = ClipboardItem.fixture(
+                kind: .text,
+                text: "trashed_only_needle confidential_trashed",
+                copiedAt: baseTime.addingTimeInterval(5)
+            )
+
+            for item in [item40KB, itemSecret, itemUnicode, itemTagged, itemDeletable, itemLink, itemPendingOCR, itemTrashed] {
+                try spyStore.saveAndReconcileItem(item, convertingExternalAssets: true)
+            }
+            try spyStore.moveToTrash(ids: [itemTrashed.id], at: Date().addingTimeInterval(-60))
+
+            spyStore.resetRecordedCalls()
+            #expect(harness.coordinator.loadHistory(sweepsCaches: false))
+
+            // (a) Idle: cachedSearchCorpus is nil, 0 fetchSearchTexts calls, and model.items holds 0 full searchText strings.
+            #expect(harness.model.items.count == 7)
+            #expect(harness.model.items.allSatisfy { !$0.isContentLoaded && $0.searchText.isEmpty })
+            #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+            #expect(harness.model.searchResult == nil)
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+
+            let controller = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            defer { TestSupport.drainDelayedPerforms([controller]) }
+            _ = controller.view
+            let toolbar = HistoryToolbar()
+            toolbar.delegate = controller
+            controller.attachToolbar(toolbar)
+
+            func findView<T: NSView>(ofType _: T.Type, in root: NSView) -> T? {
+                if let matched = root as? T {
+                    return matched
+                }
+                for subview in root.subviews {
+                    if let found = findView(ofType: T.self, in: subview) {
+                        return found
+                    }
+                }
+                return nil
+            }
+            let listPaneView = try #require(findView(ofType: History.self, in: controller.view))
+            let listTableView = try #require(findView(ofType: NSTableView.self, in: listPaneView))
+
+            @MainActor
+            func runSearchAndWait(_ query: String) async {
+                controller.historyToolbar(toolbar, didChangeSearchQuery: query)
+                let settled = await TestSupport.waitUntil {
+                    harness.model.searchQuery == query
+                        && harness.model.searchResult?.terms == HistorySearchTerms(query: query)
+                        && harness.model.searchResult?.revision == harness.model.sortedListRevision
+                }
+                #expect(settled, "Search did not settle for query=\(query)")
+            }
+
+            // (b) Active search: hydrates HistorySearchCorpus on searchQueue (matching 40 KB tail, decrypted isEncrypted == 1 secret,
+            //     and Unicode folding traps) and reuses cachedSearchCorpus with 0 extra fetchSearchTexts calls on prefix refinements!
+            spyStore.resetRecordedCalls()
+            await runSearchAndWait(sentinel40KB)
+            #expect(spyStore.fetchSearchTextsCalls.count == 1)
+            #expect(spyStore.fetchSearchTextsCalls[0].ids.count == 7)
+            #expect(!spyStore.fetchSearchTextsCalls[0].trashed)
+            #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
+            #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus != nil)
+
+            // Subsequent queries at the same sortedListRevision reuse cachedSearchCorpus with 0 DB calls!
+            spyStore.resetRecordedCalls()
+            await runSearchAndWait("confidential_vault_secret")
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+            #expect(harness.model.filteredItems.map(\.id) == [itemSecret.id])
+
+            await runSearchAndWait("strass fi café")
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+            #expect(harness.model.filteredItems.map(\.id) == [itemUnicode.id])
+
+            // Strict prefix refinements "con" -> "conf" -> "confi" perform 0 extra fetchSearchTexts calls!
+            await runSearchAndWait("con")
+            await runSearchAndWait("conf")
+            await runSearchAndWait("confi")
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+            #expect(Set(harness.model.filteredItems.map(\.id)) == [item40KB.id, itemSecret.id, itemUnicode.id])
+
+            // (c.1) Toggling Favorite, flipping sort order, and deleting an item mid-search perform 0 fetchSearchTexts calls
+            //       while preserving 40 KB tail and decrypted secret matches!
+            spyStore.resetRecordedCalls()
+            harness.coordinator.toggleFavorite(try #require(harness.currentItem(item40KB.id)))
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty, "Favorite toggle mid-search must perform 0 fetchSearchTexts calls")
+
+            controller.historyToolbarDidRequestToggleSortOrder(toolbar)
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty, "Sort-order flip mid-search must perform 0 fetchSearchTexts calls")
+
+            harness.coordinator.delete(try #require(harness.currentItem(itemDeletable.id)))
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty, "Deleting an item mid-search must perform 0 fetchSearchTexts calls")
+            #expect(Set(harness.model.filteredItems.map(\.id)) == [item40KB.id, itemSecret.id, itemUnicode.id])
+
+            // Also verify 40 KB tail sentinel is still intact inside the donor-reused corpus!
+            await runSearchAndWait(sentinel40KB)
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+            #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
+            await runSearchAndWait("confi")
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+
+            // (c.2) Capturing 1 >8 KB item mid-search queries fetchSearchTexts for ONLY [capturedID] (1 ID)!
+            spyStore.resetRecordedCalls()
+            let captured9KBText = String(repeating: "c", count: 9_500) + " confi_captured_tail"
+            harness.pasteboard.clearContents()
+            harness.pasteboard.setString(captured9KBText, forType: .string)
+            await harness.clipboardMonitor.pollAndWaitForDelivery()
+            let newlyCaptured = try #require(harness.model.items.first)
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[newlyCaptured.id]])
+            #expect(harness.model.filteredItems.contains { $0.id == newlyCaptured.id })
+
+            // (c.3) Editing 1 >8 KB item mid-search queries fetchSearchTexts for ONLY [editedID] (1 ID)!
+            spyStore.resetRecordedCalls()
+            let edited9KBText = String(repeating: "e", count: 9_600) + " confi_edited_tail"
+            harness.coordinator.editContent(newlyCaptured, text: edited9KBText)
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[newlyCaptured.id]])
+            #expect(harness.model.filteredItems.contains { $0.id == newlyCaptured.id })
+
+            // (c.4) Completing post-OCR didRecognize mid-search queries fetchSearchTexts for ONLY [ocrImgID] (1 ID)!
+            spyStore.resetRecordedCalls()
+            harness.coordinator.pasteboardMonitor(
+                harness.clipboardMonitor,
+                didRecognize: RecognizedImageContent(text: "OCR recognized confi_diagram", qrCodeText: nil),
+                inItemWithID: ocrImgID
+            )
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[ocrImgID]])
+            #expect(harness.model.filteredItems.contains { $0.id == ocrImgID })
+
+            // (c.5) Persisting a link preview mid-search queries fetchSearchTexts for ONLY [itemLink.id] (1 ID)!
+            spyStore.resetRecordedCalls()
+            harness.coordinator.updateLink(try #require(harness.currentItem(itemLink.id)))
+            let linkPreviewRefreshed = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                harness.currentItem(itemLink.id)?.linkPreviewDetails != nil
+                    && harness.model.searchResult?.revision == harness.model.sortedListRevision
+            }
+            #expect(linkPreviewRefreshed)
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemLink.id]])
+            #expect(harness.model.filteredItems.contains { $0.id == itemLink.id })
+
+            // (c.6) Tag rename & delete (both via coordinator.updateTag/deleteTag AND direct model.tags mutation)
+            //       invalidate stale tag matches on tagged items while reusing all untagged donor entries!
+            await runSearchAndWait("ProjectAlpha")
+            #expect(harness.model.filteredItems.map(\.id) == [itemTagged.id])
+
+            spyStore.resetRecordedCalls()
+            harness.coordinator.updateTag(tagAlpha, name: "RenamedOmegaTag", color: .systemBlue)
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemTagged.id]])
+            #expect(harness.model.filteredItems.isEmpty, "Stale tag name ProjectAlpha must no longer match after rename")
+
+            spyStore.resetRecordedCalls()
+            await runSearchAndWait("RenamedOmegaTag")
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+            #expect(harness.model.filteredItems.map(\.id) == [itemTagged.id])
+
+            // Direct model.tags mutation also invalidates tagNamesByID on tagged items while reusing untagged donors!
+            spyStore.resetRecordedCalls()
+            harness.model.tags = [
+                ClipBook.Tag(id: tagAlpha.id, name: "DirectMutatedTag", color: tagAlpha.color),
+                tagBeta,
+            ]
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemTagged.id]])
+            #expect(harness.model.filteredItems.isEmpty)
+
+            // Sync DB tag name and delete the tag mid-search: queries ONLY [itemTagged.id] and clears match!
+            _ = try spyStore.updateTag(id: tagAlpha.id, name: "DirectMutatedTag", color: tagAlpha.color)
+            await runSearchAndWait("DirectMutatedTag")
+            #expect(harness.model.filteredItems.map(\.id) == [itemTagged.id])
+
+            let tagToDelete = try #require(harness.model.tags.first { $0.id == tagAlpha.id })
+            spyStore.resetRecordedCalls()
+            harness.coordinator.deleteTag(tagToDelete)
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemTagged.id]])
+            #expect(harness.model.filteredItems.isEmpty)
+
+            // (c.7) Degraded fallback corpus (fetchSearchTexts throw) sets hasCompleteTexts == false and revisions[slot] == 0,
+            //       never caches as complete, and re-hydrates cleanly once fetchSearchTexts succeeds again!
+            controller.clearSearchAfterHiddenInterval()
+            #expect(harness.model.searchQuery.isEmpty)
+
+            spyStore.shouldThrowOnFetchSearchTexts = true
+            spyStore.resetRecordedCalls()
+            await runSearchAndWait(sentinel40KB)
+            let degradedResult = try #require(harness.model.searchResult)
+            #expect(!degradedResult.corpus.hasCompleteTexts)
+            #expect(degradedResult.corpus.revisions.allSatisfy { $0 == 0 })
+            #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+            #expect(harness.model.filteredItems.isEmpty, "Header fallback lacks >8 KB tail sentinel while store throws")
+            #expect(await TestSupport.waitUntil { listPaneView.items.isEmpty && listTableView.numberOfRows == 0 })
+
+            // Re-querying the SAME search term once store recovers re-hydrates via applyPendingSearchQuery's hasCompleteTexts == false guard
+            // and reloads listPaneView even though HistorySearchTerms is unchanged!
+            spyStore.shouldThrowOnFetchSearchTexts = false
+            spyStore.resetRecordedCalls()
+            controller.historyToolbar(toolbar, didChangeSearchQuery: sentinel40KB)
+            let recovered = await TestSupport.waitUntil {
+                harness.model.searchResult?.corpus.hasCompleteTexts == true
+                    && listPaneView.items.map(\.id) == [item40KB.id]
+            }
+            #expect(recovered)
+            #expect(spyStore.fetchSearchTextsCalls.count == 1)
+            #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
+            #expect(listPaneView.items.map(\.id) == [item40KB.id])
+            #expect(listTableView.numberOfRows >= 1)
+            #expect(harness.model.selectedItemID == item40KB.id)
+
+            // Also verify recovery when query changes only by trailing whitespace (HistorySearchTerms unchanged, model.searchQuery changed).
+            controller.clearSearchAfterHiddenInterval()
+            spyStore.shouldThrowOnFetchSearchTexts = true
+            await runSearchAndWait(sentinel40KB)
+            #expect(await TestSupport.waitUntil { listPaneView.items.isEmpty && listTableView.numberOfRows == 0 })
+            spyStore.shouldThrowOnFetchSearchTexts = false
+            spyStore.resetRecordedCalls()
+            controller.historyToolbar(toolbar, didChangeSearchQuery: sentinel40KB + " ")
+            let recoveredWhitespace = await TestSupport.waitUntil {
+                harness.model.searchResult?.corpus.hasCompleteTexts == true
+                    && listPaneView.items.map(\.id) == [item40KB.id]
+            }
+            #expect(recoveredWhitespace)
+            #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
+            #expect(listPaneView.items.map(\.id) == [item40KB.id])
+            #expect(listTableView.numberOfRows >= 1)
+            #expect(harness.model.selectedItemID == item40KB.id)
+
+            // (c.8) Toggling Trash (isShowingTrash) never cross-contaminates Active vs Trash results!
+            await runSearchAndWait("trashed_only_needle")
+            #expect(harness.model.filteredItems.isEmpty)
+
+            harness.model.trashedItems = try spyStore.fetchTrashedItems()
+            spyStore.resetRecordedCalls()
+            harness.model.selectedHistoryFilterContentTypes = [.trash]
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(spyStore.fetchSearchTextsCalls.contains { $0.trashed && $0.ids.contains(itemTrashed.id) })
+            #expect(harness.model.filteredItems.map(\.id) == [itemTrashed.id])
+
+            harness.model.selectedHistoryFilterContentTypes = []
+            #expect(await TestSupport.waitUntil {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+            })
+            #expect(harness.model.filteredItems.isEmpty)
+
+            // (d) Clear: clearing searchQuery releases cachedSearchCorpus, searchResult, and lastCompletedSearchResult!
+            controller.historyToolbar(toolbar, didChangeSearchQuery: "")
+            #expect(harness.model.searchQuery.isEmpty)
+            #expect(harness.model.searchResult == nil)
+            #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+            // Advance sortedListRevision while idle (Favorite toggle) and search again: because lastCompletedSearchResult
+            // was also cleared, ALL active items must be fetched fresh rather than donated from a leaked result!
+            harness.coordinator.toggleFavorite(try #require(harness.currentItem(item40KB.id)))
+            spyStore.resetRecordedCalls()
+            await runSearchAndWait("confi")
+            #expect(spyStore.fetchSearchTextsCalls.count == 1)
+            #expect(spyStore.fetchSearchTextsCalls[0].ids.count == harness.model.items.count)
+
+            controller.clearSearchAfterHiddenInterval()
+            #expect(harness.model.searchQuery.isEmpty)
+            #expect(harness.model.searchResult == nil)
+            #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+        }
+
+        @Test(.timeLimit(.minutes(2)))
+        @MainActor
+        func scaleAndColdFirstKeystrokeGateAcross5k25kAnd100kRows() throws {
+            TestSupport.ensureAppKitInitialized()
+
+            try TestSupport.withTemporaryDirectory { supportDir in
+                let masterKey = SymmetricKey(size: .bits256)
+                let keyProvider = InMemoryDatabaseKeyProvider(key: masterKey)
+                let dbURL = supportDir.appendingPathComponent("History.sqlite")
+
+                // Initialize genuine v5 schema + key_verifier_v1 via GRDBHistoryStore, then close before bulk SQLite seeding.
+                do {
+                    let initStore = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                    _ = try initStore.fetchAll()
+                    initStore.close()
+                }
+
+                let suiteName = "com.ikryanov.clipbook.tests.\(UUID().uuidString)"
+                let defaults = try #require(UserDefaults(suiteName: suiteName))
+                defaults.removePersistentDomain(forName: suiteName)
+                defer { TestSupport.removeDefaultsSuite(named: suiteName) }
+
+                var seededRowCount = 0
+                var cumulativeBodyUTF8Bytes: Int64 = 0
+                var cumulativeHTMLUTF8Bytes: Int64 = 0
+                var expectedTailSentinelIDs = Set<UUID>()
+                var expectedEncryptedSentinelIDs = Set<UUID>()
+
+                for milestone in [5_000, 25_000, 100_000] {
+                    let batchStats = try Self.bulkInsertSyntheticV5Rows(
+                        at: dbURL,
+                        masterKey: masterKey,
+                        startIndex: seededRowCount,
+                        endIndex: milestone
+                    )
+                    seededRowCount = milestone
+                    cumulativeBodyUTF8Bytes += batchStats.bodyUTF8Bytes
+                    cumulativeHTMLUTF8Bytes += batchStats.htmlUTF8Bytes
+                    expectedTailSentinelIDs.formUnion(batchStats.tailSentinelIDs)
+                    expectedEncryptedSentinelIDs.formUnion(batchStats.encryptedSentinelIDs)
+
+                    let baseStore = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                    let spyStore = SpyHistoryStore(base: baseStore)
+
+                    let pasteboard = NSPasteboard.withUniqueName()
+                    let preferencesStore = PreferencesStore(userDefaults: defaults)
+                    var prefs = AppPreferences()
+                    prefs.warnOnClearHistory = false
+                    prefs.soundEffectsEnabled = false
+                    prefs.launchAtLogin = false
+                    prefs.showPreviewForLinks = false
+                    preferencesStore.save(prefs)
+
+                    let model = AppModel()
+                    model.preferences = prefs
+                    let monitor = PasteboardMonitor(
+                        historyStore: spyStore,
+                        fileManager: .default,
+                        supportDirectory: supportDir,
+                        pasteboard: pasteboard
+                    )
+                    let pasteService = PasteService(
+                        pasteboard: pasteboard,
+                        loadContent: { [spyStore] item, scope in
+                            try spyStore.loadingContent(of: item, scope: scope)
+                        }
+                    )
+                    let coordinator = AppCoordinator(
+                        model: model,
+                        preferencesStore: preferencesStore,
+                        historyStore: spyStore,
+                        clipboardMonitor: monitor,
+                        pasteService: pasteService,
+                        globalShortcuts: GlobalShortcutService(isEnabled: false),
+                        updateService: TestNoOpUpdateService(),
+                        licensingService: LicensingService(),
+                        fileManager: .default,
+                        supportDirectory: supportDir
+                    )
+
+                    do {
+                        defer {
+                            coordinator.stopBackgroundWorkForTesting()
+                            coordinator.cancelBackgroundMaintenance()
+                            monitor.stop()
+                            spyStore.close()
+                            pasteboard.releaseGlobally()
+                        }
+
+                        // 1. Measure unloaded fetchAll() header load time & resident phys_footprint delta.
+                        let baselineFootprint = Self.currentPhysFootprintBytes()
+                        let fetchStart = ContinuousClock.now
+                        let headers = try spyStore.fetchAll()
+                        let fetchElapsed = ContinuousClock.now - fetchStart
+                        let postHeaderFootprint = Self.currentPhysFootprintBytes()
+
+                        #expect(headers.count == milestone)
+                        #expect(headers.allSatisfy { !$0.isContentLoaded && $0.searchText.isEmpty })
+                        #expect(fetchElapsed < .seconds(15), "Unloaded fetchAll() took \(fetchElapsed) at \(milestone) rows")
+
+                        let headerFootprintDelta = max(0, postHeaderFootprint - baselineFootprint)
+                        // Eagerly hydrated items hold both text and searchText plus formatting in memory.
+                        let eagerHydratedEquivalentBytes = cumulativeBodyUTF8Bytes * 2 + cumulativeHTMLUTF8Bytes
+                        #expect(
+                            headerFootprintDelta < eagerHydratedEquivalentBytes / 2,
+                            "Unloaded header phys_footprint delta (\(headerFootprintDelta) B) exceeded fraction of eager hydrated payload (\(eagerHydratedEquivalentBytes) B) at \(milestone) rows"
+                        )
+
+                        // 2. Populate AppModel & HistoryContentViewController; verify idle corpus is nil.
+                        model.items = headers
+                        #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                        let controller = HistoryContentViewController(model: model, coordinator: coordinator)
+                        defer { TestSupport.drainDelayedPerforms([controller]) }
+                        _ = controller.view
+                        let toolbar = HistoryToolbar()
+                        toolbar.delegate = controller
+                        controller.attachToolbar(toolbar)
+
+                        // 3. Cold first-keystroke fetchSearchTexts + HistorySearchJob.run + synchronous flushPendingSearch()!
+                        spyStore.resetRecordedCalls()
+                        let query = "scale_needle"
+                        let firstKeystrokeStart = ContinuousClock.now
+                        controller.historyToolbar(toolbar, didChangeSearchQuery: query)
+                        controller.selectHistoryItemOnOpen()
+                        let firstKeystrokeElapsed = ContinuousClock.now - firstKeystrokeStart
+
+                        #expect(firstKeystrokeElapsed < .seconds(20), "Cold first-keystroke took \(firstKeystrokeElapsed) at \(milestone) rows")
+                        #expect(spyStore.fetchSearchTextsCalls.count == 1)
+                        #expect(spyStore.fetchSearchTextsCalls[0].ids.count == milestone)
+
+                        let searchResult = try #require(model.searchResult)
+                        #expect(searchResult.corpus.hasCompleteTexts)
+                        #expect(searchResult.matches.count == milestone)
+
+                        // Verify >8 KB tail sentinels and decrypted isEncrypted == 1 sentinels matched.
+                        for tailID in expectedTailSentinelIDs {
+                            let idx = try #require(searchResult.indexByID[tailID])
+                            #expect(searchResult.matches[idx], "40 KB tail row \(tailID) missed at \(milestone) rows")
+                        }
+                        for encID in expectedEncryptedSentinelIDs {
+                            let idx = try #require(searchResult.indexByID[encID])
+                            #expect(searchResult.matches[idx], "Encrypted row \(encID) missed at \(milestone) rows")
+                        }
+
+                        // Verify 0 match mismatches against Foundation String.range(of:options:locale:) across ALL rows!
+                        let locale = Locale.current
+                        var mismatchCount = 0
+                        for (index, haystack) in searchResult.corpus.texts.enumerated() {
+                            let expected = haystack.range(
+                                of: query,
+                                options: [.caseInsensitive, .diacriticInsensitive],
+                                range: nil,
+                                locale: locale
+                            ) != nil
+                            if searchResult.matches[index] != expected {
+                                mismatchCount += 1
+                            }
+                        }
+                        #expect(mismatchCount == 0, "Found \(mismatchCount) Foundation parity mismatches at \(milestone) rows")
+
+                        controller.clearSearchAfterHiddenInterval()
+                        #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+                        #expect(model.searchResult == nil)
+                    }
+                }
+            }
+        }
+
+        private nonisolated static func currentPhysFootprintBytes() -> Int64 {
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+            let kr = withUnsafeMutablePointer(to: &info) { ptr in
+                ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), intPtr, &count)
+                }
+            }
+            return kr == KERN_SUCCESS ? Int64(info.phys_footprint) : 0
+        }
+
+        private nonisolated struct BulkSeedStats {
+            let bodyUTF8Bytes: Int64
+            let htmlUTF8Bytes: Int64
+            let tailSentinelIDs: [UUID]
+            let encryptedSentinelIDs: [UUID]
+        }
+
+        private nonisolated static func bulkInsertSyntheticV5Rows(
+            at dbURL: URL,
+            masterKey: SymmetricKey,
+            startIndex: Int,
+            endIndex: Int
+        ) throws -> BulkSeedStats {
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db else {
+                sqlite3_close(db)
+                throw HistoryStoreError.openFailed
+            }
+            defer { sqlite3_close(db) }
+
+            let sqlTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+                throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            let clipSQL = """
+                INSERT INTO clips (
+                    id, kind, copiedAt, firstCopiedAt, deletedAt, expiresAt,
+                    copySequenceID, copySequenceOrder, byteSize, copyCount,
+                    isFavorite, favoriteOrder, sourceAppName, sourceBundleIdentifier,
+                    sensitivity, isEncrypted, title, textPreview, characterCount,
+                    containsPreviewSecret, containsRestSecret, hasRecognizedText,
+                    hasQRCodeText, isSVGText, hasFormatting, htmlDigest, imageDigest,
+                    imageWidth, imageHeight, assetPath, filePathsData, linkPreviewData, contentKey
+                ) VALUES (
+                    ?, ?, ?, ?, NULL, NULL,
+                    NULL, NULL, ?, 1,
+                    0, NULL, 'ScaleApp', 'com.example.scale',
+                    ?, ?, NULL, ?, ?,
+                    ?, ?, 0,
+                    0, 0, ?, ?, NULL,
+                    NULL, NULL, NULL, ?, NULL, ?
+                );
+                """
+            let contentSQL = """
+                INSERT INTO clip_contents (clipId, text, qrCodeText, rtf, html)
+                VALUES (?, ?, NULL, NULL, ?);
+                """
+
+            var clipStmt: OpaquePointer?
+            var contentStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, clipSQL, -1, &clipStmt, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, contentSQL, -1, &contentStmt, nil) == SQLITE_OK,
+                  let clipStmt,
+                  let contentStmt else {
+                let msg = String(cString: sqlite3_errmsg(db))
+                sqlite3_finalize(clipStmt)
+                sqlite3_finalize(contentStmt)
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                throw HistoryStoreError.prepareFailed(msg)
+            }
+            defer {
+                sqlite3_finalize(clipStmt)
+                sqlite3_finalize(contentStmt)
+            }
+
+            let derivedKeys = ClipBookDerivedKeys(masterKey: masterKey)
+            let emptyFilePathsBytes = Array("[]".utf8)
+            let largePrefix8KB = String(repeating: "L", count: ClipboardItem.textPreviewBodyLimit)
+            let largeBody40KB = largePrefix8KB + String(repeating: "b", count: 32_000) + " SCALE_NEEDLE_TAIL_40KB"
+            let largeBodyUTF8 = Array(largeBody40KB.utf8)
+            let largePreviewUTF8 = Array(largePrefix8KB.utf8)
+            let largeCharCount = Int64(largeBody40KB.count)
+
+            let largeHTML40KB = "<article>" + String(repeating: "h", count: 40_000) + "</article>"
+            let largeHTMLUTF8 = Array(largeHTML40KB.utf8)
+            let largeHTMLDigestUTF8 = Array(ContentDigest.sha256(Data(largeHTMLUTF8)).utf8)
+
+            let unicodeBody = "Café Straße ﬁlter UNICODE_SCALE_NEEDLE entry"
+            let unicodeUTF8 = Array(unicodeBody.utf8)
+            let unicodeCharCount = Int64(unicodeBody.count)
+
+            let secretToken = ["sk", "-scale-row-", String(repeating: "z8X6cV4b", count: 4)].joined()
+            let secretBody = "Bearer \(secretToken) ENCRYPTED_SCALE_NEEDLE"
+            let secretPreview = String(secretBody.prefix(ClipboardItem.textPreviewBodyLimit))
+
+            let fillerBody = "Ordinary clipboard history prose entry alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma"
+            let fillerUTF8 = Array(fillerBody.utf8)
+            let fillerCharCount = Int64(fillerBody.count)
+
+            var totalBodyBytes: Int64 = 0
+            var totalHTMLBytes: Int64 = 0
+            var tailSentinelIDs: [UUID] = []
+            var encryptedSentinelIDs: [UUID] = []
+            var contentKeyBytes = [UInt8](repeating: 0, count: 32)
+
+            func bindBlob(_ stmt: OpaquePointer, _ index: Int32, _ bytes: [UInt8]) {
+                bytes.withUnsafeBytes { raw in
+                    _ = sqlite3_bind_blob(stmt, index, raw.baseAddress, Int32(raw.count), sqlTransient)
+                }
+            }
+
+            for rowIndex in startIndex..<endIndex {
+                sqlite3_reset(clipStmt)
+                sqlite3_clear_bindings(clipStmt)
+                sqlite3_reset(contentStmt)
+                sqlite3_clear_bindings(contentStmt)
+
+                let id = UUID()
+                let idString = id.uuidString
+                let copiedAt = 1_700_000_000.0 + Double(rowIndex) * 0.001
+
+                let uuidTuple = id.uuid
+                withUnsafeBytes(of: uuidTuple) { rawUUID in
+                    for b in 0..<16 {
+                        contentKeyBytes[b] = rawUUID[b]
+                        contentKeyBytes[16 + b] = rawUUID[15 - b] ^ UInt8(truncatingIfNeeded: rowIndex)
+                    }
+                }
+
+                _ = sqlite3_bind_text(clipStmt, 1, idString, -1, sqlTransient)
+                _ = sqlite3_bind_text(contentStmt, 1, idString, -1, sqlTransient)
+                _ = sqlite3_bind_double(clipStmt, 3, copiedAt)
+                _ = sqlite3_bind_double(clipStmt, 4, copiedAt)
+
+                if rowIndex % 500 == 1 {
+                    // Genuine AES-GCM encrypted sensitive row (isEncrypted == 1)
+                    let sealedPreview = Array(try HistoryCrypto.sealColumn(
+                        Data(secretPreview.utf8),
+                        table: "clips",
+                        column: "textPreview",
+                        clipID: id,
+                        keys: derivedKeys
+                    ))
+                    let sealedFilePaths = Array(try HistoryCrypto.sealColumn(
+                        Data(emptyFilePathsBytes),
+                        table: "clips",
+                        column: "filePathsData",
+                        clipID: id,
+                        keys: derivedKeys
+                    ))
+                    let sealedText = Array(try HistoryCrypto.sealColumn(
+                        Data(secretBody.utf8),
+                        table: "clip_contents",
+                        column: "text",
+                        clipID: id,
+                        keys: derivedKeys
+                    ))
+                    let hmacKey = Array(HistoryCrypto.contentKey(
+                        kind: .text,
+                        canonicalContent: secretBody,
+                        htmlDigest: nil,
+                        keys: derivedKeys
+                    ))
+
+                    _ = sqlite3_bind_text(clipStmt, 2, "text", -1, sqlTransient)
+                    _ = sqlite3_bind_int64(clipStmt, 5, Int64(secretBody.utf8.count))
+                    _ = sqlite3_bind_text(clipStmt, 6, "sensitive", -1, sqlTransient)
+                    _ = sqlite3_bind_int64(clipStmt, 7, 1)
+                    bindBlob(clipStmt, 8, sealedPreview)
+                    _ = sqlite3_bind_int64(clipStmt, 9, Int64(secretBody.count))
+                    _ = sqlite3_bind_int64(clipStmt, 10, 1)
+                    _ = sqlite3_bind_int64(clipStmt, 11, 1)
+                    _ = sqlite3_bind_int64(clipStmt, 12, 0)
+                    sqlite3_bind_null(clipStmt, 13)
+                    bindBlob(clipStmt, 14, sealedFilePaths)
+                    bindBlob(clipStmt, 15, hmacKey)
+
+                    bindBlob(contentStmt, 2, sealedText)
+                    sqlite3_bind_null(contentStmt, 3)
+
+                    totalBodyBytes += Int64(secretBody.utf8.count)
+                    if encryptedSentinelIDs.count < 16 {
+                        encryptedSentinelIDs.append(id)
+                    }
+                } else if rowIndex % 10 == 0 {
+                    // 40 KB body + 40 KB HTML rich row (tail needle is past char 40,000, absent from 8 KB textPreview!)
+                    _ = sqlite3_bind_text(clipStmt, 2, "richText", -1, sqlTransient)
+                    _ = sqlite3_bind_int64(clipStmt, 5, Int64(largeBodyUTF8.count + largeHTMLUTF8.count))
+                    sqlite3_bind_null(clipStmt, 6)
+                    _ = sqlite3_bind_int64(clipStmt, 7, 0)
+                    bindBlob(clipStmt, 8, largePreviewUTF8)
+                    _ = sqlite3_bind_int64(clipStmt, 9, largeCharCount)
+                    _ = sqlite3_bind_int64(clipStmt, 10, 0)
+                    _ = sqlite3_bind_int64(clipStmt, 11, 0)
+                    _ = sqlite3_bind_int64(clipStmt, 12, 1)
+                    bindBlob(clipStmt, 13, largeHTMLDigestUTF8)
+                    bindBlob(clipStmt, 14, emptyFilePathsBytes)
+                    bindBlob(clipStmt, 15, contentKeyBytes)
+
+                    bindBlob(contentStmt, 2, largeBodyUTF8)
+                    bindBlob(contentStmt, 3, largeHTMLUTF8)
+
+                    totalBodyBytes += Int64(largeBodyUTF8.count)
+                    totalHTMLBytes += Int64(largeHTMLUTF8.count)
+                    if tailSentinelIDs.count < 16 {
+                        tailSentinelIDs.append(id)
+                    }
+                } else if rowIndex % 250 == 2 {
+                    // Unicode diacritic + ligature + sharp-s folding row
+                    _ = sqlite3_bind_text(clipStmt, 2, "text", -1, sqlTransient)
+                    _ = sqlite3_bind_int64(clipStmt, 5, Int64(unicodeUTF8.count))
+                    sqlite3_bind_null(clipStmt, 6)
+                    _ = sqlite3_bind_int64(clipStmt, 7, 0)
+                    bindBlob(clipStmt, 8, unicodeUTF8)
+                    _ = sqlite3_bind_int64(clipStmt, 9, unicodeCharCount)
+                    _ = sqlite3_bind_int64(clipStmt, 10, 0)
+                    _ = sqlite3_bind_int64(clipStmt, 11, 0)
+                    _ = sqlite3_bind_int64(clipStmt, 12, 0)
+                    sqlite3_bind_null(clipStmt, 13)
+                    bindBlob(clipStmt, 14, emptyFilePathsBytes)
+                    bindBlob(clipStmt, 15, contentKeyBytes)
+
+                    bindBlob(contentStmt, 2, unicodeUTF8)
+                    sqlite3_bind_null(contentStmt, 3)
+
+                    totalBodyBytes += Int64(unicodeUTF8.count)
+                } else {
+                    // Ordinary non-matching filler row
+                    _ = sqlite3_bind_text(clipStmt, 2, "text", -1, sqlTransient)
+                    _ = sqlite3_bind_int64(clipStmt, 5, Int64(fillerUTF8.count))
+                    sqlite3_bind_null(clipStmt, 6)
+                    _ = sqlite3_bind_int64(clipStmt, 7, 0)
+                    bindBlob(clipStmt, 8, fillerUTF8)
+                    _ = sqlite3_bind_int64(clipStmt, 9, fillerCharCount)
+                    _ = sqlite3_bind_int64(clipStmt, 10, 0)
+                    _ = sqlite3_bind_int64(clipStmt, 11, 0)
+                    _ = sqlite3_bind_int64(clipStmt, 12, 0)
+                    sqlite3_bind_null(clipStmt, 13)
+                    bindBlob(clipStmt, 14, emptyFilePathsBytes)
+                    bindBlob(clipStmt, 15, contentKeyBytes)
+
+                    bindBlob(contentStmt, 2, fillerUTF8)
+                    sqlite3_bind_null(contentStmt, 3)
+
+                    totalBodyBytes += Int64(fillerUTF8.count)
+                }
+
+                guard sqlite3_step(clipStmt) == SQLITE_DONE,
+                      sqlite3_step(contentStmt) == SQLITE_DONE else {
+                    let msg = String(cString: sqlite3_errmsg(db))
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    throw HistoryStoreError.stepFailed(msg)
+                }
+            }
+
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            return BulkSeedStats(
+                bodyUTF8Bytes: totalBodyBytes,
+                htmlUTF8Bytes: totalHTMLBytes,
+                tailSentinelIDs: tailSentinelIDs,
+                encryptedSentinelIDs: encryptedSentinelIDs
+            )
+        }
     }
+}
+
+private nonisolated final class SearchTestLinkPreviewURLProtocol: URLProtocol {
+    override nonisolated class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "linkpreview-search-test.clipbook.invalid"
+    }
+
+    override nonisolated class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override nonisolated func startLoading() {
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Type": "text/html; charset=utf-8"]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let html = """
+            <!doctype html>
+            <html>
+            <head>
+              <title>ConfidOpenGraphPreviewTitle</title>
+              <meta name="description" content="confi_link_preview_description" />
+            </head>
+            <body></body>
+            </html>
+            """
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(html.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override nonisolated func stopLoading() {}
 }

@@ -220,14 +220,24 @@ final class ItemPreviewToolbar: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 
     if item.kind == .file, let filePath = item.filePaths.first, !item.isMultipleFileItem {
-      let fileURL = URL(fileURLWithPath: filePath)
-      titleField.lineBreakMode = .byTruncatingTail
-      titleField.stringValue = fileURL.lastPathComponent
-      titleField.toolTip = filePath
-      subtitleField.stringValue = fileURL.deletingLastPathComponent().path
-      subtitleField.toolTip = filePath
-      subtitleField.isHidden = false
-      titleStack.isHidden = false
+      if sensitiveContent.hidesContent {
+        titleField.lineBreakMode = .byTruncatingTail
+        titleField.stringValue = ItemPreviewDetailsView.typeName(for: item)
+        titleField.toolTip = nil
+        subtitleField.stringValue = ""
+        subtitleField.toolTip = nil
+        subtitleField.isHidden = true
+        titleStack.isHidden = false
+      } else {
+        let fileURL = URL(fileURLWithPath: filePath)
+        titleField.lineBreakMode = .byTruncatingTail
+        titleField.stringValue = fileURL.lastPathComponent
+        titleField.toolTip = filePath
+        subtitleField.stringValue = fileURL.deletingLastPathComponent().path
+        subtitleField.toolTip = filePath
+        subtitleField.isHidden = false
+        titleStack.isHidden = false
+      }
     } else if let browserURL = item.browserURL {
       // The address says more about a link than its type does. It is truncated
       // in the middle so the host and the end of the path both stay readable.
@@ -456,12 +466,14 @@ final class ItemPreviewToolbar: NSObject, NSToolbarDelegate, NSMenuDelegate {
       if item.canCopyTextFromQRCode {
         identifiers.append(copyTextFromQRCodeIdentifier)
       }
-      identifiers.append(contentsOf: [saveAsFileIdentifier, favoriteIdentifier, tagsIdentifier])
-      // Open in ... goes last, so the labelled item ends the toolbar.
-      identifiers.append(openInApplicationIdentifier)
+      identifiers.append(contentsOf: [saveAsFileIdentifier, favoriteIdentifier, tagsIdentifier, moreActionsIdentifier])
+      if !item.hasEncryptedImageAsset {
+        // Open in ... goes last, so the labelled item ends the toolbar.
+        identifiers.append(openInApplicationIdentifier)
+      }
       return identifiers
     case .file where item.isMultipleFileItem:
-      return [favoriteIdentifier, tagsIdentifier]
+      return [favoriteIdentifier, tagsIdentifier, moreActionsIdentifier]
     case .file:
       var identifiers: [NSToolbarItem.Identifier] = []
       if item.canCopyTextFromImage {
@@ -470,7 +482,7 @@ final class ItemPreviewToolbar: NSObject, NSToolbarDelegate, NSMenuDelegate {
       if item.canCopyTextFromQRCode {
         identifiers.append(copyTextFromQRCodeIdentifier)
       }
-      identifiers.append(contentsOf: [favoriteIdentifier, tagsIdentifier, showInFinderIdentifier])
+      identifiers.append(contentsOf: [favoriteIdentifier, tagsIdentifier, showInFinderIdentifier, moreActionsIdentifier])
       // Open in ... goes last, so the labelled item ends the toolbar.
       identifiers.append(openInApplicationIdentifier)
       return identifiers

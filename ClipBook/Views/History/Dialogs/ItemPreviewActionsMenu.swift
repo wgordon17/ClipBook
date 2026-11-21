@@ -41,7 +41,10 @@ final class ItemPreviewActionsMenu: NSObject {
     #selector(HistoryContentViewController.copyPlainTextMenuItem(_:)),
     #selector(HistoryContentViewController.copyFilePathMenuItem(_:)),
     #selector(HistoryContentViewController.copyTextFromImageMenuItem(_:)),
-    #selector(HistoryContentViewController.copyTextFromQRCodeMenuItem(_:))
+    #selector(HistoryContentViewController.copyTextFromQRCodeMenuItem(_:)),
+    #selector(HistoryContentViewController.saveImageAsFileMenuItem(_:)),
+    #selector(HistoryContentViewController.showInFinderMenuItem(_:)),
+    #selector(HistoryContentViewController.openInAssociatedApplicationMenuItem(_:))
   ]
 
   private let makeItemMenu: (ClipboardItem) -> NSMenu

@@ -44,10 +44,14 @@ final class LinkPreviewCardView: NSView {
   private let textInsets: NSEdgeInsets
   private var imageURL: URL?
   private var faviconURL: URL?
+  private let ownerClipID: UUID?
+  private let requiresEncryptedAssets: Bool
 
   init(preview: LinkPreview, layout: Layout) {
     imageURL = preview.imageURL
     faviconURL = preview.faviconURL
+    ownerClipID = preview.ownerClipID
+    requiresEncryptedAssets = preview.requiresEncryptedAssets
     textInsets = layout == .vertical ? Self.verticalTextInsets : Self.horizontalTextInsets
     super.init(frame: .zero)
     wantsLayer = true
@@ -186,7 +190,7 @@ final class LinkPreviewCardView: NSView {
 
     let scale = window.backingScaleFactor
     if let imageURL {
-      loadImage(at: imageURL, displaySize: Self.imageDecodeSize, scale: scale) { [weak self] image in
+      loadImage(at: imageURL, role: .linkPreview, displaySize: Self.imageDecodeSize, scale: scale) { [weak self] image in
         if let image {
           self?.showImage(image)
         } else {
@@ -204,7 +208,7 @@ final class LinkPreviewCardView: NSView {
     }
 
     let displaySize = CGSize(width: Self.placeholderIconSize, height: Self.placeholderIconSize)
-    loadImage(at: faviconURL, displaySize: displaySize, scale: scale) { [weak self] favicon in
+    loadImage(at: faviconURL, role: .linkFavicon, displaySize: displaySize, scale: scale) { [weak self] favicon in
       guard let self, let favicon else {
         return
       }
@@ -215,14 +219,23 @@ final class LinkPreviewCardView: NSView {
 
   private func loadImage(
     at url: URL,
+    role: AssetRole,
     displaySize: CGSize,
     scale: CGFloat,
-    completion: @escaping (NSImage?) -> Void
+    completion: @escaping @MainActor (NSImage?) -> Void
   ) {
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: displaySize, scale: scale)
+    let assetContext = ownerClipID.map {
+      ImageAssetThumbnailLoader.ManagedAssetContext(
+        role: role,
+        ownerClipID: $0,
+        requiresEncryption: requiresEncryptedAssets
+      )
+    }
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
       maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext,
       completion: completion
     )
     if let cachedImage {

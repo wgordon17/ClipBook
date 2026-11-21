@@ -1,14 +1,10 @@
 import Foundation
-import SwiftUI
-import AppKit
-import Carbon
-import Combine
 import ImageIO
 import UniformTypeIdentifiers
-import SQLite3
 import CryptoKit
+import os
 
-struct LinkPreviewDetails: Codable, Hashable {
+nonisolated struct LinkPreviewDetails: Codable, Hashable, Sendable {
     var url: String
     var title: String?
     var description: String?
@@ -29,21 +25,71 @@ nonisolated enum ContentDigest {
     }
 }
 
-struct ClipboardItem: Identifiable, Codable, Hashable {
+nonisolated enum ClipboardContentScope: Comparable, Sendable {
+    case body
+    case preview
+    case full
+}
+
+nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
+    static let textPreviewBodyLimit = 8_096
+    static let textPreviewMaxUTF16Length = 16_384
+
+    private static let maxLeadingWhitespaceScanUTF16Length = 8_388_608
+    private static let whitespaceOnlyPreviewUTF16Limit = 4_000
+    private static let whitespaceOnlyPreviewCharacterLimit = 2_000
+    private static let searchRevisionCounter = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+    private static func nextSearchRevision() -> UInt64 {
+        searchRevisionCounter.withLock { counter in
+            counter &+= 1
+            if counter == 0 {
+                counter = 1
+            }
+            return counter
+        }
+    }
+
+    private nonisolated enum FormattingLoadState: Sendable {
+        case unloaded
+        case previewOnly
+        case full
+    }
+
     var id: UUID
-    var kind: ClipboardKind
-    var title: String?
-    var text: String?
+    var kind: ClipboardKind {
+        didSet {
+            storedContentKey = nil
+            syncDerivedMetadataForHeaderMutation()
+        }
+    }
+    var title: String? {
+        didSet {
+            searchRevision = Self.nextSearchRevision()
+            syncDerivedMetadataForHeaderMutation()
+        }
+    }
+    var text: String? {
+        didSet {
+            storedContentKey = nil
+            searchRevision = Self.nextSearchRevision()
+            syncDerivedMetadata(textModified: true, formattingModified: false)
+        }
+    }
     // The payload of the QR code found in an image, read when the item is
     // captured. It is kept next to `text`, which holds the text the image was
     // read with OCR, because an image can carry both.
-    var qrCodeText: String?
+    var qrCodeText: String? {
+        didSet {
+            searchRevision = Self.nextSearchRevision()
+            hasQRCodeText = Self.computeHasNonWhitespaceText(qrCodeText)
+            syncRestSecretForQRCodeMutation()
+        }
+    }
     // The formatting of rich text. The store keeps it apart from the rest of
     // the item and leaves it out of the items it reads, since most of a
     // history's memory went to formatting that only pasting, dragging,
-    // previewing and export use. `loadingFormatting(of:)` on the store reads
-    // it for one item. It is set only through the methods below, which keep
-    // `hasFormatting` and `htmlDigest` in step with it.
+    // previewing and export use.
     private(set) var rtfData: Data?
     private(set) var html: String?
     /// Whether the item has formatting, loaded in this value or only stored.
@@ -51,12 +97,33 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
     /// The SHA-256 of the HTML, which tells two copies of the same text with
     /// different formatting apart when the HTML is not loaded.
     private(set) var htmlDigest: String?
-    /// The SHA-256 of the image file's bytes. A copy of an image already in
+    private var formattingLoadState: FormattingLoadState = .full
+    /// The digest of the image file's bytes. A copy of an image already in
     /// the history matches it and reuses that item instead of becoming a new one.
-    var imageDigest: String?
-    var assetPath: String?
-    var filePaths: [String]
-    var sourceAppName: String?
+    var imageDigest: String? {
+        didSet {
+            storedContentKey = nil
+        }
+    }
+    var imageWidth: Int? = nil
+    var imageHeight: Int? = nil
+    var assetPath: String? {
+        didSet {
+            storedContentKey = nil
+        }
+    }
+    var filePaths: [String] {
+        didSet {
+            storedContentKey = nil
+            searchRevision = Self.nextSearchRevision()
+            syncDerivedMetadataForHeaderMutation()
+        }
+    }
+    var sourceAppName: String? {
+        didSet {
+            searchRevision = Self.nextSearchRevision()
+        }
+    }
     var sourceBundleIdentifier: String?
     var copiedAt: Date
     var firstCopiedAt: Date
@@ -80,11 +147,16 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
             if tagOrders.keys.contains(where: { !tags.contains($0) }) {
                 tagOrders = tagOrders.filter { tags.contains($0.key) }
             }
+            searchRevision = Self.nextSearchRevision()
         }
     }
     var searchText: String
     var copyCount: Int
-    var linkPreviewDetails: LinkPreviewDetails?
+    var linkPreviewDetails: LinkPreviewDetails? {
+        didSet {
+            searchRevision = Self.nextSearchRevision()
+        }
+    }
     var copySequenceID: Date?
     var copySequenceOrder: Int?
     /// The item's place among the favorites pinned to the top of the history,
@@ -109,6 +181,18 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
     /// payload, so it is not among the coding keys.
     var deletedAt: Date? = nil
 
+    private(set) var isContentLoaded: Bool = true
+    private(set) var textPreview: String?
+    private(set) var characterCount: Int = 0
+    private(set) var containsPreviewSecret: Bool = false
+    private(set) var containsRestSecret: Bool = false
+    private(set) var hasRecognizedText: Bool = false
+    private(set) var hasQRCodeText: Bool = false
+    private(set) var isSVGText: Bool = false
+    private(set) var isCorruptPlaceholder: Bool = false
+    var storedContentKey: Data? = nil
+    private(set) var searchRevision: UInt64
+
     init(
         id: UUID = UUID(),
         kind: ClipboardKind,
@@ -119,9 +203,11 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         html: String? = nil,
         assetPath: String? = nil,
         imageDigest: String? = nil,
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil,
         filePaths: [String] = [],
-        sourceAppName: String? = NSWorkspace.shared.frontmostApplication?.localizedName,
-        sourceBundleIdentifier: String? = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+        sourceAppName: String? = nil,
+        sourceBundleIdentifier: String? = nil,
         copiedAt: Date = Date(),
         firstCopiedAt: Date? = nil,
         byteSize: Int = 0,
@@ -144,9 +230,12 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         self.qrCodeText = qrCodeText
         self.rtfData = rtfData
         self.html = html
-        hasFormatting = rtfData != nil || html != nil
-        htmlDigest = Self.digest(ofHTML: html)
+        self.hasFormatting = rtfData != nil || html != nil
+        self.htmlDigest = Self.digest(ofHTML: html)
+        self.formattingLoadState = .full
         self.imageDigest = imageDigest
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
         self.assetPath = assetPath
         self.filePaths = filePaths
         self.sourceAppName = sourceAppName
@@ -173,6 +262,102 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         self.tagOrders = tagOrders.filter { tags.contains($0.key) }
         self.sensitivity = sensitivity
         self.expiresAt = expiresAt
+        self.deletedAt = nil
+        self.isContentLoaded = true
+        self.storedContentKey = nil
+        self.searchRevision = Self.nextSearchRevision()
+        self.hasQRCodeText = Self.computeHasNonWhitespaceText(qrCodeText)
+        syncDerivedMetadata(textModified: true, formattingModified: true)
+    }
+
+    private init(
+        rawID id: UUID,
+        kind: ClipboardKind,
+        title: String?,
+        text: String?,
+        qrCodeText: String?,
+        rtfData: Data?,
+        html: String?,
+        hasFormatting: Bool,
+        htmlDigest: String?,
+        formattingLoadState: FormattingLoadState,
+        imageDigest: String?,
+        imageWidth: Int?,
+        imageHeight: Int?,
+        assetPath: String?,
+        filePaths: [String],
+        sourceAppName: String?,
+        sourceBundleIdentifier: String?,
+        copiedAt: Date,
+        firstCopiedAt: Date,
+        byteSize: Int,
+        isFavorite: Bool,
+        tags: [Int],
+        searchText: String,
+        copyCount: Int,
+        linkPreviewDetails: LinkPreviewDetails?,
+        copySequenceID: Date?,
+        copySequenceOrder: Int?,
+        favoriteOrder: Int?,
+        tagOrders: [Int: Int],
+        sensitivity: ItemSensitivity?,
+        expiresAt: Date?,
+        deletedAt: Date?,
+        isContentLoaded: Bool,
+        textPreview: String?,
+        characterCount: Int,
+        containsPreviewSecret: Bool,
+        containsRestSecret: Bool,
+        hasRecognizedText: Bool,
+        hasQRCodeText: Bool,
+        isSVGText: Bool,
+        isCorruptPlaceholder: Bool = false,
+        storedContentKey: Data?,
+        searchRevision: UInt64
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.text = text
+        self.qrCodeText = qrCodeText
+        self.rtfData = rtfData
+        self.html = html
+        self.hasFormatting = hasFormatting
+        self.htmlDigest = htmlDigest
+        self.formattingLoadState = formattingLoadState
+        self.imageDigest = imageDigest
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
+        self.assetPath = assetPath
+        self.filePaths = filePaths
+        self.sourceAppName = sourceAppName
+        self.sourceBundleIdentifier = sourceBundleIdentifier
+        self.copiedAt = copiedAt
+        self.firstCopiedAt = firstCopiedAt
+        self.byteSize = byteSize
+        self.isFavorite = isFavorite
+        self.tags = tags
+        self.searchText = searchText
+        self.copyCount = copyCount
+        self.linkPreviewDetails = linkPreviewDetails
+        self.copySequenceID = copySequenceID
+        self.copySequenceOrder = copySequenceOrder
+        self.favoriteOrder = favoriteOrder
+        self.tagOrders = tagOrders
+        self.sensitivity = sensitivity
+        self.expiresAt = expiresAt
+        self.deletedAt = deletedAt
+        self.isContentLoaded = isContentLoaded
+        self.textPreview = textPreview
+        self.characterCount = characterCount
+        self.containsPreviewSecret = containsPreviewSecret
+        self.containsRestSecret = containsRestSecret
+        self.hasRecognizedText = hasRecognizedText
+        self.hasQRCodeText = hasQRCodeText
+        self.isSVGText = isSVGText
+        self.isCorruptPlaceholder = isCorruptPlaceholder
+        self.storedContentKey = storedContentKey
+        self.searchRevision = searchRevision
     }
 
     enum CodingKeys: String, CodingKey {
@@ -217,11 +402,15 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         html = try container.decodeIfPresent(String.self, forKey: .html)
         // Items stored before the formatting moved out of the payload carry it
         // here and have neither of these.
-        hasFormatting = try container.decodeIfPresent(Bool.self, forKey: .hasFormatting)
+        let decodedHasFormatting = try container.decodeIfPresent(Bool.self, forKey: .hasFormatting)
             ?? (rtfData != nil || html != nil)
+        hasFormatting = decodedHasFormatting
         htmlDigest = try container.decodeIfPresent(String.self, forKey: .htmlDigest)
             ?? Self.digest(ofHTML: html)
+        formattingLoadState = (decodedHasFormatting && rtfData == nil && html == nil) ? .unloaded : .full
         imageDigest = try container.decodeIfPresent(String.self, forKey: .imageDigest)
+        imageWidth = nil
+        imageHeight = nil
         assetPath = try container.decodeIfPresent(String.self, forKey: .assetPath)
         filePaths = try container.decode([String].self, forKey: .filePaths)
         sourceAppName = try container.decodeIfPresent(String.self, forKey: .sourceAppName)
@@ -245,6 +434,518 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
             .flatMap { $0 }
             .flatMap(ItemSensitivity.init(rawValue:))
         expiresAt = try container.decodeIfPresent(Date.self, forKey: .expiresAt)
+        deletedAt = nil
+        isContentLoaded = true
+        storedContentKey = nil
+        searchRevision = Self.nextSearchRevision()
+        hasQRCodeText = Self.computeHasNonWhitespaceText(qrCodeText)
+        syncDerivedMetadata(textModified: true, formattingModified: true)
+    }
+
+    static func == (lhs: ClipboardItem, rhs: ClipboardItem) -> Bool {
+        lhs.id == rhs.id
+            && lhs.kind == rhs.kind
+            && lhs.title == rhs.title
+            && lhs.text == rhs.text
+            && lhs.qrCodeText == rhs.qrCodeText
+            && lhs.rtfData == rhs.rtfData
+            && lhs.html == rhs.html
+            && lhs.hasFormatting == rhs.hasFormatting
+            && lhs.htmlDigest == rhs.htmlDigest
+            && lhs.formattingLoadState == rhs.formattingLoadState
+            && lhs.imageDigest == rhs.imageDigest
+            && lhs.imageWidth == rhs.imageWidth
+            && lhs.imageHeight == rhs.imageHeight
+            && lhs.assetPath == rhs.assetPath
+            && lhs.filePaths == rhs.filePaths
+            && lhs.sourceAppName == rhs.sourceAppName
+            && lhs.sourceBundleIdentifier == rhs.sourceBundleIdentifier
+            && lhs.copiedAt == rhs.copiedAt
+            && lhs.firstCopiedAt == rhs.firstCopiedAt
+            && lhs.byteSize == rhs.byteSize
+            && lhs.isFavorite == rhs.isFavorite
+            && lhs.tags == rhs.tags
+            && lhs.searchText == rhs.searchText
+            && lhs.copyCount == rhs.copyCount
+            && lhs.linkPreviewDetails == rhs.linkPreviewDetails
+            && lhs.copySequenceID == rhs.copySequenceID
+            && lhs.copySequenceOrder == rhs.copySequenceOrder
+            && lhs.favoriteOrder == rhs.favoriteOrder
+            && lhs.tagOrders == rhs.tagOrders
+            && lhs.sensitivity == rhs.sensitivity
+            && lhs.expiresAt == rhs.expiresAt
+            && lhs.deletedAt == rhs.deletedAt
+            && lhs.isContentLoaded == rhs.isContentLoaded
+            && lhs.textPreview == rhs.textPreview
+            && lhs.characterCount == rhs.characterCount
+            && lhs.containsPreviewSecret == rhs.containsPreviewSecret
+            && lhs.containsRestSecret == rhs.containsRestSecret
+            && lhs.hasRecognizedText == rhs.hasRecognizedText
+            && lhs.hasQRCodeText == rhs.hasQRCodeText
+            && lhs.isSVGText == rhs.isSVGText
+            && lhs.isCorruptPlaceholder == rhs.isCorruptPlaceholder
+            && lhs.storedContentKey == rhs.storedContentKey
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(kind)
+        hasher.combine(title)
+        hasher.combine(text)
+        hasher.combine(qrCodeText)
+        hasher.combine(rtfData)
+        hasher.combine(html)
+        hasher.combine(hasFormatting)
+        hasher.combine(htmlDigest)
+        hasher.combine(formattingLoadState)
+        hasher.combine(imageDigest)
+        hasher.combine(imageWidth)
+        hasher.combine(imageHeight)
+        hasher.combine(assetPath)
+        hasher.combine(filePaths)
+        hasher.combine(sourceAppName)
+        hasher.combine(sourceBundleIdentifier)
+        hasher.combine(copiedAt)
+        hasher.combine(firstCopiedAt)
+        hasher.combine(byteSize)
+        hasher.combine(isFavorite)
+        hasher.combine(tags)
+        hasher.combine(searchText)
+        hasher.combine(copyCount)
+        hasher.combine(linkPreviewDetails)
+        hasher.combine(copySequenceID)
+        hasher.combine(copySequenceOrder)
+        hasher.combine(favoriteOrder)
+        hasher.combine(tagOrders)
+        hasher.combine(sensitivity)
+        hasher.combine(expiresAt)
+        hasher.combine(deletedAt)
+        hasher.combine(isContentLoaded)
+        hasher.combine(textPreview)
+        hasher.combine(characterCount)
+        hasher.combine(containsPreviewSecret)
+        hasher.combine(containsRestSecret)
+        hasher.combine(hasRecognizedText)
+        hasher.combine(hasQRCodeText)
+        hasher.combine(isSVGText)
+        hasher.combine(isCorruptPlaceholder)
+        hasher.combine(storedContentKey)
+    }
+
+    // MARK: - Preview & Header Lifecycle
+
+    static func makeTextPreview(from text: String?) -> String? {
+        guard let text, !text.isEmpty else {
+            return nil
+        }
+
+        let scalars = text.unicodeScalars
+        var cursor = scalars.startIndex
+        var skippedUTF16 = 0
+        var sawLineBreak = false
+
+        while cursor < scalars.endIndex, skippedUTF16 < maxLeadingWhitespaceScanUTF16Length {
+            let scalar = scalars[cursor]
+            guard scalar.properties.isWhitespace else {
+                break
+            }
+            switch scalar.value {
+            case 0x0A, 0x0D, 0x85, 0x2028, 0x2029:
+                sawLineBreak = true
+            default:
+                break
+            }
+            skippedUTF16 += scalar.utf16.count
+            scalars.formIndex(after: &cursor)
+        }
+
+        if cursor == scalars.endIndex || scalars[cursor].properties.isWhitespace {
+            let slice = scalarBoundedSlice(
+                text[text.startIndex...],
+                maxUTF16Length: whitespaceOnlyPreviewUTF16Limit
+            )
+            return String(slice.prefix(whitespaceOnlyPreviewCharacterLimit))
+        }
+
+        let boundedBody = scalarBoundedSlice(
+            text[cursor...],
+            maxUTF16Length: textPreviewMaxUTF16Length
+        )
+        let body = String(boundedBody.prefix(textPreviewBodyLimit))
+        if cursor == scalars.startIndex {
+            return body
+        }
+        if sawLineBreak {
+            return "\n" + body
+        }
+        return String(scalars[scalars.startIndex]) + body
+    }
+
+    private static func scalarBoundedSlice(_ substring: Substring, maxUTF16Length: Int) -> Substring {
+        guard substring.utf8.count > maxUTF16Length else {
+            return substring
+        }
+
+        let scalars = substring.unicodeScalars
+        var end = scalars.startIndex
+        var utf16Count = 0
+        while end < scalars.endIndex {
+            let nextCount = utf16Count + scalars[end].utf16.count
+            if nextCount > maxUTF16Length, end > scalars.startIndex {
+                break
+            }
+            utf16Count = nextCount
+            scalars.formIndex(after: &end)
+            if utf16Count >= maxUTF16Length {
+                break
+            }
+        }
+        return substring[substring.startIndex..<end]
+    }
+
+    var hasCompleteTextPreview: Bool {
+        if isContentLoaded {
+            return true
+        }
+        if hasFormatting && textPreview == nil {
+            return false
+        }
+        guard let textPreview else {
+            return characterCount == 0
+        }
+        return textPreview.first?.isWhitespace != true
+            && textPreview.count == characterCount
+            && textPreview.utf16.count < Self.textPreviewMaxUTF16Length - 2
+    }
+
+    static func fromStoredHeader(
+        id: UUID,
+        kind: ClipboardKind,
+        title: String?,
+        textPreview: String?,
+        characterCount: Int,
+        containsPreviewSecret: Bool,
+        containsRestSecret: Bool,
+        hasRecognizedText: Bool,
+        hasQRCodeText: Bool,
+        isSVGText: Bool,
+        hasFormatting: Bool,
+        htmlDigest: String?,
+        imageDigest: String?,
+        imageWidth: Int?,
+        imageHeight: Int?,
+        assetPath: String?,
+        filePaths: [String],
+        sourceAppName: String?,
+        sourceBundleIdentifier: String?,
+        copiedAt: Date,
+        firstCopiedAt: Date,
+        byteSize: Int,
+        isFavorite: Bool,
+        tags: [Int],
+        tagOrders: [Int: Int] = [:],
+        copyCount: Int,
+        linkPreviewDetails: LinkPreviewDetails?,
+        copySequenceID: Date?,
+        copySequenceOrder: Int?,
+        favoriteOrder: Int?,
+        sensitivity: ItemSensitivity?,
+        expiresAt: Date?,
+        deletedAt: Date?,
+        storedContentKey: Data?,
+        isCorruptPlaceholder: Bool = false
+    ) -> ClipboardItem {
+        ClipboardItem(
+            rawID: id,
+            kind: kind,
+            title: title,
+            text: nil,
+            qrCodeText: nil,
+            rtfData: nil,
+            html: nil,
+            hasFormatting: hasFormatting,
+            htmlDigest: htmlDigest,
+            formattingLoadState: hasFormatting ? .unloaded : .full,
+            imageDigest: imageDigest,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            assetPath: assetPath,
+            filePaths: filePaths,
+            sourceAppName: sourceAppName,
+            sourceBundleIdentifier: sourceBundleIdentifier,
+            copiedAt: copiedAt,
+            firstCopiedAt: firstCopiedAt,
+            byteSize: byteSize,
+            isFavorite: isFavorite,
+            tags: tags,
+            searchText: "",
+            copyCount: copyCount,
+            linkPreviewDetails: linkPreviewDetails,
+            copySequenceID: copySequenceID,
+            copySequenceOrder: copySequenceOrder,
+            favoriteOrder: favoriteOrder,
+            tagOrders: tagOrders.filter { tags.contains($0.key) },
+            sensitivity: sensitivity,
+            expiresAt: expiresAt,
+            deletedAt: deletedAt,
+            isContentLoaded: false,
+            textPreview: textPreview,
+            characterCount: characterCount,
+            containsPreviewSecret: containsPreviewSecret,
+            containsRestSecret: containsRestSecret,
+            hasRecognizedText: hasRecognizedText,
+            hasQRCodeText: hasQRCodeText,
+            isSVGText: isSVGText,
+            isCorruptPlaceholder: isCorruptPlaceholder,
+            storedContentKey: storedContentKey,
+            searchRevision: Self.nextSearchRevision()
+        )
+    }
+
+    func unloadingContent() -> ClipboardItem {
+        ClipboardItem(
+            rawID: id,
+            kind: kind,
+            title: title,
+            text: nil,
+            qrCodeText: nil,
+            rtfData: nil,
+            html: nil,
+            hasFormatting: hasFormatting,
+            htmlDigest: htmlDigest,
+            formattingLoadState: hasFormatting ? .unloaded : .full,
+            imageDigest: imageDigest,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            assetPath: assetPath,
+            filePaths: filePaths,
+            sourceAppName: sourceAppName,
+            sourceBundleIdentifier: sourceBundleIdentifier,
+            copiedAt: copiedAt,
+            firstCopiedAt: firstCopiedAt,
+            byteSize: byteSize,
+            isFavorite: isFavorite,
+            tags: tags,
+            searchText: "",
+            copyCount: copyCount,
+            linkPreviewDetails: linkPreviewDetails,
+            copySequenceID: copySequenceID,
+            copySequenceOrder: copySequenceOrder,
+            favoriteOrder: favoriteOrder,
+            tagOrders: tagOrders,
+            sensitivity: sensitivity,
+            expiresAt: expiresAt,
+            deletedAt: deletedAt,
+            isContentLoaded: false,
+            textPreview: textPreview,
+            characterCount: characterCount,
+            containsPreviewSecret: containsPreviewSecret,
+            containsRestSecret: containsRestSecret,
+            hasRecognizedText: hasRecognizedText,
+            hasQRCodeText: hasQRCodeText,
+            isSVGText: isSVGText,
+            isCorruptPlaceholder: isCorruptPlaceholder,
+            storedContentKey: storedContentKey,
+            searchRevision: searchRevision
+        )
+    }
+
+    func withLoadedContent(
+        text: String?,
+        qrCodeText: String?,
+        html: String? = nil,
+        rtfData: Data? = nil,
+        scope: ClipboardContentScope = .full,
+        tagNames: [String]? = nil
+    ) -> ClipboardItem {
+        let resolvedHTML: String?
+        let resolvedRTFData: Data?
+        let resolvedHasFormatting: Bool
+        let resolvedHTMLDigest: String?
+        let resolvedFormattingLoadState: FormattingLoadState
+
+        switch scope {
+        case .body:
+            resolvedHTML = self.html
+            resolvedRTFData = self.rtfData
+            resolvedHasFormatting = self.hasFormatting
+            resolvedHTMLDigest = self.htmlDigest
+            resolvedFormattingLoadState = self.formattingLoadState
+        case .preview:
+            resolvedRTFData = rtfData ?? self.rtfData
+            resolvedHTML = html ?? self.html
+            resolvedFormattingLoadState = (self.formattingLoadState == .full || resolvedHTML != nil)
+                ? .full
+                : .previewOnly
+            resolvedHasFormatting = self.hasFormatting
+            resolvedHTMLDigest = self.htmlDigest
+        case .full:
+            resolvedHTML = html
+            resolvedRTFData = rtfData
+            resolvedFormattingLoadState = .full
+            resolvedHasFormatting = html != nil || rtfData != nil
+            resolvedHTMLDigest = (html?.isEmpty == false)
+                ? (self.htmlDigest ?? Self.digest(ofHTML: html))
+                : nil
+        }
+
+        let resolvedSearchText: String
+        if let tagNames {
+            resolvedSearchText = Self.makeSearchText(
+                title: title,
+                text: text,
+                filePaths: kind == .image ? [] : filePaths,
+                tagNames: tagNames,
+                sourceAppName: sourceAppName,
+                linkPreviewDetails: linkPreviewDetails,
+                qrCodeText: qrCodeText
+            )
+        } else {
+            resolvedSearchText = self.searchText
+        }
+
+        var updated = ClipboardItem(
+            rawID: id,
+            kind: kind,
+            title: title,
+            text: text,
+            qrCodeText: qrCodeText,
+            rtfData: resolvedRTFData,
+            html: resolvedHTML,
+            hasFormatting: resolvedHasFormatting,
+            htmlDigest: resolvedHTMLDigest,
+            formattingLoadState: resolvedFormattingLoadState,
+            imageDigest: imageDigest,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            assetPath: assetPath,
+            filePaths: filePaths,
+            sourceAppName: sourceAppName,
+            sourceBundleIdentifier: sourceBundleIdentifier,
+            copiedAt: copiedAt,
+            firstCopiedAt: firstCopiedAt,
+            byteSize: byteSize,
+            isFavorite: isFavorite,
+            tags: tags,
+            searchText: resolvedSearchText,
+            copyCount: copyCount,
+            linkPreviewDetails: linkPreviewDetails,
+            copySequenceID: copySequenceID,
+            copySequenceOrder: copySequenceOrder,
+            favoriteOrder: favoriteOrder,
+            tagOrders: tagOrders,
+            sensitivity: sensitivity,
+            expiresAt: expiresAt,
+            deletedAt: deletedAt,
+            isContentLoaded: true,
+            textPreview: textPreview,
+            characterCount: characterCount,
+            containsPreviewSecret: containsPreviewSecret,
+            containsRestSecret: containsRestSecret,
+            hasRecognizedText: hasRecognizedText,
+            hasQRCodeText: Self.computeHasNonWhitespaceText(qrCodeText),
+            isSVGText: isSVGText,
+            isCorruptPlaceholder: isCorruptPlaceholder,
+            storedContentKey: storedContentKey,
+            searchRevision: searchRevision
+        )
+        updated.syncDerivedMetadata(textModified: true, formattingModified: scope == .full)
+        return updated
+    }
+
+    private static func computeHasNonWhitespaceText(_ value: String?) -> Bool {
+        !(value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    private mutating func syncLoadedSecretFlags() {
+        if !kind.canHoldSensitiveContent {
+            containsPreviewSecret = false
+        } else if (text?.isEmpty ?? true) && hasFormatting && !isFormattingLoaded {
+            containsPreviewSecret = containsPreviewSecret || SensitiveContent.livePreviewSecretExists(in: self)
+        } else {
+            containsPreviewSecret = SensitiveContent.livePreviewSecretExists(in: self)
+        }
+
+        let bodySecret = SensitiveContent.detectsBodySecretAtRest(
+            kind: kind,
+            text: text,
+            qrCodeText: qrCodeText,
+            html: html,
+            rtfData: rtfData
+        )
+        if hasFormatting && !isFormattingLoaded {
+            containsRestSecret = containsRestSecret || bodySecret
+        } else {
+            containsRestSecret = bodySecret
+        }
+    }
+
+    private mutating func syncDerivedMetadata(textModified: Bool, formattingModified: Bool) {
+        if textModified {
+            isContentLoaded = true
+            textPreview = Self.makeTextPreview(from: text)
+            characterCount = text?.count ?? 0
+            hasRecognizedText = Self.computeHasNonWhitespaceText(text)
+            isSVGText = (kind == .text || kind == .richText) && (text.map(SVGImageRenderer.isSVGMarkup) ?? false)
+        }
+
+        if isContentLoaded {
+            syncLoadedSecretFlags()
+        } else if formattingModified {
+            let hasNonEmptyFormatting = !(html?.isEmpty ?? true) || !(rtfData?.isEmpty ?? true)
+            if hasNonEmptyFormatting,
+               SensitiveContent.detectsBodySecretAtRest(
+                   kind: kind,
+                   text: nil,
+                   qrCodeText: nil,
+                   html: html,
+                   rtfData: rtfData
+               ) {
+                containsRestSecret = true
+            }
+            if !(html?.isEmpty ?? true),
+               textPreview == nil,
+               characterCount == 0,
+               SensitiveContent.livePreviewSecretExists(in: self) {
+                containsPreviewSecret = true
+            }
+        }
+    }
+
+    private mutating func syncDerivedMetadataForHeaderMutation() {
+        if isContentLoaded {
+            isSVGText = (kind == .text || kind == .richText) && (text.map(SVGImageRenderer.isSVGMarkup) ?? false)
+            syncLoadedSecretFlags()
+        } else {
+            if kind != .text && kind != .richText {
+                isSVGText = false
+            }
+            if !kind.canHoldSensitiveContent {
+                containsPreviewSecret = false
+            } else if characterCount == 0 && textPreview == nil && !hasFormatting && filePaths.isEmpty {
+                containsPreviewSecret = SensitiveContent.livePreviewSecretExists(in: self)
+            }
+        }
+    }
+
+    private mutating func syncRestSecretForQRCodeMutation() {
+        if isContentLoaded && (!hasFormatting || isFormattingLoaded) {
+            containsRestSecret = SensitiveContent.detectsBodySecretAtRest(
+                kind: kind,
+                text: text,
+                qrCodeText: qrCodeText,
+                html: html,
+                rtfData: rtfData
+            )
+        } else if SensitiveContent.detectsBodySecretAtRest(
+            kind: kind,
+            text: nil,
+            qrCodeText: qrCodeText,
+            html: nil,
+            rtfData: nil
+        ) {
+            containsRestSecret = true
+        }
     }
 
     /// Whether the item is kept for good whatever its content: the user
@@ -253,35 +954,29 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         isFavorite || !tags.isEmpty
     }
 
-    /// Whether this value holds the formatting, rather than only knowing the
-    /// store has some.
+    /// Whether this value holds the full formatting, rather than only knowing
+    /// the store has some or holding preview-only RTF.
     var isFormattingLoaded: Bool {
-        rtfData != nil || html != nil
+        formattingLoadState == .full && (rtfData != nil || html != nil)
+    }
+
+    var isPreviewFormattingLoaded: Bool {
+        !hasFormatting || formattingLoadState != .unloaded
     }
 
     /// Replaces the formatting, or removes it when both are nil.
     mutating func setFormatting(html: String?, rtfData: Data?) {
         self.html = html
         self.rtfData = rtfData
+        formattingLoadState = .full
         hasFormatting = html != nil || rtfData != nil
         htmlDigest = Self.digest(ofHTML: html)
+        storedContentKey = nil
+        syncDerivedMetadata(textModified: false, formattingModified: true)
     }
 
     mutating func removeFormatting() {
         setFormatting(html: nil, rtfData: nil)
-    }
-
-    /// The item without its formatting in memory. It still knows it has some,
-    /// so saving it leaves the stored formatting as it is.
-    func unloadingFormatting() -> ClipboardItem {
-        guard isFormattingLoaded else {
-            return self
-        }
-
-        var item = self
-        item.html = nil
-        item.rtfData = nil
-        return item
     }
 
     private static func digest(ofHTML html: String?) -> String? {
@@ -300,6 +995,13 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         sourceBundleIdentifier != nil || sourceAppName != nil
     }
 
+    var hasTextContent: Bool {
+        isContentLoaded
+            ? !(text?.isEmpty ?? true)
+            : (characterCount > 0 || !(textPreview?.isEmpty ?? true))
+    }
+
+    @MainActor
     var displayTitle: String {
         if let itemTitle {
             return itemTitle
@@ -308,6 +1010,7 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         return contentTitle
     }
 
+    @MainActor
     var contentTitle: String {
         if kind == .image {
             return imageDisplayTitle
@@ -317,12 +1020,13 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         case .file:
             return filePaths.first.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "File"
         case .color:
-            return text ?? "Color"
+            return (isContentLoaded ? text : textPreview) ?? "Color"
         default:
             return previewText.components(separatedBy: .newlines).first?.nilIfEmpty ?? kind.title
         }
     }
 
+    @MainActor
     var subtitle: String {
         switch kind {
         case .file:
@@ -334,7 +1038,16 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         }
     }
 
+    @MainActor
     var previewText: String {
+        rawPreviewText ?? kind.title
+    }
+
+    var scannablePreviewText: String {
+        rawPreviewText ?? ""
+    }
+
+    private var rawPreviewText: String? {
         // Single-file image items store recognized OCR text in `text` for search,
         // while their preview text remains the file path.
         if kind == .file, !filePaths.isEmpty {
@@ -343,13 +1056,16 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         if let text, !text.isEmpty {
             return text
         }
+        if !isContentLoaded, let textPreview, !textPreview.isEmpty {
+            return textPreview
+        }
         if let html, !html.isEmpty {
             return html
         }
         if !filePaths.isEmpty {
             return filePaths.joined(separator: "\n")
         }
-        return title ?? kind.title
+        return title
     }
 
     var assetURL: URL? {
@@ -363,7 +1079,18 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         [assetPath, linkPreviewDetails?.imagePath, linkPreviewDetails?.faviconPath].compactMap { $0 }
     }
 
+    var hasEncryptedImageAsset: Bool {
+        kind == .image && assetPath?.lowercased().hasSuffix(".enc") == true
+    }
+
+    var hasUnverifiedEncryptedImageAsset: Bool {
+        hasEncryptedImageAsset && sensitivity != .notSensitive
+    }
+
     var quickLookURL: URL? {
+        if hasEncryptedImageAsset {
+            return nil
+        }
         if let assetURL {
             return assetURL
         }
@@ -392,32 +1119,44 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
 
     var canCopyTextFromImage: Bool {
         guard !isMultipleFileItem,
-              kind == .image || (kind == .file && firstFileIsImage),
-              let text = text?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+              kind == .image || (kind == .file && firstFileIsImage) else {
             return false
         }
-
-        return !text.isEmpty
+        if isContentLoaded {
+            guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return false
+            }
+            return !text.isEmpty
+        }
+        return hasRecognizedText
     }
 
     // The QR code is read from the same kinds of items the image text is read
     // from, so an image and an image file both offer it.
     var canCopyTextFromQRCode: Bool {
         guard !isMultipleFileItem,
-              kind == .image || (kind == .file && firstFileIsImage),
-              let qrCodeText = qrCodeText?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+              kind == .image || (kind == .file && firstFileIsImage) else {
             return false
         }
-
-        return !qrCodeText.isEmpty
+        if isContentLoaded {
+            guard let qrCodeText = qrCodeText?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                return false
+            }
+            return !qrCodeText.isEmpty
+        }
+        return hasQRCodeText
     }
 
     var browserURL: URL? {
-        guard kind == .link, let text else {
+        guard kind == .link else {
+            return nil
+        }
+        let candidate = isContentLoaded ? text : (hasCompleteTextPreview ? textPreview : nil)
+        guard let candidate else {
             return nil
         }
 
-        return Self.linkURL(from: text)
+        return Self.linkURL(from: candidate)
     }
 
     // The one address a text holds, if that is all it holds. A URL carries no
@@ -438,6 +1177,28 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         return url
     }
 
+    var contentKeyComponents: (canonicalContent: String, htmlDigest: String?) {
+        if kind == .link, let browserURL {
+            return (Self.normalizedLinkContentKey(for: browserURL), nil)
+        }
+
+        if kind == .file, !filePaths.isEmpty {
+            return (Self.normalizedFileContentKey(for: filePaths), nil)
+        }
+
+        // An image is told apart by the bytes of its file, so copying the same
+        // image again counts on the item it already has. An image stored before
+        // images had a digest is told apart by its file.
+        if kind == .image, let imageKey = imageDigest ?? assetPath {
+            return (imageKey, nil)
+        }
+
+        // Formatting is not searchable, but it still tells two copies of the
+        // same text apart, so a differently styled copy stays its own item.
+        // The digest stands in for the HTML, which is usually not loaded.
+        return (text ?? "", htmlDigest)
+    }
+
     /// What tells two captures of the same content apart. It is built from the
     /// content alone, never from the search text: the search text also carries
     /// the source app, tag names and link preview details, which the store
@@ -445,29 +1206,11 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
     /// would change after the first match, and the next copy of the same
     /// content would start a second item instead of counting on the first.
     var contentKey: String {
-        if kind == .link, let browserURL {
-            return Self.normalizedLinkContentKey(for: browserURL)
+        let components = contentKeyComponents
+        if let htmlDigest = components.htmlDigest {
+            return components.canonicalContent + "\n" + htmlDigest
         }
-
-        if kind == .file, !filePaths.isEmpty {
-            return Self.normalizedFileContentKey(for: filePaths)
-        }
-
-        // An image is told apart by the bytes of its file, so copying the same
-        // image again counts on the item it already has. An image stored before
-        // images had a digest is told apart by its file.
-        if kind == .image, let imageKey = imageDigest ?? assetPath {
-            return imageKey
-        }
-
-        // Formatting is not searchable, but it still tells two copies of the
-        // same text apart, so a differently styled copy stays its own item.
-        // The digest stands in for the HTML, which is usually not loaded.
-        if let htmlDigest {
-            return (text ?? "") + "\n" + htmlDigest
-        }
-
-        return text ?? ""
+        return components.canonicalContent
     }
 
     /// Whether the two items hold the same content, as their `contentKey`
@@ -477,21 +1220,91 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
             return false
         }
 
+        if let storedContentKey, let otherStoredContentKey = other.storedContentKey {
+            return storedContentKey == otherStoredContentKey
+        }
+
+        if isContentLoaded && other.isContentLoaded {
+            switch kind {
+            case .link, .file, .image:
+                return contentKey == other.contentKey
+            default:
+                return htmlDigest == other.htmlDigest && (text ?? "") == (other.text ?? "")
+            }
+        }
+
         switch kind {
-        case .link, .file, .image:
-            return contentKey == other.contentKey
+        case .link:
+            guard let lhsURL = browserURL, let rhsURL = other.browserURL else {
+                return id == other.id
+            }
+            return Self.normalizedLinkContentKey(for: lhsURL) == Self.normalizedLinkContentKey(for: rhsURL)
+        case .file:
+            let lhsKey = Self.normalizedFileContentKey(for: filePaths)
+            let rhsKey = Self.normalizedFileContentKey(for: other.filePaths)
+            guard !lhsKey.isEmpty, !rhsKey.isEmpty else {
+                return id == other.id
+            }
+            return lhsKey == rhsKey
+        case .image:
+            guard let lhsKey = imageDigest ?? assetPath,
+                  let rhsKey = other.imageDigest ?? other.assetPath else {
+                return id == other.id
+            }
+            return lhsKey == rhsKey
         default:
-            return htmlDigest == other.htmlDigest && (text ?? "") == (other.text ?? "")
+            guard htmlDigest == other.htmlDigest,
+                  characterCount == other.characterCount else {
+                return false
+            }
+            guard hasCompleteTextPreview && other.hasCompleteTextPreview else {
+                return id == other.id
+            }
+            let lhsText = isContentLoaded ? (text ?? "") : (textPreview ?? "")
+            let rhsText = other.isContentLoaded ? (other.text ?? "") : (other.textPreview ?? "")
+            return lhsText == rhsText
         }
     }
 
-    var imageDimensions: (width: Int, height: Int)? {
-        guard kind == .image,
-              let assetURL,
-              let source = CGImageSourceCreateWithURL(assetURL as CFURL, nil),
+    nonisolated static func pixelDimensions(of imageData: Data) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0,
+              height > 0 else {
+            return nil
+        }
+        return (width, height)
+    }
+
+    var imageDimensions: (width: Int, height: Int)? {
+        guard kind == .image else {
+            return nil
+        }
+        if let imageWidth, let imageHeight {
+            return (imageWidth, imageHeight)
+        }
+        guard let assetURL else {
+            return nil
+        }
+        if hasEncryptedImageAsset {
+            guard let data = try? ImageAssetStore.readAssetData(
+                at: assetURL,
+                role: .image,
+                ownerClipID: id,
+                requiresEncryption: SensitiveContent.shouldEncryptAtRest(self)
+            ) else {
+                return nil
+            }
+            return Self.pixelDimensions(of: data)
+        }
+        guard let source = CGImageSourceCreateWithURL(assetURL as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0,
+              height > 0 else {
             return nil
         }
 
@@ -506,7 +1319,7 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
         return "Image (\(imageDimensions.width)x\(imageDimensions.height))"
     }
 
-    nonisolated static func isImageFile(at filePath: String) -> Bool {
+    static func isImageFile(at filePath: String) -> Bool {
         let fileURL = URL(fileURLWithPath: filePath)
 
         // Prefer the extension-based check because it does not touch the disk,
@@ -525,16 +1338,32 @@ struct ClipboardItem: Identifiable, Codable, Hashable {
 
     func rebuildingSearchText(tagNames: [String]) -> ClipboardItem {
         var updated = self
-        updated.searchText = Self.makeSearchText(
-            title: title,
-            text: text,
-            filePaths: filePaths,
-            tagNames: tagNames,
-            sourceAppName: sourceAppName,
-            linkPreviewDetails: linkPreviewDetails,
-            qrCodeText: qrCodeText
-        )
+        updated.searchRevision = Self.nextSearchRevision()
+        if isContentLoaded {
+            updated.searchText = Self.makeSearchText(
+                title: title,
+                text: text,
+                filePaths: kind == .image ? [] : filePaths,
+                tagNames: tagNames,
+                sourceAppName: sourceAppName,
+                linkPreviewDetails: linkPreviewDetails,
+                qrCodeText: qrCodeText
+            )
+        } else {
+            updated.searchText = ""
+        }
         return updated
+    }
+
+    nonisolated func headerFallbackSearchText(tagNamesByID: [Tag.ID: String]) -> String {
+        Self.makeSearchText(
+            title: title,
+            text: textPreview,
+            filePaths: kind == .image ? [] : filePaths,
+            tagNames: tags.compactMap { tagNamesByID[$0] },
+            sourceAppName: sourceAppName,
+            linkPreviewDetails: linkPreviewDetails
+        )
     }
 
     /// Only the plain text of an item is searchable. The HTML of a rich text

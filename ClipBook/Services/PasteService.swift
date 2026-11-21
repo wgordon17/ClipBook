@@ -1,19 +1,20 @@
 import Foundation
-import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 final class PasteService {
   private static let interKeyDelay: TimeInterval = 0.06
 
   private let pasteboard: NSPasteboard
-  // History items come without their formatting; this reads it for the one
-  // item being pasted or copied.
-  private let loadFormatting: (ClipboardItem) -> ClipboardItem
+  // History items come without their body and formatting; this reads the
+  // required scope for the one item being pasted or copied.
+  private let loadContent: (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem
 
-  init(pasteboard: NSPasteboard = .general, loadFormatting: @escaping (ClipboardItem) -> ClipboardItem) {
+  init(
+    pasteboard: NSPasteboard = .general,
+    loadContent: @escaping (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem = { item, _ in item }
+  ) {
     self.pasteboard = pasteboard
-    self.loadFormatting = loadFormatting
+    self.loadContent = loadContent
   }
 
   // The process that owned keyboard focus the last time the history panel took
@@ -139,46 +140,83 @@ final class PasteService {
   }
   
   func copy(_ item: ClipboardItem, variant: PasteVariant) throws {
-    pasteboard.clearContents()
-    
+    if item.isCorruptPlaceholder {
+      _ = try loadContent(item, .body)
+      throw HistoryStoreError.authenticationFailed
+    }
+    var isConcealed = SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+
     switch variant {
     case .plainText:
-      guard pasteboard.setString(item.previewText, forType: .string) else {
+      let hydratedItem: ClipboardItem
+      if (item.kind == .file && !item.filePaths.isEmpty)
+          || (item.kind == .image && !item.hasRecognizedText) {
+        hydratedItem = item
+      } else {
+        let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
+        hydratedItem = try loadContent(item, scope)
+      }
+      isConcealed = isConcealed
+        || SensitiveContent.shouldEncryptAtRest(hydratedItem)
+        || hydratedItem.hasUnverifiedEncryptedImageAsset
+      pasteboard.clearContents()
+      guard pasteboard.setString(hydratedItem.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }
     case .filePath:
       guard !item.filePaths.isEmpty else {
         throw PasteServiceError.unsupportedItem
       }
+      pasteboard.clearContents()
       pasteboard.setString(item.filePaths.joined(separator: "\n"), forType: .string)
     default:
-      try writeItem(item)
+      let writtenItem = try writeItem(item)
+      isConcealed = isConcealed
+        || SensitiveContent.shouldEncryptAtRest(writtenItem)
+        || writtenItem.hasUnverifiedEncryptedImageAsset
     }
     // Marked after the item is written so `writeObjects` for images and files
     // does not leave the ghost marker on a separate, empty first pasteboard item.
     if let firstItem = pasteboard.pasteboardItems?.first {
       firstItem.setString("1", forType: PasteboardMonitor.ghostType)
+      if isConcealed {
+        firstItem.setData(Data(), forType: PasteboardReader.concealedType)
+      }
     } else {
       pasteboard.setString("1", forType: PasteboardMonitor.ghostType)
+      if isConcealed {
+        pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
+      }
     }
   }
 
-  func copyText(_ text: String, markAsGhost: Bool = false) throws {
+  func copyText(_ text: String, markAsGhost: Bool = false, markAsConcealed: Bool = false) throws {
     pasteboard.clearContents()
     if markAsGhost {
       pasteboard.setString("1", forType: PasteboardMonitor.ghostType)
+    }
+    if markAsConcealed {
+      pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
     }
     guard pasteboard.setString(text, forType: .string) else {
       throw PasteServiceError.unsupportedItem
     }
   }
-  
-  private func writeItem(_ item: ClipboardItem) throws {
+
+  @discardableResult
+  private func writeItem(_ item: ClipboardItem) throws -> ClipboardItem {
     switch item.kind {
     case .image:
-      guard let url = item.assetURL, let pngData = try? Data(contentsOf: url) else {
+      guard let url = item.assetURL,
+            let pngData = try? ImageAssetStore.readAssetData(
+              at: url,
+              role: .image,
+              ownerClipID: item.id,
+              requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+            ) else {
         throw PasteServiceError.unsupportedItem
       }
+      pasteboard.clearContents()
       // Image assets are stored as PNG. Write the raw bytes directly and promise
       // TIFF lazily: decoding and re-encoding the image up front is expensive for
       // large images and would delay the synthetic Cmd+V, while most target apps
@@ -187,14 +225,18 @@ final class PasteService {
       pasteboardItem.setData(pngData, forType: .png)
       pasteboardItem.setDataProvider(LazyTiffDataProvider(pngData: pngData), forTypes: [.tiff])
       pasteboard.writeObjects([pasteboardItem])
+      return item
     case .file:
       let urls = item.filePaths.map(URL.init(fileURLWithPath:))
       guard !urls.isEmpty else {
         throw PasteServiceError.unsupportedItem
       }
+      pasteboard.clearContents()
       pasteboard.writeObjects(urls as [NSURL])
+      return item
     case .richText:
-      let item = loadFormatting(item)
+      let item = try loadContent(item, .full)
+      pasteboard.clearContents()
       if let rtfData = item.rtfData {
         pasteboard.setData(rtfData, forType: .rtf)
       }
@@ -204,10 +246,15 @@ final class PasteService {
       if let text = item.text {
         pasteboard.setString(text, forType: .string)
       }
+      return item
     default:
+      let scope: ClipboardContentScope = (!item.hasTextContent && item.hasFormatting) ? .full : .body
+      let item = try loadContent(item, scope)
+      pasteboard.clearContents()
       guard pasteboard.setString(item.previewText, forType: .string) else {
         throw PasteServiceError.unsupportedItem
       }
+      return item
     }
   }
   

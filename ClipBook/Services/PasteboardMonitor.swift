@@ -1,10 +1,13 @@
 import Foundation
-import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 final class PasteboardMonitor {
     static let ghostType = PasteboardReader.ghostType
+
+    private enum PendingRecognitionSource {
+        case pngData(Data)
+        case imageFile(URL)
+    }
 
     weak var delegate: PasteboardMonitorDelegate?
     // Pausing or resuming skips whatever was copied while capture was paused:
@@ -24,9 +27,7 @@ final class PasteboardMonitor {
     private let pasteboard: NSPasteboard
     private let now: @Sendable () -> Date
     private let historyStore: HistoryStore
-    private let findStoredImage: @Sendable (String) -> StoredImage?
     private let fileManager: FileManager
-    private let supportDirectory: URL
     private var timer: Timer?
     private var lastChangeCount: Int
     private var preferences = AppPreferences() {
@@ -60,29 +61,27 @@ final class PasteboardMonitor {
     // time after launch. It has a queue of its own so the pasteboard is read
     // meanwhile; a read that waited for it missed the copies made in between.
     private let textRecognitionQueue = DispatchQueue(label: "com.ikryanov.clipbook.v2.image-text", qos: .utility)
-    /// The image to read the text of, by the ID of the item made for it, until
-    /// that item is in the history.
-    private var textRecognitionImagesByItemID: [ClipboardItem.ID: URL] = [:]
+    private var pendingRecognitionsByItemID: [ClipboardItem.ID: PendingRecognitionSource] = [:]
+    private var pendingPNGDataByItemID: [ClipboardItem.ID: Data] = [:]
+    private var inFlightImageRecognitionIDs: Set<ClipboardItem.ID> = []
     private var isReadInFlight = false
     // A read that was started before the monitor was stopped belongs to no
     // one when it finishes, and its result is dropped.
     private var readGeneration = 0
+    private var recognitionGeneration: UInt64 = 0
+    nonisolated private let computeImageDigest: @Sendable (Data) -> String
+    nonisolated private let findStoredImage: @Sendable (String) -> StoredImage?
+    nonisolated private let recognizeImageData: @Sendable (Data) -> RecognizedImageContent
+    nonisolated private let recognizeImageFile: @Sendable (URL) -> RecognizedImageContent
 
-    init(
-        historyStore: HistoryStore,
-        fileManager: FileManager,
-        supportDirectory: URL,
-        pasteboard: NSPasteboard = .general,
-        now: @escaping @Sendable () -> Date = { Date() }
-    ) {
-        self.historyStore = historyStore
-        self.fileManager = fileManager
-        self.supportDirectory = supportDirectory
-        self.pasteboard = pasteboard
-        self.now = now
-        // The store guards itself with a lock, so the read queue may ask it.
-        nonisolated(unsafe) let store = historyStore
-        findStoredImage = { digest in
+    nonisolated private static func makeImageDigestCallback(store: HistoryStore) -> @Sendable (Data) -> String {
+        { data in
+            store.computeImageDigest(forPNGData: data)
+        }
+    }
+
+    nonisolated private static func makeFindStoredImageCallback(store: HistoryStore) -> @Sendable (String) -> StoredImage? {
+        { digest in
             guard let item = try? store.fetchItem(kind: .image, contentKey: digest),
                   let assetPath = item.assetPath else {
                 return nil
@@ -93,7 +92,51 @@ final class PasteboardMonitor {
                 recognizedContent: RecognizedImageContent(text: item.text, qrCodeText: item.qrCodeText)
             )
         }
+    }
+
+    init(
+        historyStore: HistoryStore,
+        fileManager: FileManager,
+        supportDirectory _: URL,
+        pasteboard: NSPasteboard = .general,
+        now: @escaping @Sendable () -> Date = { Date() },
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofImageAt:)
+    ) {
+        self.historyStore = historyStore
+        self.fileManager = fileManager
+        self.pasteboard = pasteboard
+        self.now = now
+        self.recognizeImageData = recognizeImageData
+        self.recognizeImageFile = recognizeImageFile
+        computeImageDigest = Self.makeImageDigestCallback(store: historyStore)
+        findStoredImage = Self.makeFindStoredImageCallback(store: historyStore)
         lastChangeCount = pasteboard.changeCount
+    }
+
+    func isImageRecognitionPending(for id: ClipboardItem.ID) -> Bool {
+        inFlightImageRecognitionIDs.contains(id)
+    }
+
+    func resumePendingImageRecognitions(for items: [ClipboardItem]) {
+        for item in items where item.kind == .image
+            && item.hasUnverifiedEncryptedImageAsset
+            && !SensitiveContent.shouldEncryptAtRest(item)
+            && !item.hasRecognizedText
+            && !item.hasQRCodeText
+            && !inFlightImageRecognitionIDs.contains(item.id) {
+            guard let assetURL = item.assetURL,
+                  let pngData = try? ImageAssetStore.readAssetData(
+                      at: assetURL,
+                      role: .image,
+                      ownerClipID: item.id,
+                      requiresEncryption: true
+                  ) else {
+                continue
+            }
+            inFlightImageRecognitionIDs.insert(item.id)
+            recognizeText(ofPNGData: pngData, inItemWithID: item.id)
+        }
     }
 
     func start(preferences: AppPreferences) {
@@ -109,11 +152,21 @@ final class PasteboardMonitor {
         timer?.invalidate()
         timer = nil
         readGeneration += 1
+        recognitionGeneration &+= 1
+        if let pendingID = pendingCopyAndMergeItem?.id {
+            discardPendingCaptureResources(for: pendingID)
+        }
         clearPendingCopyAndMergeItem()
+        pendingPNGDataByItemID.removeAll()
+        pendingRecognitionsByItemID.removeAll()
+        inFlightImageRecognitionIDs.removeAll()
     }
 
     func updatePreferences(_ preferences: AppPreferences) {
         if !preferences.copyAndMergeEnabled {
+            if let pendingID = pendingCopyAndMergeItem?.id {
+                discardPendingCaptureResources(for: pendingID)
+            }
             clearPendingCopyAndMergeItem()
         }
         self.preferences = preferences
@@ -151,7 +204,7 @@ final class PasteboardMonitor {
             ignoresTransientContent: preferences.ignoreTransientContent,
             ignoresConcealedContent: preferences.confidentialContentLifetime == ContentLifetime.dontSave,
             ignoredApplicationEntries: ignoredApplicationEntries,
-            imagesDirectory: supportDirectory.appendingPathComponent("Images", isDirectory: true),
+            computeImageDigest: computeImageDigest,
             findStoredImage: findStoredImage
         )
         let generation = readGeneration
@@ -170,7 +223,6 @@ final class PasteboardMonitor {
     private func finishRead(_ result: PasteboardReadResult, generation: Int) {
         isReadInFlight = false
         guard generation == readGeneration else {
-            discard(result)
             return
         }
 
@@ -179,6 +231,12 @@ final class PasteboardMonitor {
             do {
                 try handleCopyAndMerge(item)
             } catch {
+                if let pendingID = pendingCopyAndMergeItem?.id {
+                    discardPendingCaptureResources(for: pendingID)
+                }
+                if let itemID = item?.id {
+                    discardPendingCaptureResources(for: itemID)
+                }
                 clearPendingCopyAndMergeItem()
                 NSLog("ClipBook history write failed: \(error.localizedDescription)")
             }
@@ -186,18 +244,15 @@ final class PasteboardMonitor {
             do {
                 try capture(item)
             } catch {
+                discardPendingCaptureResources(for: item.id)
                 NSLog("ClipBook history write failed: \(error.localizedDescription)")
             }
         }
     }
 
-    /// The file the reader stored for an image goes with a result nobody takes.
-    /// The file of an image already in the history stays with its item.
-    private func discard(_ result: PasteboardReadResult) {
-        if case .content(let content) = result.outcome,
-           case .image(_, let assetPath, _, _, _, false) = content.payload {
-            try? fileManager.removeItem(atPath: assetPath)
-        }
+    private func discardPendingCaptureResources(for id: ClipboardItem.ID) {
+        pendingPNGDataByItemID.removeValue(forKey: id)
+        pendingRecognitionsByItemID.removeValue(forKey: id)
     }
 
     private func capturedItem(from result: PasteboardReadResult) -> ClipboardItem? {
@@ -227,29 +282,35 @@ final class PasteboardMonitor {
             return nil
         case .content(let content):
             deferredReadAttemptsRemaining = 0
-            var ownsAssetFile = true
-            var textRecognitionImage: URL?
+            var pendingPNGData: Data?
+            var pendingRecognition: PendingRecognitionSource?
             switch content.payload {
-            case .image(_, let assetPath, _, _, _, let reusesStoredFile):
+            case .image(_, let pngData, _, _, _, _, _, _, let reusesStoredFile):
                 // An image already in the history comes with the text read from it.
-                ownsAssetFile = !reusesStoredFile
-                textRecognitionImage = reusesStoredFile ? nil : URL(fileURLWithPath: assetPath)
+                if !reusesStoredFile, let pngData {
+                    pendingPNGData = pngData
+                    pendingRecognition = .pngData(pngData)
+                }
             case .files(let paths, _, _):
                 if paths.count == 1, let path = paths.first, ClipboardItem.isImageFile(at: path) {
-                    textRecognitionImage = URL(fileURLWithPath: path)
+                    pendingRecognition = .imageFile(URL(fileURLWithPath: path))
                 }
             case .richText, .text:
                 break
             }
             guard let item = capturableItem(
                 makeItem(from: content),
-                isConcealed: content.isConcealed,
-                ownsAssetFile: ownsAssetFile
+                isConcealed: content.isConcealed
             ) else {
                 return nil
             }
 
-            textRecognitionImagesByItemID[item.id] = textRecognitionImage
+            if let pendingPNGData {
+                pendingPNGDataByItemID[item.id] = pendingPNGData
+            }
+            if let pendingRecognition {
+                pendingRecognitionsByItemID[item.id] = pendingRecognition
+            }
             return item
         }
     }
@@ -273,7 +334,7 @@ final class PasteboardMonitor {
                 byteSize: byteSize,
                 searchText: searchText
             )
-        case .image(let id, let assetPath, let byteSize, let recognizedContent, let digest, _):
+        case .image(let id, _, let existingAssetPath, let pixelWidth, let pixelHeight, let byteSize, let recognizedContent, let digest, _):
             let searchText = ClipboardItem.makeSearchText(
                 title: nil,
                 text: recognizedContent.text,
@@ -288,8 +349,10 @@ final class PasteboardMonitor {
                 title: nil,
                 text: recognizedContent.text,
                 qrCodeText: recognizedContent.qrCodeText,
-                assetPath: assetPath,
+                assetPath: existingAssetPath,
                 imageDigest: digest,
+                imageWidth: pixelWidth,
+                imageHeight: pixelHeight,
                 sourceAppName: content.sourceAppName,
                 sourceBundleIdentifier: content.sourceBundleIdentifier,
                 copiedAt: copiedAt,
@@ -331,12 +394,11 @@ final class PasteboardMonitor {
         }
     }
 
-    /// An item of a kind whose "Keep history" period is Never is dropped,
-    /// together with any file the reader has already stored for it. So is a
-    /// secret when sensitive content is not saved. Confidential content and
-    /// secrets kept for a limited time get their expiry date here, and
+    /// An item of a kind whose "Keep history" period is Never is dropped.
+    /// So is a secret when sensitive content is not saved. Confidential content
+    /// and secrets kept for a limited time get their expiry date here, and
     /// confidential content is hidden in the history.
-    private func capturableItem(_ item: ClipboardItem, isConcealed: Bool, ownsAssetFile: Bool) -> ClipboardItem? {
+    private func capturableItem(_ item: ClipboardItem, isConcealed: Bool) -> ClipboardItem? {
         var lifetimes: [Int] = []
         if isConcealed {
             lifetimes.append(preferences.confidentialContentLifetime)
@@ -346,9 +408,6 @@ final class PasteboardMonitor {
         }
 
         guard preferences.capturesHistory(for: item.kind), !lifetimes.contains(ContentLifetime.dontSave) else {
-            if ownsAssetFile, let assetPath = item.assetPath {
-                try? fileManager.removeItem(atPath: assetPath)
-            }
             return nil
         }
 
@@ -369,7 +428,12 @@ final class PasteboardMonitor {
             return false
         }
 
-        let storedItem = try? historyStore.fetchItem(kind: item.kind, contentKey: item.contentKey)
+        let parts = item.contentKeyComponents
+        let storedItem = try? historyStore.fetchItem(
+            kind: item.kind,
+            contentKey: parts.canonicalContent,
+            htmlDigest: parts.htmlDigest
+        )
         return storedItem?.sensitivity != .notSensitive
     }
 
@@ -380,12 +444,20 @@ final class PasteboardMonitor {
         }
 
         if let pendingItem = pendingCopyAndMergeItem {
+            let pendingID = pendingItem.id
             clearPendingCopyAndMergeItem()
-            if isDuplicateCopyAndMergeItem(item, of: pendingItem) {
-                try mergeCopiedItem(item)
-            } else {
-                try capture(pendingItem)
-                holdPendingCopyAndMergeItem(item)
+            do {
+                if item.hasSameContent(as: pendingItem) {
+                    discardPendingCaptureResources(for: pendingID)
+                    try mergeCopiedItem(item)
+                } else {
+                    try capture(pendingItem)
+                    holdPendingCopyAndMergeItem(item)
+                }
+            } catch {
+                discardPendingCaptureResources(for: pendingID)
+                discardPendingCaptureResources(for: item.id)
+                throw error
             }
         } else {
             holdPendingCopyAndMergeItem(item)
@@ -398,14 +470,23 @@ final class PasteboardMonitor {
             return
         }
 
+        let pendingID = pendingItem.id
         clearPendingCopyAndMergeItem()
-        try capture(pendingItem)
+        do {
+            try capture(pendingItem)
+        } catch {
+            discardPendingCaptureResources(for: pendingID)
+            throw error
+        }
     }
 
     private func flushPendingCopyAndMergeItemIfExpiredLoggingFailure() {
         do {
             try flushPendingCopyAndMergeItemIfExpired()
         } catch {
+            if let pendingID = pendingCopyAndMergeItem?.id {
+                discardPendingCaptureResources(for: pendingID)
+            }
             clearPendingCopyAndMergeItem()
             NSLog("ClipBook history write failed: \(error.localizedDescription)")
         }
@@ -428,15 +509,21 @@ final class PasteboardMonitor {
             return
         }
 
+        defer {
+            discardPendingCaptureResources(for: item.id)
+        }
         try saveMergedItem(mergedItem)
-    }
-
-    private func isDuplicateCopyAndMergeItem(_ item: ClipboardItem, of pendingItem: ClipboardItem) -> Bool {
-        item.hasSameContent(as: pendingItem)
     }
 
     @discardableResult
     private func capture(_ item: ClipboardItem) throws -> ClipboardItem {
+        let sourceItemID = item.id
+        let pendingPNGData = pendingPNGDataByItemID.removeValue(forKey: sourceItemID)
+        var pendingRecognition = pendingRecognitionsByItemID.removeValue(forKey: sourceItemID)
+        defer {
+            discardPendingCaptureResources(for: sourceItemID)
+        }
+
         var item = item
         let updatesCopySequence = preferences.copySequenceModeEnabled
         var updatedItems: [ClipboardItem] = []
@@ -446,44 +533,108 @@ final class PasteboardMonitor {
             updatedItems = sequenceTrackingResult.updatedItems
         }
 
-        let textRecognitionImage = textRecognitionImagesByItemID.removeValue(forKey: item.id)
-        if textRecognitionImage != nil, item.kind == .file,
-           let storedItem = try historyStore.fetchItem(kind: .file, contentKey: item.contentKey) {
-            // Copying a file again keeps the text read from it before until the
-            // file is read again.
-            item.text = storedItem.text
-            item.qrCodeText = storedItem.qrCodeText
+        var newlyStagedAssetURL: URL?
+        if item.kind == .image, let pngData = pendingPNGData {
+            let parts = item.contentKeyComponents
+            let existing = try? historyStore.fetchItem(
+                kind: .image,
+                contentKey: parts.canonicalContent,
+                htmlDigest: parts.htmlDigest
+            )
+            let targetID = existing?.id ?? sourceItemID
+            item.id = targetID
+            if let existingAssetPath = existing?.assetPath,
+               fileManager.fileExists(atPath: existingAssetPath) {
+                item.assetPath = existingAssetPath
+                item.text = existing?.text
+                item.qrCodeText = existing?.qrCodeText
+                pendingRecognition = nil
+            } else {
+                let stagedURL = try historyStore.writeManagedAsset(
+                    pngData: pngData,
+                    role: .image,
+                    clipID: targetID,
+                    encrypted: true
+                )
+                newlyStagedAssetURL = stagedURL
+                item.assetPath = stagedURL.path
+            }
+        } else if pendingRecognition != nil, item.kind == .file {
+            let parts = item.contentKeyComponents
+            if let storedItem = try historyStore.fetchItem(
+                kind: .file,
+                contentKey: parts.canonicalContent,
+                htmlDigest: parts.htmlDigest
+            ) {
+                // Copying a file again keeps the text read from it before until the
+                // file is read again.
+                item.text = storedItem.text
+                item.qrCodeText = storedItem.qrCodeText
+            }
         }
 
-        let capturedItem = try historyStore.capture(item, updatesCopySequence: updatesCopySequence)
+        let capturedItem: ClipboardItem
+        do {
+            capturedItem = try historyStore.capture(item, updatesCopySequence: updatesCopySequence)
+        } catch {
+            if let newlyStagedAssetURL {
+                ImageAssetStore.secureUnlink(at: newlyStagedAssetURL)
+            }
+            throw error
+        }
+
         notifyCapture(capturedItem, updatedItems: updatedItems)
-        if let textRecognitionImage {
-            recognizeText(ofImageAt: textRecognitionImage, inItemWithID: capturedItem.id)
+        if let pendingRecognition {
+            switch pendingRecognition {
+            case .pngData(let pngData):
+                inFlightImageRecognitionIDs.insert(capturedItem.id)
+                recognizeText(ofPNGData: pngData, inItemWithID: capturedItem.id)
+            case .imageFile(let url):
+                recognizeText(ofImageAt: url, inItemWithID: capturedItem.id)
+            }
         }
         return capturedItem
     }
 
-    private func recognizeText(ofImageAt url: URL, inItemWithID itemID: ClipboardItem.ID) {
+    private func recognizeText(ofPNGData pngData: Data, inItemWithID itemID: ClipboardItem.ID) {
+        let recognize = recognizeImageData
+        let generation = recognitionGeneration
         textRecognitionQueue.async { [weak self] in
-            let content = ImageTextRecognizer.recognizeContent(ofImageAt: url)
+            let content = recognize(pngData)
             Task { @MainActor [weak self] in
-                guard let self else {
+                guard let self, self.recognitionGeneration == generation else {
                     return
                 }
 
-                delegate?.pasteboardMonitor(self, didRecognize: content, inItemWithID: itemID)
+                self.inFlightImageRecognitionIDs.remove(itemID)
+                self.delegate?.pasteboardMonitor(self, didRecognize: content, inItemWithID: itemID)
+            }
+        }
+    }
+
+    private func recognizeText(ofImageAt url: URL, inItemWithID itemID: ClipboardItem.ID) {
+        let recognize = recognizeImageFile
+        let generation = recognitionGeneration
+        textRecognitionQueue.async { [weak self] in
+            let content = recognize(url)
+            Task { @MainActor [weak self] in
+                guard let self, self.recognitionGeneration == generation else {
+                    return
+                }
+
+                self.delegate?.pasteboardMonitor(self, didRecognize: content, inItemWithID: itemID)
             }
         }
     }
 
     private func saveMergedItem(_ mergedItem: ClipboardItem) throws {
-        try historyStore.upsert(mergedItem)
+        let saved = try historyStore.saveAndReconcileItem(mergedItem, convertingExternalAssets: true)
         if preferences.copyToClipboardAfterMerge,
-           let text = mergedItem.text {
-            copyMergedTextToClipboard(text)
+           let text = saved.text {
+            copyMergedTextToClipboard(text, isConcealed: SensitiveContent.shouldEncryptAtRest(saved))
             lastChangeCount = pasteboard.changeCount
         }
-        notifyCapture(mergedItem, updatedItems: [])
+        notifyCapture(saved, updatedItems: [])
     }
 
     private func notifyCapture(_ item: ClipboardItem, updatedItems: [ClipboardItem]) {
@@ -496,7 +647,7 @@ final class PasteboardMonitor {
     }
 
     private func copyAndMergeTargetItem() throws -> ClipboardItem? {
-        try historyStore.fetchMostRecentItem { !$0.isFavorite }
+        try historyStore.fetchMostRecentItem { !$0.isFavorite && !$0.isCorruptPlaceholder }
     }
 
     private func copyAndMergedItem(sourceItem: ClipboardItem, targetItem: ClipboardItem) throws -> ClipboardItem? {
@@ -520,6 +671,11 @@ final class PasteboardMonitor {
         targetItem.byteSize = mergedText.utf8.count
         targetItem.copyCount += 1
         targetItem.linkPreviewDetails = nil
+        if sourceItem.sensitivity == .sensitive || targetItem.sensitivity == .sensitive {
+            targetItem.sensitivity = .sensitive
+        } else if targetItem.sensitivity == .notSensitive && sourceItem.sensitivity != .notSensitive {
+            targetItem.sensitivity = nil
+        }
         // The merged text holds the copied content, so it goes when that
         // content would have gone, unless the user keeps the item.
         if let sourceExpiry = sourceItem.expiresAt, !targetItem.isKeptByUser {
@@ -551,9 +707,12 @@ final class PasteboardMonitor {
         }
     }
 
-    private func copyMergedTextToClipboard(_ text: String) {
+    private func copyMergedTextToClipboard(_ text: String, isConcealed: Bool) {
         pasteboard.clearContents()
         pasteboard.setString("1", forType: Self.ghostType)
+        if isConcealed {
+            pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
+        }
         pasteboard.setString(text, forType: .string)
     }
 
@@ -600,7 +759,7 @@ final class PasteboardMonitor {
     /// one before it.
     private func mostRecentClipForSequenceTracking(item: ClipboardItem) throws -> ClipboardItem? {
         try historyStore.fetchMostRecentItem { clip in
-            !clip.hasSameContent(as: item)
+            !clip.isCorruptPlaceholder && !clip.hasSameContent(as: item)
         }
     }
 }

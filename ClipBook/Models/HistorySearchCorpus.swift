@@ -7,13 +7,226 @@ import os
 nonisolated final class HistorySearchCorpus: Sendable {
     let revision: Int
     let ids: [UUID]
+    let revisions: [UInt64]
     let texts: [String]
+    let tagNamesByID: [Tag.ID: String]
+    let hasCompleteTexts: Bool
     fileprivate let cachedIndexByID = OSAllocatedUnfairLock<[UUID: Int]?>(initialState: nil)
 
-    init(revision: Int, ids: [UUID], texts: [String]) {
+    init(
+        revision: Int,
+        ids: [UUID],
+        revisions: [UInt64] = [],
+        texts: [String],
+        tagNamesByID: [Tag.ID: String] = [:],
+        hasCompleteTexts: Bool = true
+    ) {
         self.revision = revision
         self.ids = ids
+        self.revisions = revisions.count == ids.count
+            ? revisions
+            : Array(repeating: 0, count: ids.count)
         self.texts = texts
+        self.tagNamesByID = tagNamesByID
+        self.hasCompleteTexts = hasCompleteTexts
+    }
+
+    func indexByID() -> [UUID: Int] {
+        if let cached = cachedIndexByID.withLock({ $0 }) {
+            return cached
+        }
+        var built = [UUID: Int](minimumCapacity: ids.count)
+        for (index, id) in ids.enumerated() {
+            built[id] = index
+        }
+        let indexByID = built
+        return cachedIndexByID.withLock { state in
+            if let existing = state {
+                return existing
+            }
+            state = indexByID
+            return indexByID
+        }
+    }
+
+    func reusableText(for item: ClipboardItem, tagNamesByID: [Tag.ID: String]) -> String? {
+        guard hasCompleteTexts,
+              item.searchRevision != 0,
+              let index = indexByID()[item.id],
+              index < revisions.count,
+              index < texts.count,
+              revisions[index] == item.searchRevision,
+              item.tags.isEmpty || item.tags.allSatisfy({ self.tagNamesByID[$0] == tagNamesByID[$0] }) else {
+            return nil
+        }
+        return texts[index]
+    }
+
+    static func resolve(
+        _ descriptor: AppModel.SearchCorpusDescriptor,
+        previousCorpus: HistorySearchCorpus? = nil,
+        fetchSearchTexts: ((_ ids: [UUID], _ trashed: Bool, _ tagNamesByID: [Tag.ID: String], _ isCancelled: () -> Bool) throws -> [String?]?)?,
+        isCancelled: () -> Bool = { false }
+    ) -> HistorySearchCorpus? {
+        if isCancelled() {
+            return nil
+        }
+        if let cached = descriptor.cachedCorpus {
+            return cached
+        }
+        if let previousCorpus,
+           previousCorpus.revision == descriptor.revision,
+           previousCorpus.hasCompleteTexts {
+            return previousCorpus
+        }
+
+        let count = descriptor.headers.count
+        if count == 0 {
+            return HistorySearchCorpus(
+                revision: descriptor.revision,
+                ids: [],
+                revisions: [],
+                texts: [],
+                tagNamesByID: descriptor.tagNamesByID,
+                hasCompleteTexts: true
+            )
+        }
+
+        let primaryDonor = previousCorpus
+        let secondaryDonor = (descriptor.donorCorpus === previousCorpus) ? nil : descriptor.donorCorpus
+        if primaryDonor?.hasCompleteTexts == true {
+            _ = primaryDonor?.indexByID()
+        }
+        if secondaryDonor?.hasCompleteTexts == true {
+            _ = secondaryDonor?.indexByID()
+        }
+
+        var ids = [UUID](repeating: UUID(), count: count)
+        var revisions = [UInt64](repeating: 0, count: count)
+        var texts = [String](repeating: "", count: count)
+        var missingSlots: [(slotIndex: Int, id: UUID)] = []
+
+        let headers = descriptor.headers
+        let tagNamesByID = descriptor.tagNamesByID
+        headers.withUnsafeBufferPointer { buffer in
+            for i in 0..<count {
+                if (i & 4095) == 0, isCancelled() {
+                    return
+                }
+                let header = buffer[i]
+                ids[i] = header.id
+                if header.isContentLoaded {
+                    texts[i] = header.searchText
+                    revisions[i] = header.searchRevision
+                } else if let reused = primaryDonor?.reusableText(for: header, tagNamesByID: tagNamesByID)
+                            ?? secondaryDonor?.reusableText(for: header, tagNamesByID: tagNamesByID) {
+                    texts[i] = reused
+                    revisions[i] = header.searchRevision
+                } else {
+                    missingSlots.append((slotIndex: i, id: header.id))
+                }
+            }
+        }
+
+        if isCancelled() {
+            return nil
+        }
+
+        if missingSlots.isEmpty {
+            return HistorySearchCorpus(
+                revision: descriptor.revision,
+                ids: ids,
+                revisions: revisions,
+                texts: texts,
+                tagNamesByID: tagNamesByID,
+                hasCompleteTexts: true
+            )
+        }
+
+        var didFetchSucceed = false
+        var usedFallback = false
+        if let fetchSearchTexts {
+            do {
+                if let fetched = try fetchSearchTexts(
+                    missingSlots.map(\.id),
+                    descriptor.isTrashed,
+                    tagNamesByID,
+                    isCancelled
+                ) {
+                    didFetchSucceed = true
+                    headers.withUnsafeBufferPointer { buffer in
+                        for (offset, slot) in missingSlots.enumerated() {
+                            if (offset & 4095) == 0, isCancelled() {
+                                return
+                            }
+                            let header = buffer[slot.slotIndex]
+                            if offset < fetched.count, let fetchedText = fetched[offset] {
+                                texts[slot.slotIndex] = fetchedText
+                                revisions[slot.slotIndex] = header.searchRevision
+                            } else {
+                                usedFallback = true
+                                texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                                revisions[slot.slotIndex] = 0
+                            }
+                        }
+                    }
+                } else if isCancelled() {
+                    return nil
+                } else {
+                    usedFallback = true
+                    headers.withUnsafeBufferPointer { buffer in
+                        for (offset, slot) in missingSlots.enumerated() {
+                            if (offset & 4095) == 0, isCancelled() {
+                                return
+                            }
+                            let header = buffer[slot.slotIndex]
+                            texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                            revisions[slot.slotIndex] = 0
+                        }
+                    }
+                }
+            } catch {
+                if isCancelled() {
+                    return nil
+                }
+                usedFallback = true
+                headers.withUnsafeBufferPointer { buffer in
+                    for (offset, slot) in missingSlots.enumerated() {
+                        if (offset & 4095) == 0, isCancelled() {
+                            return
+                        }
+                        let header = buffer[slot.slotIndex]
+                        texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                        revisions[slot.slotIndex] = 0
+                    }
+                }
+            }
+        } else {
+            usedFallback = true
+            headers.withUnsafeBufferPointer { buffer in
+                for (offset, slot) in missingSlots.enumerated() {
+                    if (offset & 4095) == 0, isCancelled() {
+                        return
+                    }
+                    let header = buffer[slot.slotIndex]
+                    texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                    revisions[slot.slotIndex] = 0
+                }
+            }
+        }
+
+        if isCancelled() {
+            return nil
+        }
+
+        return HistorySearchCorpus(
+            revision: descriptor.revision,
+            ids: ids,
+            revisions: revisions,
+            texts: texts,
+            tagNamesByID: tagNamesByID,
+            hasCompleteTexts: didFetchSucceed && !usedFallback
+        )
     }
 }
 

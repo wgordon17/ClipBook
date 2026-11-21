@@ -450,13 +450,15 @@ final class HistoryItemContextMenu {
     menu.addItem(makeTagsMenuItem(title: "Tags...", for: item))
     menu.addItem(.separator())
 
-    menu.addItem(makeOpenInAssociatedApplicationMenuItem(for: item))
-    menu.addItem(makeMenuItem(
-      title: "Open With...",
-      action: #selector(HistoryContentViewController.openWithMenuItem(_:)),
-      systemImageName: "square.and.arrow.up"
-    ))
-    menu.addItem(.separator())
+    if !item.hasEncryptedImageAsset {
+      menu.addItem(makeOpenInAssociatedApplicationMenuItem(for: item))
+      menu.addItem(makeMenuItem(
+        title: "Open With...",
+        action: #selector(HistoryContentViewController.openWithMenuItem(_:)),
+        systemImageName: "square.and.arrow.up"
+      ))
+      menu.addItem(.separator())
+    }
     menu.addItem(makeMenuItem(
       title: "Delete",
       action: #selector(HistoryContentViewController.deleteMenuItem(_:)),
@@ -799,9 +801,9 @@ final class HistoryItemContextMenu {
   }
 
   // An item with content to hide can have it shown for now, or for good by saying it is
-  // not sensitive. Any other item with text can be hidden by hand.
+  // not sensitive. Any other item can be hidden by hand.
   private func addSensitiveContentItems(to menu: NSMenu, for item: ClipboardItem) {
-    guard item.kind.canHoldSensitiveContent, let target else {
+    guard let target else {
       return
     }
 
@@ -816,6 +818,8 @@ final class HistoryItemContextMenu {
         systemImageName: hidesContent ? "eye" : "eye.slash",
         shortcut: preferences.toggleSensitiveContentShortcut
       ))
+    }
+    if target.canMarkAsNotSensitive(item) {
       menuItems.append(makeMenuItem(
         title: L10n.string("Mark as Not Sensitive"),
         action: #selector(HistoryContentViewController.sensitiveMenuItem(_:)),

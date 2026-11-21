@@ -2,7 +2,7 @@ import AppKit
 
 final class HistoryItemRowColorView: HistoryItemRowView {
   override func configureContent(item: ClipboardItem, quickPasteIndex: Int?) {
-    if let color = NSColor(colorItemText: item.previewText) {
+    if !hidesSensitiveContent, let color = NSColor(colorItemText: item.previewText) {
       configureTypeIconColorSwatch(color, toolTip: item.displayTitle)
     }
 

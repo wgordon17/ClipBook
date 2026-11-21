@@ -176,6 +176,14 @@ final class HistoryContentViewController: NSViewController {
   /// history is read-only. The actions that use items stay in the menu,
   /// disabled, so the menu shows what a license brings back.
   func isMenuActionAvailable(_ action: Selector, representedObject: Any?) -> Bool {
+    if (action == #selector(showInFinderMenuItem(_:))
+        || action == #selector(openInAssociatedApplicationMenuItem(_:))
+        || action == #selector(openWithMenuItem(_:))),
+       let item = representedObject as? ClipboardItem,
+       item.hasEncryptedImageAsset {
+      return false
+    }
+
     guard coordinator.isHistoryReadOnly else {
       return true
     }
@@ -202,8 +210,22 @@ final class HistoryContentViewController: NSViewController {
     self.coordinator = coordinator
     super.init(nibName: nil, bundle: nil)
     listPaneView.filePreviewCache = coordinator.filePreviewCache
-    listPaneView.loadFormatting = { [weak coordinator] item in coordinator?.loadingFormatting(of: item) ?? item }
+    listPaneView.loadContent = makeContentLoader()
     bindModel()
+  }
+
+  private func makeContentLoader() -> (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem {
+    { [weak self] item, scope in
+      guard let self else {
+        return item
+      }
+      do {
+        return try self.coordinator.loadingContent(of: item, scope: scope)
+      } catch {
+        self.model.lastError = PersistenceErrorLocalization.message(for: error)
+        throw error
+      }
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -342,7 +364,17 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    listPaneView.hideRevealedSensitiveContent()
+    let hiddenIDs = listPaneView.hideRevealedSensitiveContent()
+    if !hiddenIDs.isEmpty {
+      if let previewPaneController, hiddenIDs.contains(previewPaneController.item.id) {
+        previewPaneController.update(item: previewPaneController.item, revealsSensitiveContent: false)
+      }
+      if let previewSheetController, previewSheetWindow != nil,
+         hiddenIDs.contains(previewSheetController.item.id) {
+        previewSheetController.update(item: previewSheetController.item, revealsSensitiveContent: false)
+      }
+      evictRenderedMediaCaches(forItemIDs: hiddenIDs)
+    }
     setNeedsPreviewPaneUpdate()
   }
 
@@ -489,6 +521,7 @@ final class HistoryContentViewController: NSViewController {
     reloadListOnChange(of: model.$selectedHistoryFilterTagIDs)
     reloadListOnChange(of: model.$selectedHistoryFilterSourceApplicationIDs)
     reloadListOnChange(of: model.$trashedItems)
+    reloadListOnChange(of: model.$storeLockState)
   }
 
   private func reloadListOnChange<Value>(of publisher: some Publisher<Value, Never>) {
@@ -515,7 +548,7 @@ final class HistoryContentViewController: NSViewController {
     reloadList()
   }
 
-  private func reloadList() {
+  private func reloadList(schedulesSearchRefresh: Bool = true) {
     needsListReload = false
     let items = model.filteredItems
     let isArrangedByTag = model.orderingTagID != nil
@@ -538,7 +571,8 @@ final class HistoryContentViewController: NSViewController {
       arrangesEveryItem: isArrangedByTag,
       isShowingTrash: model.isShowingTrash,
       showsTiles: showsImageTiles,
-      showsCompactRows: model.preferences.compactHistory
+      showsCompactRows: model.preferences.compactHistory,
+      storeLockState: model.storeLockState
     ) { [weak self] firstItem in
       self?.model.selectedItemID = firstItem.id
       self?.model.selectedItemIDs = [firstItem.id]
@@ -547,7 +581,9 @@ final class HistoryContentViewController: NSViewController {
     updateToolbarFilterState()
     updateToolbarState()
     setNeedsPreviewPaneUpdate()
-    scheduleSearchRefreshIfNeeded()
+    if schedulesSearchRefresh {
+      scheduleSearchRefreshIfNeeded()
+    }
   }
 
   /// A history filtered to images only is where the pictures matter most, so
@@ -734,7 +770,8 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    if terms == HistorySearchTerms(query: pendingSearchQuery ?? model.searchQuery) {
+    if terms == HistorySearchTerms(query: pendingSearchQuery ?? model.searchQuery),
+       (pendingSearchQuery != nil || model.searchResult?.corpus.hasCompleteTexts != false) {
       if case .search(let result, _) = heldSearchUpdate {
         heldSearchUpdate = .search(result: result, query: query)
       }
@@ -780,7 +817,8 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    guard terms != HistorySearchTerms(query: model.searchQuery) else {
+    guard terms != HistorySearchTerms(query: model.searchQuery)
+            || model.searchResult?.corpus.hasCompleteTexts == false else {
       pendingSearchQuery = nil
       applySearchQuery(currentPendingQuery)
       scheduleSearchRefreshIfNeeded()
@@ -791,16 +829,25 @@ final class HistoryContentViewController: NSViewController {
   }
 
   private func startSearchJob(for terms: HistorySearchTerms) {
-    let corpus = model.makeSearchCorpus()
+    let coordinator = self.coordinator
+    let descriptor = model.prepareSearchCorpusDescriptor()
     let locale = Locale.current
-    let previousResult = model.searchResult ?? lastCompletedSearchResult
+    let previousResult = lastCompletedSearchResult ?? model.searchResult
     let job = HistorySearchJob()
     searchJob = job
     clearLatestSearchJobResult()
     let resultBox = latestSearchJobResult
 
     searchQueue.async { [weak self] in
-      let result = job.run(corpus: corpus, terms: terms, locale: locale, previous: previousResult)
+      let corpus = HistorySearchCorpus.resolve(
+        descriptor,
+        previousCorpus: previousResult?.corpus,
+        fetchSearchTexts: coordinator.fetchSearchTexts,
+        isCancelled: { job.isCancelled }
+      )
+      let result = corpus.flatMap { resolvedCorpus in
+        job.run(corpus: resolvedCorpus, terms: terms, locale: locale, previous: previousResult)
+      }
       if let result {
         resultBox.withLock {
           if !job.isCancelled {
@@ -822,16 +869,22 @@ final class HistoryContentViewController: NSViewController {
     if searchJob == nil {
       clearLatestSearchJobResult()
     }
-    guard let result,
-          searchJob === job,
-          let query = pendingSearchQuery,
-          HistorySearchTerms(query: query) == result.terms else {
+    guard searchJob === job else {
       Self.releaseSearchResultOffMainThreadIfLarge(result)
       return
     }
 
     searchJob = nil
     clearLatestSearchJobResult()
+
+    guard let result,
+          let query = pendingSearchQuery,
+          HistorySearchTerms(query: query) == result.terms else {
+      Self.releaseSearchResultOffMainThreadIfLarge(result)
+      scheduleSearchRefreshIfNeeded()
+      return
+    }
+
     setLastCompletedSearchResult(result)
 
     let isRapidTypingBurst = (lastTermsChangingKeystrokeTime - previousTermsChangingKeystrokeTime) < Self.typingPause
@@ -845,9 +898,21 @@ final class HistoryContentViewController: NSViewController {
     }
 
     pendingSearchQuery = nil
-    model.installSearchResult(result)
-    applySearchQuery(query, shouldResetSelection: true)
+    applyCompletedSearchResult(result, for: query)
     scheduleSearchRefreshIfNeeded()
+  }
+
+  private func applyCompletedSearchResult(
+    _ result: HistorySearchResult,
+    for query: String,
+    reloadsWhenTermsUnchanged: Bool = true
+  ) {
+    let unchangedTerms = HistorySearchTerms(query: model.searchQuery) == HistorySearchTerms(query: query)
+    model.installSearchResult(result)
+    applySearchQuery(query, shouldResetSelection: true, reloadsListSeparately: true)
+    if reloadsWhenTermsUnchanged && unchangedTerms {
+      reloadList(schedulesSearchRefresh: false)
+    }
   }
 
   private func scheduleHeldSearchUpdate(_ update: HeldSearchUpdate, delay: TimeInterval) {
@@ -860,7 +925,7 @@ final class HistoryContentViewController: NSViewController {
     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
   }
 
-  private func applyHeldSearchUpdate() {
+  private func applyHeldSearchUpdate(reloadsWhenTermsUnchanged: Bool = true) {
     heldSearchWorkItem = nil
     guard let held = heldSearchUpdate else {
       return
@@ -875,8 +940,11 @@ final class HistoryContentViewController: NSViewController {
         return
       }
       pendingSearchQuery = nil
-      model.installSearchResult(result)
-      applySearchQuery(query, shouldResetSelection: true)
+      applyCompletedSearchResult(
+        result,
+        for: query,
+        reloadsWhenTermsUnchanged: reloadsWhenTermsUnchanged
+      )
       scheduleSearchRefreshIfNeeded()
     case .clear(let heldQuery, let shouldResetSelection):
       let query = pendingSearchQuery ?? heldQuery
@@ -910,9 +978,11 @@ final class HistoryContentViewController: NSViewController {
         searchJob = nil
         pendingSearchQuery = nil
         if let result {
-          model.installSearchResult(result)
+          setLastCompletedSearchResult(result)
+          applyCompletedSearchResult(result, for: query, reloadsWhenTermsUnchanged: false)
+        } else {
+          applySearchQuery(query, shouldResetSelection: true, reloadsListSeparately: true)
         }
-        applySearchQuery(query, shouldResetSelection: true)
         scheduleSearchRefreshIfNeeded()
         didApplySearchUpdate = true
       } else {
@@ -923,7 +993,7 @@ final class HistoryContentViewController: NSViewController {
     if heldSearchUpdate != nil {
       heldSearchWorkItem?.cancel()
       heldSearchWorkItem = nil
-      applyHeldSearchUpdate()
+      applyHeldSearchUpdate(reloadsWhenTermsUnchanged: false)
       didApplySearchUpdate = true
     }
 
@@ -946,7 +1016,8 @@ final class HistoryContentViewController: NSViewController {
 
     guard model.searchResult?.terms != terms
             || model.searchResult?.revision != model.sortedListRevision
-            || model.searchResult?.locale != Locale.current else {
+            || model.searchResult?.locale != Locale.current
+            || (model.searchResult?.corpus.hasCompleteTexts == false && model.storeLockState == .unlocked) else {
       cancelSearchRefresh()
       return
     }
@@ -978,21 +1049,31 @@ final class HistoryContentViewController: NSViewController {
 
     guard model.searchResult?.terms != terms
             || model.searchResult?.revision != model.sortedListRevision
-            || model.searchResult?.locale != Locale.current else {
+            || model.searchResult?.locale != Locale.current
+            || (model.searchResult?.corpus.hasCompleteTexts == false && model.storeLockState == .unlocked) else {
       searchRefreshJob?.cancel()
       searchRefreshJob = nil
       return
     }
 
     searchRefreshJob?.cancel()
-    let corpus = model.makeSearchCorpus()
+    let coordinator = self.coordinator
+    let descriptor = model.prepareSearchCorpusDescriptor()
     let locale = Locale.current
-    let previousResult = model.searchResult
+    let previousResult = lastCompletedSearchResult ?? model.searchResult
     let job = HistorySearchJob()
     searchRefreshJob = job
 
     searchQueue.async { [weak self] in
-      let result = job.run(corpus: corpus, terms: terms, locale: locale, previous: previousResult)
+      let corpus = HistorySearchCorpus.resolve(
+        descriptor,
+        previousCorpus: previousResult?.corpus,
+        fetchSearchTexts: coordinator.fetchSearchTexts,
+        isCancelled: { job.isCancelled }
+      )
+      let result = corpus.flatMap { resolvedCorpus in
+        job.run(corpus: resolvedCorpus, terms: terms, locale: locale, previous: previousResult)
+      }
       DispatchQueue.main.async { [weak self] in
         guard let self else {
           Self.releaseSearchResultOffMainThreadIfLarge(result)
@@ -1022,27 +1103,36 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
+    setLastCompletedSearchResult(result)
     model.installSearchResult(result)
+    reloadList(schedulesSearchRefresh: false)
   }
 
-  private func applySearchQuery(_ query: String, shouldResetSelection: Bool = false) {
+  private func applySearchQuery(
+    _ query: String,
+    shouldResetSelection: Bool = false,
+    reloadsListSeparately: Bool = false
+  ) {
     if HistorySearchTerms(query: query).isEmpty {
       setLastCompletedSearchResult(nil)
     }
     guard model.searchQuery != query else {
-      updateToolbarState()
       if shouldResetSelection {
-        selectFirstHistoryItem()
+        selectFirstHistoryItem(syncsList: !reloadsListSeparately)
+      }
+      if !reloadsListSeparately {
+        updateToolbarState()
       }
       return
     }
 
     let changesTerms = HistorySearchTerms(query: model.searchQuery) != HistorySearchTerms(query: query)
+    let syncsImmediately = !changesTerms && !reloadsListSeparately
     model.searchQuery = query
     if shouldResetSelection {
-      selectFirstHistoryItem(syncsList: !changesTerms)
+      selectFirstHistoryItem(syncsList: syncsImmediately)
     }
-    if !changesTerms {
+    if syncsImmediately {
       updateToolbarState()
     }
   }
@@ -1050,6 +1140,13 @@ final class HistoryContentViewController: NSViewController {
   private var isSearchActive: Bool {
     let query = pendingSearchQuery ?? model.searchQuery
     return !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  private func showsOpenInBrowser(for item: ClipboardItem?) -> Bool {
+    guard let item else {
+      return false
+    }
+    return item.kind == .link || item.browserURL != nil
   }
 
   private func updateToolbarState() {
@@ -1092,7 +1189,7 @@ final class HistoryContentViewController: NSViewController {
       copyItemCount: copyItemCount,
       showsCopyTextFromImage: canUseItems && !hasMultipleSelection && selectedItem?.canCopyTextFromImage == true,
       showsCopyTextFromQRCode: canUseItems && !hasMultipleSelection && selectedItem?.canCopyTextFromQRCode == true,
-      showsOpenInBrowser: canUseItems && !hasMultipleSelection && selectedItem?.browserURL != nil,
+      showsOpenInBrowser: canUseItems && !hasMultipleSelection && showsOpenInBrowser(for: selectedItem),
       showsMerge: canMergeSelection,
       sortOption: model.historySortOption,
       isSortReversed: model.isHistorySortReversed,
@@ -1387,7 +1484,7 @@ final class HistoryContentViewController: NSViewController {
       detectsSensitiveContent: model.preferences.detectSensitiveContent,
       revealsSensitiveContent: listPaneView.revealsSensitiveContent(of: item),
       isReadOnly: coordinator.isHistoryReadOnly,
-      loadFormatting: { [weak coordinator] item in coordinator?.loadingFormatting(of: item) ?? item }
+      loadContent: makeContentLoader()
     )
     dialogController.highlightsSyntax = model.preferences.highlightCodeSyntax
     let dialogWindow = NSWindow(contentViewController: dialogController)
@@ -1463,8 +1560,18 @@ final class HistoryContentViewController: NSViewController {
         self?.coordinator.showInFinder(item)
       }
     }
-    dialogController.onSave = { [weak self] item, text in
-      self?.coordinator.editContent(item, text: text)
+    dialogController.onSave = { [weak self, weak dialogController] item, text in
+      guard let self else {
+        return
+      }
+      self.coordinator.editContent(item, text: text)
+      if let dialogController,
+         let updated = self.model.items.first(where: { $0.id == item.id }) {
+        dialogController.update(
+          item: updated,
+          revealsSensitiveContent: self.listPaneView.revealsSensitiveContent(of: updated)
+        )
+      }
     }
     dialogController.moreActionsMenuProvider = { [weak actionsMenu] item in
       actionsMenu?.makeMenu(for: item)
@@ -1613,7 +1720,7 @@ final class HistoryContentViewController: NSViewController {
     }
 
     if KeyboardShortcutParser.event(event, matches: preferences.openInBrowserShortcut),
-       item.browserURL != nil {
+       showsOpenInBrowser(for: item) {
       dismissPreviewSheet { [weak self] in
         self?.openInBrowserAndHideHistory(item)
       }
@@ -1651,7 +1758,8 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    guard item != previewSheetController.item else {
+    guard previewSheetController.item != item
+            || previewSheetController.item.searchRevision != item.searchRevision else {
       return
     }
 
@@ -1665,7 +1773,9 @@ final class HistoryContentViewController: NSViewController {
     guard let previewSheetController, previewSheetWindow != nil else {
       return
     }
-    guard let item, previewSheetController.item != item else {
+    guard let item,
+          previewSheetController.item != item
+            || previewSheetController.item.searchRevision != item.searchRevision else {
       return
     }
 
@@ -1872,14 +1982,20 @@ final class HistoryContentViewController: NSViewController {
       isReadOnly: coordinator.isHistoryReadOnly
     )
     if let previewPaneController, previewPaneControllerConfiguration == configuration {
+      if !showsPreview {
+        previewPaneController.showsPreview = false
+      }
       previewPaneController.showsWebPages = showsWebPages
       previewPaneController.highlightsSyntax = highlightsSyntax
       previewPaneController.showsDetails = showsDetails
-      previewPaneController.showsPreview = showsPreview
       previewPaneController.detailsArrangement = previewPaneDetailsArrangement(showsPreview: showsPreview)
       if previewPaneController.item != item
+          || previewPaneController.item.searchRevision != item.searchRevision
           || previewPaneController.revealsSensitiveContent != revealsSensitiveContent {
         previewPaneController.update(item: item, revealsSensitiveContent: revealsSensitiveContent)
+      }
+      if showsPreview {
+        previewPaneController.showsPreview = true
       }
     } else {
       tearDownPreviewPaneController()
@@ -1890,18 +2006,31 @@ final class HistoryContentViewController: NSViewController {
         revealsSensitiveContent: revealsSensitiveContent,
         isReadOnly: configuration.isReadOnly,
         presentation: .pane,
-        loadFormatting: { [weak coordinator] item in coordinator?.loadingFormatting(of: item) ?? item }
+        showsPreview: showsPreview,
+        loadContent: makeContentLoader()
       )
       controller.showsDetails = showsDetails
       controller.showsWebPages = showsWebPages
       controller.highlightsSyntax = highlightsSyntax
-      controller.showsPreview = showsPreview
       controller.detailsArrangement = previewPaneDetailsArrangement(showsPreview: showsPreview)
       controller.onContentFocusLost = { [weak self] in
         self?.listPaneView.focusTableView()
       }
       controller.onCancel = { [weak self] in
         self?.listPaneView.focusTableView()
+      }
+      controller.onSave = { [weak self, weak controller] item, text in
+        guard let self else {
+          return
+        }
+        self.coordinator.editContent(item, text: text)
+        if let controller,
+           let updated = self.model.items.first(where: { $0.id == item.id }) {
+          controller.update(
+            item: updated,
+            revealsSensitiveContent: self.listPaneView.revealsSensitiveContent(of: updated)
+          )
+        }
       }
       addChild(controller)
       previewPane.contentView = controller.view
@@ -2312,8 +2441,8 @@ final class HistoryContentViewController: NSViewController {
   }
 
   @discardableResult
-  private func copyText(_ text: String) -> Bool {
-    let didCopy = coordinator.copyText(text)
+  private func copyText(_ text: String, isConcealed: Bool = false) -> Bool {
+    let didCopy = coordinator.copyText(text, isConcealed: isConcealed)
     showCopySuccessIndicatorIfNeeded(didCopy)
     return didCopy
   }
@@ -2341,7 +2470,7 @@ final class HistoryContentViewController: NSViewController {
   }
 
   private func openInBrowserAndHideHistory(_ item: ClipboardItem) {
-    guard item.browserURL != nil else {
+    guard showsOpenInBrowser(for: item) else {
       return
     }
 
@@ -2441,6 +2570,50 @@ final class HistoryContentViewController: NSViewController {
     SensitiveContent.isMasked(item, detectsAutomatically: model.preferences.detectSensitiveContent)
   }
 
+  func canMarkAsNotSensitive(_ item: ClipboardItem) -> Bool {
+    isSensitiveContentMasked(in: item) || SensitiveContent.shouldEncryptAtRest(item)
+  }
+
+  private func evictRenderedMediaCaches(for item: ClipboardItem) {
+    SVGImageRenderer.shared.removeRendering(for: item.id)
+    if let assetPath = item.assetPath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: assetPath)
+    }
+    if let imagePath = item.linkPreviewDetails?.imagePath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: imagePath)
+    }
+    if let faviconPath = item.linkPreviewDetails?.faviconPath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: faviconPath)
+    }
+    for filePath in item.filePaths where ClipboardItem.isImageFile(at: filePath) {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: filePath)
+    }
+  }
+
+  private func evictRenderedMediaCaches(forItemIDs ids: Set<UUID>) {
+    guard !ids.isEmpty else {
+      return
+    }
+    for id in ids {
+      SVGImageRenderer.shared.removeRendering(for: id)
+    }
+    for item in model.items where ids.contains(item.id) {
+      evictRenderedMediaCaches(for: item)
+    }
+    for item in model.trashedItems where ids.contains(item.id) {
+      evictRenderedMediaCaches(for: item)
+    }
+    for item in listPaneView.items where ids.contains(item.id) {
+      evictRenderedMediaCaches(for: item)
+    }
+    if let paneItem = previewPaneController?.item, ids.contains(paneItem.id) {
+      evictRenderedMediaCaches(for: paneItem)
+    }
+    if let sheetItem = previewSheetController?.item, ids.contains(sheetItem.id) {
+      evictRenderedMediaCaches(for: sheetItem)
+    }
+  }
+
   // An item with content to hide, marked by the user or found by the app, becomes one
   // the user wants shown, and any other item becomes one the user wants hidden.
   private func toggleSensitive(_ item: ClipboardItem) {
@@ -2448,8 +2621,19 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    let isSensitive = !isSensitiveContentMasked(in: item)
+    let isSensitive = !canMarkAsNotSensitive(item)
+    let wasRevealed = listPaneView.revealsSensitiveContent(of: item)
     listPaneView.setRevealsSensitiveContent(false, of: item)
+    if wasRevealed {
+      if let previewPaneController, previewPaneController.item.id == item.id {
+        previewPaneController.update(item: previewPaneController.item, revealsSensitiveContent: false)
+      }
+      if let previewSheetController, previewSheetWindow != nil,
+         previewSheetController.item.id == item.id {
+        previewSheetController.update(item: previewSheetController.item, revealsSensitiveContent: false)
+      }
+      evictRenderedMediaCaches(for: item)
+    }
     coordinator.setSensitive(isSensitive, for: item)
   }
 
@@ -2460,6 +2644,12 @@ final class HistoryContentViewController: NSViewController {
 
     let reveals = !listPaneView.revealsSensitiveContent(of: item)
     listPaneView.setRevealsSensitiveContent(reveals, of: item)
+    if !reveals {
+      if let previewPaneController, previewPaneController.item.id == item.id {
+        previewPaneController.update(item: previewPaneController.item, revealsSensitiveContent: false)
+      }
+      evictRenderedMediaCaches(for: item)
+    }
     setNeedsPreviewPaneUpdate()
 
     guard let previewSheetController, previewSheetWindow != nil,
@@ -2467,6 +2657,9 @@ final class HistoryContentViewController: NSViewController {
       return
     }
     previewSheetController.update(item: previewSheetController.item, revealsSensitiveContent: reveals)
+    if !reveals {
+      evictRenderedMediaCaches(for: previewSheetController.item)
+    }
   }
 
   @objc func applyTransformMenuItem(_ sender: NSMenuItem) {
@@ -2670,6 +2863,10 @@ final class HistoryContentViewController: NSViewController {
 }
 
 extension HistoryContentViewController: HistoryDelegate {
+  func listPaneDidRequestUnlockHistory(_ pane: History) {
+    _ = coordinator.retryUnlockHistoryStore()
+  }
+
   func listPane(_ pane: History, didSelectItems items: [ClipboardItem], focusedItem: ClipboardItem?) {
     let selectedItemIDs = Set(items.map(\.id))
     let selectedItemIDsInSelectionOrder = items.map(\.id)
@@ -3336,7 +3533,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       + copyTextFromQRCodeCommands(for: item, section: 1) + [
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + [
       showInFinderCommand(for: item, shortcut: preferences.showInFinderShortcut, section: 2),
       openInAssociatedApplicationCommand(for: item, section: 2),
       openWithCommand(for: item, section: 2),
@@ -3374,7 +3575,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       + copyTextFromQRCodeCommands(for: item, section: 1) + [
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + [
       settingsCommand(section: 3, shortcut: preferences.openSettingsShortcut),
       deleteCommand(for: item, shortcut: preferences.deleteItemShortcut, section: 4),
       deleteAllCommand(section: 4)
@@ -3408,7 +3613,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       },
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + [
       settingsCommand(section: 3, shortcut: preferences.openSettingsShortcut),
       deleteCommand(for: item, shortcut: preferences.deleteItemShortcut, section: 4),
       deleteAllCommand(section: 4)
@@ -3421,7 +3630,14 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
     appIcon: NSImage,
     preferences: AppPreferences
   ) -> [CommandPaletteCommand] {
-    pasteCommandPair(
+    let openCommands: [CommandPaletteCommand] = item.hasEncryptedImageAsset
+      ? []
+      : [
+          openInAssociatedApplicationCommand(for: item, section: 2),
+          openWithCommand(for: item, section: 2)
+        ]
+
+    return pasteCommandPair(
       title: L10n.string("Paste to %@", appName),
       pasteAndDeleteTitle: L10n.string("Paste to %@ & Delete", appName),
       shortcut: preferences.pasteSelectedShortcut,
@@ -3445,9 +3661,11 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
       saveImageAsFileCommand(for: item, section: 1),
       favoriteCommand(for: item, shortcut: preferences.toggleFavoriteShortcut, section: 1),
       renameCommand(for: item, shortcut: preferences.renameItemShortcut, section: 1)
-    ] + previewCommands(for: item, section: 1) + [
-      openInAssociatedApplicationCommand(for: item, section: 2),
-      openWithCommand(for: item, section: 2),
+    ] + sensitiveContentCommands(
+      for: item,
+      shortcut: preferences.toggleSensitiveContentShortcut,
+      section: 1
+    ) + previewCommands(for: item, section: 1) + openCommands + [
       settingsCommand(section: 4, shortcut: preferences.openSettingsShortcut),
       deleteCommand(for: item, shortcut: preferences.deleteItemShortcut, section: 5),
       deleteAllCommand(section: 5)
@@ -3882,39 +4100,56 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
   }
 
   private func copyTextFromQRCode(_ item: ClipboardItem) {
-    guard allowsUsingItems() else {
-      return
-    }
-
-    guard item.canCopyTextFromQRCode else {
-      model.lastError = L10n.string("%@ does not contain a QR code.", item.kind.title)
-      return
-    }
-
-    guard let text = item.qrCodeText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-      model.lastError = L10n.string("No QR code was found in this image.")
-      return
-    }
-
-    copyText(text)
+    copyRecognizedTextValue(
+      from: item,
+      canCopy: item.canCopyTextFromQRCode,
+      unsupportedMessage: L10n.string("%@ does not contain a QR code.", item.kind.title),
+      emptyMessage: L10n.string("No QR code was found in this image."),
+      extract: \.qrCodeText
+    )
   }
 
   private func copyTextFromImage(_ item: ClipboardItem) {
+    copyRecognizedTextValue(
+      from: item,
+      canCopy: item.canCopyTextFromImage,
+      unsupportedMessage: L10n.string("%@ does not contain image text.", item.kind.title),
+      emptyMessage: L10n.string("No text was found in this image."),
+      extract: \.text
+    )
+  }
+
+  private func copyRecognizedTextValue(
+    from item: ClipboardItem,
+    canCopy: Bool,
+    unsupportedMessage: @autoclosure () -> String,
+    emptyMessage: @autoclosure () -> String,
+    extract: (ClipboardItem) -> String?
+  ) {
     guard allowsUsingItems() else {
       return
     }
-
-    guard item.canCopyTextFromImage else {
-      model.lastError = L10n.string("%@ does not contain image text.", item.kind.title)
+    guard canCopy else {
+      model.lastError = unsupportedMessage()
       return
     }
 
-    guard let text = item.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-      model.lastError = L10n.string("No text was found in this image.")
+    let loadedItem: ClipboardItem
+    do {
+      loadedItem = try coordinator.loadingContent(of: item, scope: .body)
+    } catch {
+      model.lastError = PersistenceErrorLocalization.message(for: error)
+      return
+    }
+    guard let text = extract(loadedItem)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+      model.lastError = emptyMessage()
       return
     }
 
-    copyText(text)
+    let isConcealed = SensitiveContent.shouldEncryptAtRest(loadedItem)
+      || (loadedItem.sensitivity != .notSensitive
+          && SensitiveContent.detectsBodySecretAtRest(kind: .text, text: text, qrCodeText: nil, html: nil))
+    copyText(text, isConcealed: isConcealed)
   }
 
   private func saveImageAsFileCommand(for item: ClipboardItem, section: Int) -> CommandPaletteCommand {
@@ -3966,12 +4201,37 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
     shortcut: String?,
     section: Int
   ) -> [CommandPaletteCommand] {
-    guard item.kind.canHoldSensitiveContent else {
-      return []
+    var commands: [CommandPaletteCommand] = []
+    if isSensitiveContentMasked(in: item) {
+      let hidesContent = hidesSensitiveContent(of: item)
+      commands.append(
+        command(
+          title: hidesContent
+            ? L10n.string("Show Sensitive Content")
+            : L10n.string("Hide Sensitive Content"),
+          shortcut: shortcut,
+          systemImageName: hidesContent ? "eye" : "eye.slash",
+          section: section,
+          isAvailableInReadOnlyHistory: true
+        ) { [weak self] in
+          self?.toggleSensitiveContentVisibility(of: item)
+        }
+      )
     }
 
-    guard isSensitiveContentMasked(in: item) else {
-      return [
+    if canMarkAsNotSensitive(item) {
+      commands.append(
+        command(
+          title: L10n.string("Mark as Not Sensitive"),
+          shortcut: nil,
+          systemImageName: "lock.open",
+          section: section
+        ) { [weak self] in
+          self?.toggleSensitive(item)
+        }
+      )
+    } else {
+      commands.append(
         command(
           title: L10n.string("Mark as Sensitive"),
           shortcut: nil,
@@ -3980,31 +4240,10 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
         ) { [weak self] in
           self?.toggleSensitive(item)
         }
-      ]
+      )
     }
 
-    let hidesContent = hidesSensitiveContent(of: item)
-    return [
-      command(
-        title: hidesContent
-          ? L10n.string("Show Sensitive Content")
-          : L10n.string("Hide Sensitive Content"),
-        shortcut: shortcut,
-        systemImageName: hidesContent ? "eye" : "eye.slash",
-        section: section,
-        isAvailableInReadOnlyHistory: true
-      ) { [weak self] in
-        self?.toggleSensitiveContentVisibility(of: item)
-      },
-      command(
-        title: L10n.string("Mark as Not Sensitive"),
-        shortcut: nil,
-        systemImageName: "lock.open",
-        section: section
-      ) { [weak self] in
-        self?.toggleSensitive(item)
-      }
-    ]
+    return commands
   }
 
   private func transformCommand(for item: ClipboardItem, shortcut: String?, section: Int) -> CommandPaletteCommand {
@@ -4475,7 +4714,7 @@ private extension ClipboardItem {
   var canTransformText: Bool {
     switch kind {
     case .text, .richText, .link, .email, .color:
-      return text != nil
+      return hasTextContent
     case .image, .file:
       return false
     }

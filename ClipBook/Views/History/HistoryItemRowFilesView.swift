@@ -21,7 +21,7 @@ final class HistoryItemRowFilesView: HistoryItemRowView {
       secondary: makeSecondaryLabel(text: makeFileSetDetailsText(for: item))
     )
 
-    if configureFilePreviewStrip(for: item) {
+    if !hidesSensitiveContent, configureFilePreviewStrip(for: item) {
       setTrailingView(previewStrip)
     }
   }
@@ -78,13 +78,13 @@ final class HistoryItemRowFilesView: HistoryItemRowView {
       height: HistoryRow.multipleFilesPreviewImageSize
     )
     imageView.image = filePreviewImage(filePath: filePath, targetSize: targetSize) { [weak self, weak imageView] image in
-      guard self?.isConfigured(for: item) == true else {
+      guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent else {
         return
       }
 
       imageView?.image = image
     }
-    imageView.toolTip = URL(fileURLWithPath: filePath).lastPathComponent
+    imageView.toolTip = hidesSensitiveContent ? nil : URL(fileURLWithPath: filePath).lastPathComponent
   }
 
   private func makePreviewImageView() -> NSImageView {

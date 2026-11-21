@@ -1,11 +1,32 @@
 import Foundation
-import SwiftUI
-import AppKit
-import Carbon
-import Combine
-import SQLite3
 
-protocol HistoryStore {
+nonisolated enum StoreLockState: Equatable, Sendable {
+    case unlocked
+    case locked(KeyUnavailableReason)
+    case keyMismatch
+}
+
+nonisolated protocol HistoryStore: Sendable {
+    var lockState: StoreLockState { get }
+    var isOpen: Bool { get }
+    func retryUnlock() throws
+    func flushPendingFreePageRelease()
+    func close()
+
+    func computeImageDigest(forPNGData pngData: Data) -> String
+    func writeManagedAsset(
+        pngData: Data,
+        role: AssetRole,
+        clipID: UUID,
+        encrypted: Bool,
+        preferredPlainExtension: String?
+    ) throws -> URL
+    func finalizeRecognizedImage(
+        id: UUID,
+        content: RecognizedImageContent,
+        sensitiveContentLifetime: Int
+    ) throws -> (updated: ClipboardItem?, previous: ClipboardItem?, isTrashed: Bool, purged: Bool)
+
     /// The items in the history. Items in the Trash are left out of this and
     /// of every other fetch unless it says otherwise.
     func fetchAll() throws -> [ClipboardItem]
@@ -24,10 +45,11 @@ protocol HistoryStore {
     func capture(_ item: ClipboardItem, updatesCopySequence: Bool) throws -> ClipboardItem
     /// Saves the item. An existing item stays in or out of the Trash.
     func upsert(_ item: ClipboardItem) throws
-    /// The item with its formatting read from the store. Items read from the
-    /// store come without it, and only pasting, dragging, previewing and
-    /// export need it. An item without formatting comes back as it is.
-    func loadingFormatting(of item: ClipboardItem) throws -> ClipboardItem
+    @discardableResult
+    func saveAndReconcileItem(_ item: ClipboardItem, convertingExternalAssets: Bool) throws -> ClipboardItem
+    func setSensitivity(_ sensitivity: ItemSensitivity?, for id: UUID) throws -> ClipboardItem?
+    /// Reads the item's stored body and/or formatting for the requested scope.
+    func loadingContent(of item: ClipboardItem, scope: ClipboardContentScope) throws -> ClipboardItem
     func createTag(name: String, color: String) throws -> Tag
     func updateTag(id: Tag.ID, name: String, color: String) throws -> Tag
     func deleteTag(id: Tag.ID) throws
@@ -50,10 +72,16 @@ protocol HistoryStore {
     /// The latest item of the kind with the content key, the one a capture of
     /// that content updates. It may be in the Trash, which a capture brings
     /// it back from, but an item in the history comes first.
-    func fetchItem(kind: ClipboardKind, contentKey: String) throws -> ClipboardItem?
+    func fetchItem(kind: ClipboardKind, contentKey: String, htmlDigest: String?) throws -> ClipboardItem?
     /// The files every item in the store refers to, its image and its link
     /// preview pictures, the items in the Trash included.
     func fetchStoredFilePaths() throws -> Set<String>
+    func fetchSearchTexts(
+        for ids: [UUID],
+        trashed: Bool,
+        tagNamesByID: [Tag.ID: String],
+        isCancelled: () -> Bool
+    ) throws -> [String?]?
     func fetchItems(where isIncluded: (ClipboardItem) -> Bool) throws -> [ClipboardItem]
     /// The item copied last among those `isIncluded` accepts. Items are read
     /// from the latest one back and only until one is accepted, so asking
@@ -63,4 +91,38 @@ protocol HistoryStore {
     /// Rolls back and rethrows if `body` throws. Nested calls join the
     /// enclosing transaction.
     func performInTransaction(_ body: () throws -> Void) throws
+}
+
+nonisolated extension HistoryStore {
+    var isOpen: Bool {
+        lockState == .unlocked
+    }
+
+    func writeManagedAsset(
+        pngData: Data,
+        role: AssetRole,
+        clipID: UUID,
+        encrypted: Bool
+    ) throws -> URL {
+        try writeManagedAsset(
+            pngData: pngData,
+            role: role,
+            clipID: clipID,
+            encrypted: encrypted,
+            preferredPlainExtension: nil
+        )
+    }
+
+    func fetchItem(kind: ClipboardKind, contentKey: String) throws -> ClipboardItem? {
+        try fetchItem(kind: kind, contentKey: contentKey, htmlDigest: nil)
+    }
+
+    func loadingContent(of item: ClipboardItem) throws -> ClipboardItem {
+        try loadingContent(of: item, scope: .full)
+    }
+
+    @discardableResult
+    func saveAndReconcileItem(_ item: ClipboardItem) throws -> ClipboardItem {
+        try saveAndReconcileItem(item, convertingExternalAssets: true)
+    }
 }

@@ -11,6 +11,8 @@ struct LinkPreview {
   /// shows them, so they are not read in `image` and `favicon`.
   var imageURL: URL?
   var faviconURL: URL?
+  var ownerClipID: UUID? = nil
+  var requiresEncryptedAssets: Bool = false
 
   var hasVisibleDetails: Bool {
     title != nil || description != nil || image != nil || favicon != nil || imageURL != nil || faviconURL != nil
@@ -35,7 +37,9 @@ extension ClipboardItem {
       image: nil,
       favicon: nil,
       imageURL: Self.existingFileURL(atPath: details.imagePath),
-      faviconURL: Self.existingFileURL(atPath: details.faviconPath)
+      faviconURL: Self.existingFileURL(atPath: details.faviconPath),
+      ownerClipID: id,
+      requiresEncryptedAssets: SensitiveContent.shouldEncryptAtRest(self)
     )
   }
 
@@ -99,9 +103,17 @@ final class HistoryItemRowLinkView: HistoryItemRowView {
   private func configureFavicon(at url: URL, for item: ClipboardItem, toolTip: String) {
     let boxSize = CGSize(width: HistoryRow.typeIconSize, height: HistoryRow.typeIconSize)
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: boxSize, scale: backingScale)
+    let assetContext = linkPreview?.ownerClipID.map {
+      ImageAssetThumbnailLoader.ManagedAssetContext(
+        role: .linkFavicon,
+        ownerClipID: $0,
+        requiresEncryption: linkPreview?.requiresEncryptedAssets ?? false
+      )
+    }
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
-      maximumPixelSize: maximumPixelSize
+      maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext
     ) { [weak self] image in
       guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent, self.showsLinkPreview, let image else {
         return
@@ -121,9 +133,17 @@ final class HistoryItemRowLinkView: HistoryItemRowView {
     // than the box needs more pixels along its long side than the box itself has.
     let fillSize = CGSize(width: HistoryRow.linkPreviewImageWidth * 2, height: HistoryRow.linkPreviewImageHeight * 2)
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: fillSize, scale: backingScale)
+    let assetContext = linkPreview?.ownerClipID.map {
+      ImageAssetThumbnailLoader.ManagedAssetContext(
+        role: .linkPreview,
+        ownerClipID: $0,
+        requiresEncryption: linkPreview?.requiresEncryptedAssets ?? false
+      )
+    }
     linkPreviewImageView.image = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
-      maximumPixelSize: maximumPixelSize
+      maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext
     ) { [weak self] image in
       guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent, self.showsLinkPreview, let image else {
         return

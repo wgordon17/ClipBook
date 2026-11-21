@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import AppKit
-import Carbon
 import Combine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -37,7 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   // Hosted unit tests launch the app process before running any test, so they
   // get a scratch directory and preferences domain and skip starting the
   // clipboard monitor and menu bar item.
-  private static let isRunningTests: Bool = {
+  nonisolated static let isRunningTests: Bool = {
     #if DEBUG
     let env = ProcessInfo.processInfo.environment
     return env["XCTestConfigurationFilePath"] != nil
@@ -68,10 +66,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       testDefaultsSuiteName = nil
     }
     preferencesStore = PreferencesStore(userDefaults: userDefaults)
-    historyStore = SQLiteHistoryStore(directory: supportDirectory)
+    historyStore = GRDBHistoryStore(directory: supportDirectory)
     model = AppModel()
-    pasteService = PasteService { [historyStore] item in
-      (try? historyStore.loadingFormatting(of: item)) ?? item
+    pasteService = PasteService { [historyStore] item, scope in
+      try historyStore.loadingContent(of: item, scope: scope)
     }
     globalShortcuts = GlobalShortcutService(isEnabled: !Self.isRunningTests)
     updateService = Self.isRunningTests ? DisabledUpdateService() : SparkleUpdateService()
@@ -198,9 +196,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     coordinator.stop()
+    historyStore.close()
   }
 
   private func removeTestStorage() {
+    coordinator.cancelBackgroundMaintenance()
+    historyStore.close()
     if let testDefaultsSuiteName {
       UserDefaults(suiteName: testDefaultsSuiteName)?.removePersistentDomain(forName: testDefaultsSuiteName)
     }
@@ -244,9 +245,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    item.button?.image = Self.statusBarImage(isPaused: model.isPaused)
+    item.button?.image = Self.statusBarImage(isPaused: model.isPaused || model.storeLockState != .unlocked)
     item.button?.imagePosition = .imageOnly
-    item.button?.toolTip = "ClipBook"
+    let statusLabel = model.storeLockState != .unlocked
+      ? "ClipBook — \(PersistenceErrorLocalization.statusTitle(for: model.storeLockState))"
+      : "ClipBook"
+    item.button?.toolTip = statusLabel
+    item.button?.setAccessibilityLabel(statusLabel)
     if model.preferences.openHistoryOnMenuBarIconClick {
       // A click toggles the history window, and the menu is attached only for
       // as long as a right-click or Control-click shows it. The action is sent
@@ -268,6 +273,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private func observeStatusItemState() {
     model.$items
       .combineLatest(model.$isPaused, model.$selectedItemID, model.$preferences)
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.configureStatusItem()
+        self?.configureHistoryMenu()
+      }
+      .store(in: &statusCancellables)
+
+    model.$storeLockState
       .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
         self?.configureStatusItem()
@@ -335,9 +348,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     menu.addItem(showHistoryItem)
 
+    if model.storeLockState != .unlocked {
+      menu.addItem(.separator())
+      let lockStatusItem = NSMenuItem(
+        title: PersistenceErrorLocalization.statusTitle(for: model.storeLockState),
+        action: nil,
+        keyEquivalent: ""
+      )
+      lockStatusItem.isEnabled = false
+      menu.addItem(lockStatusItem)
+      menu.addItem(
+        menuItem(
+          L10n.string("Unlock History..."),
+          action: #selector(retryUnlockHistory),
+          systemImage: "lock.open"
+        )
+      )
+      menu.addItem(.separator())
+    }
+
     let pauseItem = menuItem(
       model.isPaused ? L10n.string("Resume Clipboard Capture") : L10n.string("Pause Clipboard Capture"),
-      action: #selector(togglePaused)
+      action: #selector(togglePaused),
+      enabled: model.storeLockState == .unlocked
     )
     if let shortcut = KeyboardShortcutParser.menuItemKeyEquivalent(for: model.preferences.pauseShortcut) {
       pauseItem.keyEquivalent = shortcut.keyEquivalent
@@ -355,6 +388,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       openClipBookItem.keyEquivalentModifierMask = shortcut.modifierFlags
     }
     menu.addItem(openClipBookItem)
+    if model.storeLockState != .unlocked {
+      menu.addItem(.separator())
+      let lockStatusItem = NSMenuItem(
+        title: PersistenceErrorLocalization.statusTitle(for: model.storeLockState),
+        action: nil,
+        keyEquivalent: ""
+      )
+      lockStatusItem.isEnabled = false
+      menu.addItem(lockStatusItem)
+      menu.addItem(
+        menuItem(
+          L10n.string("Unlock History..."),
+          action: #selector(retryUnlockHistory),
+          systemImage: "lock.open"
+        )
+      )
+    }
     menu.addItem(.separator())
     menu.addItem(menuItem(L10n.string("About ClipBook"), action: #selector(aboutClipBook), systemImage: "info.circle"))
     menu.addItem(menuItem(L10n.string("Check for Updates..."), action: #selector(checkForUpdates), systemImage: "arrow.clockwise"))
@@ -379,7 +429,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let pauseItem = menuItem(
       model.isPaused ? L10n.string("Resume") : L10n.string("Pause"),
       action: #selector(togglePaused),
-      systemImage: model.isPaused ? "play.fill" : "pause.fill"
+      systemImage: model.isPaused ? "play.fill" : "pause.fill",
+      enabled: model.storeLockState == .unlocked
     )
     if let shortcut = KeyboardShortcutParser.menuItemKeyEquivalent(for: model.preferences.pauseShortcut) {
       pauseItem.keyEquivalent = shortcut.keyEquivalent
@@ -446,6 +497,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc private func togglePaused() {
     coordinator.togglePaused()
+    configureStatusItem()
+    configureHistoryMenu()
+  }
+
+  @objc private func retryUnlockHistory() {
+    coordinator.retryUnlockHistoryStore()
     configureStatusItem()
     configureHistoryMenu()
   }

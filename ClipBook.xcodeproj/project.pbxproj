@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		E77DF5402FBE260100FAC6DD /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = E77DF53F2FBE260100FAC6DD /* Sparkle */; };
+		E77DF54E2FBE400100FAC6DD /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = E77DF54D2FBE400100FAC6DD /* GRDB */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +58,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E77DF5402FBE260100FAC6DD /* Sparkle in Frameworks */,
+				E77DF54E2FBE400100FAC6DD /* GRDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -109,6 +111,7 @@
 			name = ClipBook;
 			packageProductDependencies = (
 				E77DF53F2FBE260100FAC6DD /* Sparkle */,
+				E77DF54D2FBE400100FAC6DD /* GRDB */,
 			);
 			productName = ClipBook;
 			productReference = E77DF5302FBE007100FAC6DD /* ClipBook.app */;
@@ -174,6 +177,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				E77DF53F2FBE250100FAC6DD /* XCRemoteSwiftPackageReference "Sparkle" */,
+				E77DF54C2FBE400100FAC6DD /* XCRemoteSwiftPackageReference "GRDB.swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = E77DF5312FBE007100FAC6DD /* Products */;
@@ -394,7 +398,7 @@
 				DEVELOPMENT_TEAM = 96B3X7S47C;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_PREVIEWS = YES;
+				ENABLE_PREVIEWS = NO;
 				ENABLE_USER_SELECTED_FILES = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = ClipBook/Info.plist;
@@ -512,6 +516,14 @@
 				minimumVersion = 2.7.0;
 			};
 		};
+		E77DF54C2FBE400100FAC6DD /* XCRemoteSwiftPackageReference "GRDB.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift";
+			requirement = {
+				kind = exactVersion;
+				version = 7.12.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -519,6 +531,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = E77DF53F2FBE250100FAC6DD /* XCRemoteSwiftPackageReference "Sparkle" */;
 			productName = Sparkle;
+		};
+		E77DF54D2FBE400100FAC6DD /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E77DF54C2FBE400100FAC6DD /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
