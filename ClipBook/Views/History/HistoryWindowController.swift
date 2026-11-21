@@ -172,9 +172,11 @@ final class HistoryContentViewController: NSViewController {
     #selector(hidePreviewPaneMenuItem(_:))
   ]
 
-  /// Whether a context menu action still works once the trial is over and the
-  /// history is read-only. The actions that use items stay in the menu,
-  /// disabled, so the menu shows what a license brings back.
+  /// Whether a context menu action is enabled for `representedObject`:
+  /// Finder and external-application open actions are disabled for items backed
+  /// by an encrypted `.enc` image asset, and once the trial expires only
+  /// read-only history actions remain enabled while other actions stay visible
+  /// in the menu, disabled, to show what a license brings back.
   func isMenuActionAvailable(_ action: Selector, representedObject: Any?) -> Bool {
     if (action == #selector(showInFinderMenuItem(_:))
         || action == #selector(openInAssociatedApplicationMenuItem(_:))

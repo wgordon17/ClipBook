@@ -53,12 +53,13 @@ trap cleanup_release_fork EXIT
 
 usage() {
   printf '%s\n' "Usage: ./scripts/release-fork.sh --run-number N [options]"
+  printf '%s\n' "       ./scripts/release-fork.sh --sign-and-verify-app PATH [options]"
   printf '%s\n' ""
   printf '%s\n' "Builds, signs (Hardened Runtime, inside-out), packages (.dmg), and generates"
   printf '%s\n' "an Ed25519-signed Sparkle appcast.xml for the ClipBook fork."
   printf '%s\n' ""
   printf '%s\n' "Options:"
-  printf '%s\n' "  --run-number N               Required positive integer CI/release run number."
+  printf '%s\n' "  --run-number N               Positive integer CI/release run number (required for release builds; omitted with --sign-and-verify-app)."
   printf '%s\n' "  --upstream-version X.Y.Z     Upstream version baseline (default: FORK_UPSTREAM_VERSION)."
   printf '%s\n' "  --signing-identity ID        macOS codesign identity (default: ClipBook Fork Code Signing)."
   printf '%s\n' "  --keychain PATH              Optional keychain passed to macOS codesign."
@@ -71,7 +72,7 @@ usage() {
   printf '%s\n' "  --previous-build INT         Optional monotonic CFBundleVersion floor."
   printf '%s\n' "  --output-dir DIR             Output root directory (default: Releases/fork)."
   printf '%s\n' "  --arch-list \"arm64 x86_64\"   Space-separated architectures to archive."
-  printf '%s\n' "  --sign-and-verify-app PATH   Sign and verify an existing ClipBook.app bundle in place."
+  printf '%s\n' "  --sign-and-verify-app PATH   Sign and verify an existing ClipBook.app bundle in place (supports --signing-identity/--keychain, SIGNING_IDENTITY=- ad-hoc, and --p12-file modes; cannot be combined with --run-number or --ed-key-file)."
   printf '%s\n' "  --smoke-test                 Unprivileged verification mode (ephemeral Ed25519; ad-hoc unless --p12-file is set)."
   printf '%s\n' "  -h, --help                   Show this help."
 }

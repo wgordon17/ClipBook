@@ -24908,6 +24908,52 @@
         }
       }
     },
+    "The license key cannot be deactivated :(" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Lizenzschlüssel kann nicht deaktiviert werden :("
+          }
+        },
+        "en-GB" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The licence key cannot be deactivated :("
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La clave de licencia no se puede desactivar :("
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La chiave di licenza non può essere disattivata :("
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ライセンス キーを非アクティブ化できません:("
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A chave de licença não pode ser desativada :("
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "许可证密钥无法停用:("
+          }
+        }
+      }
+    },
     "The offer ends %@." : {
       "localizations" : {
         "de" : {

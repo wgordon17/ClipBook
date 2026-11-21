@@ -715,7 +715,8 @@ enum AppModelAndLocalizationTests {
             "History Imported",
             "History Exported",
             "Import Failed",
-            "Export Failed"
+            "Export Failed",
+            "The license key cannot be deactivated :("
         ]
 
         @Test
