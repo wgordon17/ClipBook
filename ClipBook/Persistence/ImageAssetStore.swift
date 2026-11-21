@@ -545,6 +545,91 @@ nonisolated final class ImageAssetStore: Sendable {
         _ = Darwin.unlink(path)
     }
 
+    static func secureRemoveItem(at url: URL) {
+        let path = url.path
+        guard !path.isEmpty else {
+            return
+        }
+
+        var st = stat()
+        guard Darwin.lstat(path, &st) == 0 else {
+            return
+        }
+
+        if (st.st_mode & S_IFMT) == S_IFDIR {
+            if let children = try? FileManager.default.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: nil,
+                options: []
+            ) {
+                for child in children {
+                    secureRemoveItem(at: child)
+                }
+            }
+            _ = Darwin.rmdir(path)
+            if Darwin.lstat(path, &st) == 0 {
+                try? FileManager.default.removeItem(at: url)
+            }
+        } else {
+            secureUnlink(at: url)
+            if Darwin.lstat(path, &st) == 0 {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    static func writeExclusivePrivateFile(
+        _ data: Data,
+        to destinationURL: URL,
+        sync: Bool = false,
+        mapELOOPToAuthFailed: Bool = false
+    ) throws {
+        let fd = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+        guard fd >= 0 else {
+            let err = errno
+            if mapELOOPToAuthFailed && err == ELOOP {
+                throw HistoryStoreError.authenticationFailed
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
+        }
+
+        var fdOpen = true
+        do {
+            _ = Darwin.fchmod(fd, mode_t(0o600))
+            try data.withUnsafeBytes { rawBuffer in
+                guard rawBuffer.count > 0, let baseAddress = rawBuffer.baseAddress else { return }
+                var writtenTotal = 0
+                while writtenTotal < rawBuffer.count {
+                    let result = Darwin.write(fd, baseAddress.advanced(by: writtenTotal), rawBuffer.count - writtenTotal)
+                    if result > 0 {
+                        writtenTotal += result
+                    } else if result < 0 && errno == EINTR {
+                        continue
+                    } else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                }
+            }
+
+            if sync {
+                if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+                    _ = Darwin.fsync(fd)
+                }
+            }
+
+            fdOpen = false
+            guard Darwin.close(fd) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch {
+            if fdOpen {
+                _ = Darwin.close(fd)
+            }
+            secureUnlink(at: destinationURL)
+            throw error
+        }
+    }
+
     // MARK: - Private Helpers
 
     private func directory(for role: AssetRole) -> URL {
@@ -730,53 +815,11 @@ nonisolated final class ImageAssetStore: Sendable {
     ) throws {
         let tempFileName = ".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)"
         let tempURL = directoryURL.appendingPathComponent(tempFileName, isDirectory: false)
-        let tempPath = tempURL.path
-
-        let fd = Darwin.open(tempPath, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-        guard fd >= 0 else {
+        try writeExclusivePrivateFile(data, to: tempURL, sync: true, mapELOOPToAuthFailed: true)
+        guard Darwin.rename(tempURL.path, destinationURL.path) == 0 else {
             let err = errno
-            if err == ELOOP {
-                throw HistoryStoreError.authenticationFailed
-            }
-            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
-        }
-
-        var fdOpen = true
-        do {
-            _ = Darwin.fchmod(fd, mode_t(0o600))
-            try data.withUnsafeBytes { rawBuffer in
-                guard rawBuffer.count > 0, let baseAddress = rawBuffer.baseAddress else { return }
-                var writtenTotal = 0
-                while writtenTotal < rawBuffer.count {
-                    let result = Darwin.write(fd, baseAddress.advanced(by: writtenTotal), rawBuffer.count - writtenTotal)
-                    if result > 0 {
-                        writtenTotal += result
-                    } else if result < 0 && errno == EINTR {
-                        continue
-                    } else {
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                }
-            }
-
-            if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
-                _ = Darwin.fsync(fd)
-            }
-
-            fdOpen = false
-            guard Darwin.close(fd) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-
-            guard Darwin.rename(tempPath, destinationURL.path) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-        } catch {
-            if fdOpen {
-                _ = Darwin.close(fd)
-            }
             secureUnlink(at: tempURL)
-            throw error
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
         }
     }
 }

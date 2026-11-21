@@ -541,26 +541,6 @@ enum ViewsAndWindowsTests {
         func itemPreviewDetailsViewReusesSameShapeSubviewsAndTruncatesDockedListPaths() throws {
             TestSupport.ensureAppKitInitialized()
 
-            func allDescendants(in root: NSView) -> [NSView] {
-                var visited = Set<ObjectIdentifier>()
-                var ordered: [NSView] = []
-                func walk(_ view: NSView) {
-                    let id = ObjectIdentifier(view)
-                    guard visited.insert(id).inserted else { return }
-                    ordered.append(view)
-                    if #available(macOS 26.0, *),
-                       let glassView = view as? NSGlassEffectView,
-                       let contentView = glassView.contentView {
-                        walk(contentView)
-                    }
-                    for subview in view.subviews {
-                        walk(subview)
-                    }
-                }
-                walk(root)
-                return ordered
-            }
-
             let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
             let longText = String(repeating: "x", count: 4_096)
             let textItemA = ClipboardItem.fixture(
@@ -588,7 +568,7 @@ enum ViewsAndWindowsTests {
             floatingDetails.frame = NSRect(x: 0, y: 0, width: 640, height: 80)
             floatingDetails.layoutSubtreeIfNeeded()
 
-            let initialViews = allDescendants(in: floatingDetails)
+            let initialViews = allViewDescendants(in: floatingDetails)
             let initialStacks = initialViews.compactMap { $0 as? NSStackView }.map(ObjectIdentifier.init)
             let initialTextFields = initialViews.compactMap { $0 as? NSTextField }
             let initialTextFieldIDs = initialTextFields.map(ObjectIdentifier.init)
@@ -606,7 +586,7 @@ enum ViewsAndWindowsTests {
             floatingDetails.update(item: textItemB)
             floatingDetails.layoutSubtreeIfNeeded()
 
-            let updatedViews = allDescendants(in: floatingDetails)
+            let updatedViews = allViewDescendants(in: floatingDetails)
             let updatedStacks = updatedViews.compactMap { $0 as? NSStackView }.map(ObjectIdentifier.init)
             let updatedTextFields = updatedViews.compactMap { $0 as? NSTextField }
             #expect(!initialStacks.isEmpty)
@@ -655,7 +635,7 @@ enum ViewsAndWindowsTests {
             dockedDetails.layoutSubtreeIfNeeded()
 
             let pathTitle = L10n.string("Path")
-            let dockedFieldsInitial = allDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
+            let dockedFieldsInitial = allViewDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
             let pathTitleField = try #require(dockedFieldsInitial.first { $0.stringValue == pathTitle })
             let pathRowView = try #require(pathTitleField.superview)
             let fieldsContainer = try #require(pathRowView.superview)
@@ -678,7 +658,7 @@ enum ViewsAndWindowsTests {
             dockedDetails.update(item: multiFile)
             dockedDetails.layoutSubtreeIfNeeded()
 
-            let multiFields = allDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
+            let multiFields = allViewDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
             #expect(fieldsContainer.subviews.count == initialListRowIDs.count - 1)
             #expect(!multiFields.contains { $0.stringValue == pathTitle })
             #expect(!multiFields.contains { $0.stringValue.contains("report-") })
@@ -687,27 +667,6 @@ enum ViewsAndWindowsTests {
 
         private static func makeRuntimeSecret(tag: String) -> String {
             ["sk", "-proj-", tag, "-", String(repeating: "h7J3pQ5w", count: 4)].joined()
-        }
-
-        @MainActor
-        private static func allDescendants(in root: NSView) -> [NSView] {
-            var visited = Set<ObjectIdentifier>()
-            var ordered: [NSView] = []
-            func walk(_ view: NSView) {
-                let id = ObjectIdentifier(view)
-                guard visited.insert(id).inserted else { return }
-                ordered.append(view)
-                if #available(macOS 26.0, *),
-                   let glassView = view as? NSGlassEffectView,
-                   let contentView = glassView.contentView {
-                    walk(contentView)
-                }
-                for subview in view.subviews {
-                    walk(subview)
-                }
-            }
-            walk(root)
-            return ordered
         }
 
         @MainActor
@@ -783,7 +742,7 @@ enum ViewsAndWindowsTests {
                 let hiddenFileLabels = Self.labels(of: fileRow)
                 #expect(!hiddenFileLabels.contains { $0.text.contains("secret-card-one.png") })
                 #expect(!hiddenFileLabels.contains { $0.text.contains("VaultFolderAlpha") })
-                let hiddenFileTooltips = Self.allDescendants(in: fileRow).compactMap(\.toolTip)
+                let hiddenFileTooltips = allViewDescendants(in: fileRow).compactMap(\.toolTip)
                 #expect(!hiddenFileTooltips.contains { $0.contains("secret-card-one") || $0.contains("VaultFolderAlpha") })
 
                 let multiSensitiveFiles = ClipboardItem.fixture(
@@ -803,12 +762,12 @@ enum ViewsAndWindowsTests {
                     revealsSensitiveContent: false
                 )
                 filesRow.layoutSubtreeIfNeeded()
-                let hiddenMultiImageViews = Self.allDescendants(in: filesRow)
+                let hiddenMultiImageViews = allViewDescendants(in: filesRow)
                     .compactMap { $0 as? NSImageView }
                     .filter { !$0.isHidden && $0.superview != nil }
                 let hiddenPreviewStripViews = hiddenMultiImageViews.filter { $0.wantsLayer && $0.layer?.cornerRadius == 4 }
                 // Only the type icon box symbols (document symbol + lock badge) are visible; the trailing preview strip is omitted and has zero file-name tooltips.
-                let hiddenMultiTooltips = Self.allDescendants(in: filesRow).compactMap(\.toolTip)
+                let hiddenMultiTooltips = allViewDescendants(in: filesRow).compactMap(\.toolTip)
                 #expect(!hiddenMultiTooltips.contains { $0.contains("secret-card") })
                 #expect(hiddenMultiImageViews.count <= 2)
                 #expect(hiddenPreviewStripViews.isEmpty)
@@ -821,7 +780,7 @@ enum ViewsAndWindowsTests {
                     revealsSensitiveContent: true
                 )
                 filesRow.layoutSubtreeIfNeeded()
-                let revealedMultiImageViews = Self.allDescendants(in: filesRow)
+                let revealedMultiImageViews = allViewDescendants(in: filesRow)
                     .compactMap { $0 as? NSImageView }
                     .filter { !$0.isHidden && $0.superview != nil }
                 let revealedPreviewStripViews = revealedMultiImageViews.filter { $0.wantsLayer && $0.layer?.cornerRadius == 4 }
@@ -878,11 +837,11 @@ enum ViewsAndWindowsTests {
 
                 @MainActor
                 func tilePictureImageView() throws -> NSImageView {
-                    let imageViews = Self.allDescendants(in: tileView).compactMap { $0 as? NSImageView }
+                    let imageViews = allViewDescendants(in: tileView).compactMap { $0 as? NSImageView }
                     return try #require(imageViews.first { $0.image != nil })
                 }
 
-                let hiddenFields = Self.allDescendants(in: tileView).compactMap { $0 as? NSTextField }
+                let hiddenFields = allViewDescendants(in: tileView).compactMap { $0 as? NSTextField }
                 #expect(!hiddenFields.contains { $0.stringValue.contains(secretToken) })
                 #expect(hiddenFields.contains { $0.stringValue.contains(SensitiveContent.inlineMask) })
                 #expect(tileView.toolTip == nil)
@@ -897,7 +856,7 @@ enum ViewsAndWindowsTests {
                 )
                 tileView.layoutSubtreeIfNeeded()
                 let decodedShown = await TestSupport.waitUntil(timeout: .seconds(5)) {
-                    Self.allDescendants(in: tileView)
+                    allViewDescendants(in: tileView)
                         .compactMap { $0 as? NSImageView }
                         .contains { $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) > 20 }
                 }
@@ -911,7 +870,7 @@ enum ViewsAndWindowsTests {
                     hidesSensitiveContent: true
                 )
                 tileView.layoutSubtreeIfNeeded()
-                let nonTemplatePicturesAfterRehide = Self.allDescendants(in: tileView)
+                let nonTemplatePicturesAfterRehide = allViewDescendants(in: tileView)
                     .compactMap { $0 as? NSImageView }
                     .filter { $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) > 20 }
                 #expect(nonTemplatePicturesAfterRehide.isEmpty, "Re-hiding a tile must clear the decoded screenshot back to placeholder")
@@ -1079,7 +1038,7 @@ enum ViewsAndWindowsTests {
 
                 @MainActor
                 func hasDecodedPreviewPicture(in root: NSView) -> Bool {
-                    Self.allDescendants(in: root)
+                    allViewDescendants(in: root)
                         .compactMap { $0 as? NSImageView }
                         .contains { !$0.isHidden && $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) >= 60 }
                 }
@@ -1117,10 +1076,10 @@ enum ViewsAndWindowsTests {
                 closeAccessory.view.layoutSubtreeIfNeeded()
 
                 #expect(!hasDecodedPreviewPicture(in: fileDialog.view), "Hidden sensitive image .file must not show visual image preview")
-                let hiddenAccessoryFields = Self.allDescendants(in: closeAccessory.view).compactMap { $0 as? NSTextField }
+                let hiddenAccessoryFields = allViewDescendants(in: closeAccessory.view).compactMap { $0 as? NSTextField }
                 #expect(hiddenAccessoryFields.contains { $0.stringValue == ItemPreviewDetailsView.typeName(for: sensitiveFileItem) })
                 #expect(!hiddenAccessoryFields.contains { !$0.isHidden && ($0.stringValue.contains("passport-scan.png") || $0.stringValue.contains("PrivateVaultDir")) })
-                let hiddenAccessoryTooltips = Self.allDescendants(in: closeAccessory.view).compactMap(\.toolTip)
+                let hiddenAccessoryTooltips = allViewDescendants(in: closeAccessory.view).compactMap(\.toolTip)
                 #expect(!hiddenAccessoryTooltips.contains { $0.contains("passport-scan") || $0.contains("PrivateVaultDir") })
 
                 let dockedDetails = ItemPreviewDetailsView(
@@ -1132,10 +1091,10 @@ enum ViewsAndWindowsTests {
                 dockedDetails.frame = NSRect(x: 0, y: 0, width: 320, height: 180)
                 dockedDetails.layoutSubtreeIfNeeded()
 
-                let hiddenDetailsFields = Self.allDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
+                let hiddenDetailsFields = allViewDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
                 #expect(hiddenDetailsFields.contains { $0.stringValue == SensitiveContent.wholeMask })
                 #expect(!hiddenDetailsFields.contains { $0.stringValue.contains("passport-scan") || $0.stringValue.contains("PrivateVaultDir") })
-                let hiddenDetailsTooltips = Self.allDescendants(in: dockedDetails).compactMap(\.toolTip)
+                let hiddenDetailsTooltips = allViewDescendants(in: dockedDetails).compactMap(\.toolTip)
                 #expect(!hiddenDetailsTooltips.contains { $0.contains("passport-scan") || $0.contains("PrivateVaultDir") })
 
                 // Reveal sensitive .file (as Cmd+U does) and verify visual preview + filename + path + tooltip appear!
@@ -1143,16 +1102,16 @@ enum ViewsAndWindowsTests {
                 fileDialog.view.layoutSubtreeIfNeeded()
                 closeAccessory.view.layoutSubtreeIfNeeded()
                 #expect(hasDecodedPreviewPicture(in: fileDialog.view))
-                let revealedAccessoryFields = Self.allDescendants(in: closeAccessory.view).compactMap { $0 as? NSTextField }
+                let revealedAccessoryFields = allViewDescendants(in: closeAccessory.view).compactMap { $0 as? NSTextField }
                 #expect(revealedAccessoryFields.contains { !$0.isHidden && $0.stringValue == "passport-scan.png" })
                 #expect(revealedAccessoryFields.contains { !$0.isHidden && $0.stringValue.contains("PrivateVaultDir") })
 
                 dockedDetails.update(item: sensitiveFileItem, hidesSensitiveContent: false)
                 dockedDetails.layoutSubtreeIfNeeded()
                 let expectedAbbrevPath = (secretFileURL.path as NSString).abbreviatingWithTildeInPath
-                let revealedDetailsFields = Self.allDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
+                let revealedDetailsFields = allViewDescendants(in: dockedDetails).compactMap { $0 as? NSTextField }
                 #expect(revealedDetailsFields.contains { $0.stringValue == expectedAbbrevPath })
-                let revealedDetailsTooltips = Self.allDescendants(in: dockedDetails).compactMap(\.toolTip)
+                let revealedDetailsTooltips = allViewDescendants(in: dockedDetails).compactMap(\.toolTip)
                 #expect(revealedDetailsTooltips.contains(expectedAbbrevPath))
             }
         }
@@ -1664,87 +1623,11 @@ extension SharedProcessStateTests {
             supportDirectory: URL,
             keyProvider: any DatabaseKeyProvider
         ) throws -> TestCoordinatorHarness {
-            TestSupport.ensureAppKitInitialized()
-            let fileManager = FileManager.default
-            try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-
-            let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
-            let userDefaults = try #require(UserDefaults(suiteName: suiteName))
-            userDefaults.removePersistentDomain(forName: suiteName)
-
-            let pasteboard = NSPasteboard.withUniqueName()
-            let historyStore = GRDBHistoryStore(
-                directory: supportDirectory,
-                keyProvider: keyProvider
-            )
-            _ = try? historyStore.fetchAll()
-
-            let preferencesStore = PreferencesStore(userDefaults: userDefaults)
-            var initialPreferences = AppPreferences()
-            initialPreferences.warnOnClearHistory = false
-            initialPreferences.soundEffectsEnabled = false
-            initialPreferences.launchAtLogin = false
-            initialPreferences.showPreviewForLinks = false
-            preferencesStore.save(initialPreferences)
-
-            let model = AppModel()
-            model.preferences = initialPreferences
-
-            let globalShortcuts = GlobalShortcutService(isEnabled: false)
-            let updateService = TestNoOpUpdateService()
-            let licensingService = LicensingService()
-            let clipboardMonitor = PasteboardMonitor(
-                historyStore: historyStore,
-                fileManager: fileManager,
+            try TestSupport.makeTestCoordinator(
                 supportDirectory: supportDirectory,
-                pasteboard: pasteboard
+                keyProvider: keyProvider,
+                probeStoreBeforeInit: true
             )
-            let pasteService = PasteService(
-                pasteboard: pasteboard,
-                loadContent: { [historyStore] item, scope in
-                    try historyStore.loadingContent(of: item, scope: scope)
-                }
-            )
-            let coordinator = AppCoordinator(
-                model: model,
-                preferencesStore: preferencesStore,
-                historyStore: historyStore,
-                clipboardMonitor: clipboardMonitor,
-                pasteService: pasteService,
-                globalShortcuts: globalShortcuts,
-                updateService: updateService,
-                licensingService: licensingService,
-                fileManager: fileManager,
-                supportDirectory: supportDirectory
-            )
-
-            return TestCoordinatorHarness(
-                coordinator: coordinator,
-                model: model,
-                historyStore: historyStore,
-                preferencesStore: preferencesStore,
-                clipboardMonitor: clipboardMonitor,
-                globalShortcuts: globalShortcuts,
-                updateService: updateService,
-                pasteboard: pasteboard,
-                userDefaultsSuiteName: suiteName,
-                supportDirectory: supportDirectory
-            )
-        }
-
-        @MainActor
-        private static func collectViewSubviews(in root: NSView) -> [NSView] {
-            var visited = Set<ObjectIdentifier>()
-            var result: [NSView] = []
-            func walk(_ view: NSView) {
-                guard visited.insert(ObjectIdentifier(view)).inserted else { return }
-                result.append(view)
-                for subview in view.subviews {
-                    walk(subview)
-                }
-            }
-            walk(root)
-            return result
         }
 
         @MainActor
@@ -1838,7 +1721,7 @@ extension SharedProcessStateTests {
         @MainActor
         private static func renderedStrings(in root: NSView) -> [String] {
             var strings: [String] = []
-            for view in collectViewSubviews(in: root) {
+            for view in allViewDescendants(in: root, includeGlassContentView: false) {
                 if let tf = view as? NSTextField, !tf.isHidden, !tf.stringValue.isEmpty {
                     strings.append(tf.stringValue)
                 } else if let button = view as? NSButton, !button.isHidden, !button.title.isEmpty {
@@ -1853,7 +1736,7 @@ extension SharedProcessStateTests {
 
         @MainActor
         private static func findHostedButton(titled title: String, in root: NSView) -> (isEnabled: Bool, press: () -> Void)? {
-            for view in collectViewSubviews(in: root) {
+            for view in allViewDescendants(in: root, includeGlassContentView: false) {
                 if let button = view as? NSButton, !button.isHidden, button.title == title {
                     return (
                         isEnabled: button.isEnabled,
@@ -1881,7 +1764,7 @@ extension SharedProcessStateTests {
 
         @MainActor
         private static func findHostedSwitchEnabledState(labeled label: String, in root: NSView) -> Bool? {
-            let switches = collectViewSubviews(in: root).compactMap { $0 as? NSSwitch }.filter { !$0.isHidden }
+            let switches = allViewDescendants(in: root, includeGlassContentView: false).compactMap { $0 as? NSSwitch }.filter { !$0.isHidden }
             if let matchingSwitch = switches.first(where: { axStringAttributes(of: $0).contains(label) }) {
                 return matchingSwitch.isEnabled
             }
@@ -2277,24 +2160,9 @@ extension SharedProcessStateTests {
         }
 
         @MainActor
-        private static func allDescendants(in root: NSView) -> [NSView] {
-            var visited = Set<ObjectIdentifier>()
-            var ordered: [NSView] = []
-            func walk(_ view: NSView) {
-                guard visited.insert(ObjectIdentifier(view)).inserted else { return }
-                ordered.append(view)
-                for subview in view.subviews {
-                    walk(subview)
-                }
-            }
-            walk(root)
-            return ordered
-        }
-
-        @MainActor
         private static func allTextStrings(in root: NSView) -> String {
             var parts: [String] = []
-            for view in allDescendants(in: root) {
+            for view in allViewDescendants(in: root, includeGlassContentView: false) {
                 if let tv = view as? NSTextView {
                     parts.append(tv.string)
                 } else if let tf = view as? NSTextField, !tf.isHidden {
@@ -2302,11 +2170,6 @@ extension SharedProcessStateTests {
                 }
             }
             return parts.joined(separator: "\n")
-        }
-
-        @MainActor
-        private static func findEditableTextView(in root: NSView) -> NSTextView? {
-            allDescendants(in: root).compactMap { $0 as? NSTextView }.first { $0.isEditable }
         }
 
         @Test
@@ -2550,7 +2413,7 @@ extension SharedProcessStateTests {
 
             livePane.beginEditing()
             #expect(livePane.isEditing)
-            let editor = try #require(Self.findEditableTextView(in: livePane.view))
+            let editor = try #require(findEditableTextView(in: livePane.view))
             #expect(editor.string == text40KB)
 
             let edited42KB = String(repeating: "e", count: 42_000) + "LIVE_PANE_EDITED_SENTINEL"
@@ -2689,10 +2552,10 @@ extension SharedProcessStateTests {
             defer { TestSupport.tearDownHistoryWindow(historyWindow) }
 
             func findTileView(in root: NSView) -> HistoryTileView? {
-                Self.allDescendants(in: root).compactMap { $0 as? HistoryTileView }.first { !$0.isHidden }
+                allViewDescendants(in: root).compactMap { $0 as? HistoryTileView }.first { !$0.isHidden }
             }
             func hasDecodedTileScreenshot(in tile: HistoryTileView) -> Bool {
-                Self.allDescendants(in: tile)
+                allViewDescendants(in: tile)
                     .compactMap { $0 as? NSImageView }
                     .contains { !$0.isHidden && $0.image?.isTemplate == false && ($0.image?.size.width ?? 0) >= 40 }
             }
@@ -2758,7 +2621,7 @@ extension SharedProcessStateTests {
             contentVC.view.layoutSubtreeIfNeeded()
 
             let listPane = try #require(
-                Self.allDescendants(in: contentVC.view).compactMap { $0 as? History }.first
+                allViewDescendants(in: contentVC.view).compactMap { $0 as? History }.first
             )
             #expect(listPane.items.map(\.id) == [initialItem.id])
 
@@ -3500,6 +3363,27 @@ private final class ToolbarDelegateSpy: HistoryToolbarDelegate {
     func historyToolbarDidRequestToggleImageTiles(_ toolbar: HistoryToolbar) {}
     func historyToolbarDidRequestToggleCompactHistory(_ toolbar: HistoryToolbar) {}
     func historyToolbarDidRequestCommandDialog(_ toolbar: HistoryToolbar) {}
+}
+
+@MainActor
+private func allViewDescendants(in root: NSView, includeGlassContentView: Bool = true) -> [NSView] {
+    var visited = Set<ObjectIdentifier>()
+    var ordered: [NSView] = []
+    func walk(_ view: NSView) {
+        guard visited.insert(ObjectIdentifier(view)).inserted else { return }
+        ordered.append(view)
+        if includeGlassContentView,
+           #available(macOS 26.0, *),
+           let glassView = view as? NSGlassEffectView,
+           let contentView = glassView.contentView {
+            walk(contentView)
+        }
+        for subview in view.subviews {
+            walk(subview)
+        }
+    }
+    walk(root)
+    return ordered
 }
 
 @MainActor

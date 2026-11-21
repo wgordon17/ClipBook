@@ -1,5 +1,4 @@
 import AppKit
-import CryptoKit
 import Darwin
 import Foundation
 import ImageIO
@@ -488,40 +487,8 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       ".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)",
       isDirectory: false
     )
-    let fd = Darwin.open(tempURL.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-    guard fd >= 0 else {
-      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-    }
-
-    var fdOpen = true
-    do {
-      _ = Darwin.fchmod(fd, mode_t(0o600))
-      try data.withUnsafeBytes { rawBuffer in
-        guard rawBuffer.count > 0, let baseAddress = rawBuffer.baseAddress else { return }
-        var writtenTotal = 0
-        while writtenTotal < rawBuffer.count {
-          let result = Darwin.write(fd, baseAddress.advanced(by: writtenTotal), rawBuffer.count - writtenTotal)
-          if result > 0 {
-            writtenTotal += result
-          } else if result < 0 && errno == EINTR {
-            continue
-          } else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-          }
-        }
-      }
-      fdOpen = false
-      guard Darwin.close(fd) == 0 else {
-        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-      }
-      return tempURL
-    } catch {
-      if fdOpen {
-        _ = Darwin.close(fd)
-      }
-      ImageAssetStore.secureUnlink(at: tempURL)
-      throw error
-    }
+    try ImageAssetStore.writeExclusivePrivateFile(data, to: tempURL)
+    return tempURL
   }
 
   private static func thumbnailPNGData(from fileURL: URL, maximumPixelSize: Int) -> Data? {
@@ -594,8 +561,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       String(Int(targetSize.width.rounded())),
       String(Int(targetSize.height.rounded()))
     ].joined(separator: "\n")
-    let digest = SHA256.hash(data: Data(rawKey.utf8))
-    return digest.map { String(format: "%02x", $0) }.joined()
+    return ContentDigest.sha256(Data(rawKey.utf8))
   }
 
   private func imageURL(forKey key: String) -> URL {

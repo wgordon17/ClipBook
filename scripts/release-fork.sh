@@ -210,6 +210,80 @@ require_tool() {
   fi
 }
 
+normalize_signing_cli_paths() {
+  if [[ -n "$KEYCHAIN_PATH" ]]; then
+    KEYCHAIN_PATH="$(normalize_existing_file "--keychain" "$KEYCHAIN_PATH")"
+  fi
+  if [[ -n "$P12_FILE" ]]; then
+    P12_FILE="$(normalize_existing_file "--p12-file" "$P12_FILE")"
+  fi
+  if [[ -n "$P12_PASSWORD_FILE" ]]; then
+    P12_PASSWORD_FILE="$(normalize_existing_file "--p12-password-file" "$P12_PASSWORD_FILE")"
+  fi
+  if [[ -n "$SIGNER_BIN" ]]; then
+    if [[ ! -f "$SIGNER_BIN" || ! -x "$SIGNER_BIN" ]]; then
+      printf 'Error: --rcodesign-bin is missing or not executable: %s\n' "$SIGNER_BIN" >&2
+      exit 1
+    fi
+    SIGNER_BIN="$(cd "$(dirname "$SIGNER_BIN")" && pwd)/$(basename "$SIGNER_BIN")"
+  fi
+  if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$SIGNER_BIN" ]]; then
+    if [[ -z "$P12_FILE" || -z "$P12_PASSWORD_FILE" || -z "$SIGNER_BIN" ]]; then
+      printf 'Error: --p12-file, --p12-password-file, and --rcodesign-bin must all be provided together.\n' >&2
+      exit 1
+    fi
+  fi
+}
+
+parse_and_validate_arch_list() {
+  local arch_item
+  read -r -a REQUIRED_APP_ARCHS <<< "$APP_ARCHS"
+  if [[ "${#REQUIRED_APP_ARCHS[@]}" -eq 0 ]]; then
+    printf 'Error: --arch-list must specify at least one architecture.\n' >&2
+    exit 1
+  fi
+  for arch_item in "${REQUIRED_APP_ARCHS[@]}"; do
+    if [[ ! "$arch_item" =~ ^[A-Za-z0-9_]+$ ]]; then
+      printf 'Error: Invalid architecture token in --arch-list: %s\n' "$arch_item" >&2
+      exit 1
+    fi
+  done
+}
+
+extract_and_verify_p12_leaf() {
+  local min_valid_seconds="$1"
+  local leaf_cert_pem raw_fp leaf_subject
+  if [[ ! -x /usr/bin/openssl ]]; then
+    printf 'Error: Expected macOS /usr/bin/openssl to be present and executable.\n' >&2
+    exit 1
+  fi
+  if ! leaf_cert_pem="$(/usr/bin/openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin file:"$P12_PASSWORD_FILE" 2>/dev/null)" || [[ -z "$leaf_cert_pem" ]]; then
+    printf 'Error: Could not extract leaf certificate PEM from PKCS#12 file (invalid bundle or passphrase).\n' >&2
+    exit 1
+  fi
+  if ! /usr/bin/openssl x509 -noout -checkend "$min_valid_seconds" <<< "$leaf_cert_pem" >/dev/null 2>&1; then
+    printf 'Error: PKCS#12 leaf certificate is expired or expires within %s seconds.\n' "$min_valid_seconds" >&2
+    exit 1
+  fi
+  raw_fp="$(/usr/bin/openssl x509 -noout -fingerprint -sha1 <<< "$leaf_cert_pem")"
+  LEAF_SHA1="$(printf '%s' "${raw_fp#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$LEAF_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Error: Could not extract 40-hex leaf SHA-1 fingerprint from PKCS#12 certificate (got: %s).\n' "$LEAF_SHA1" >&2
+    exit 1
+  fi
+  leaf_subject="$(/usr/bin/openssl x509 -noout -subject -nameopt RFC2253 <<< "$leaf_cert_pem" | tr -d '\r\n')"
+  if [[ "$leaf_subject" != *CN=* ]]; then
+    printf 'Error: PKCS#12 leaf certificate subject is missing CN= (got: %s).\n' "$leaf_subject" >&2
+    exit 1
+  fi
+  EXPECTED_AUTHORITY="${leaf_subject#*CN=}"
+  EXPECTED_AUTHORITY="${EXPECTED_AUTHORITY%%,*}"
+  if [[ -z "$EXPECTED_AUTHORITY" ]]; then
+    printf 'Error: PKCS#12 leaf certificate has an empty Common Name (subject: %s).\n' "$leaf_subject" >&2
+    exit 1
+  fi
+}
+
 run_rcodesign() {
   (
     local bin="$SIGNER_BIN"
@@ -239,28 +313,7 @@ if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
     exit 1
   fi
 
-  if [[ -n "$KEYCHAIN_PATH" ]]; then
-    KEYCHAIN_PATH="$(normalize_existing_file "--keychain" "$KEYCHAIN_PATH")"
-  fi
-  if [[ -n "$P12_FILE" ]]; then
-    P12_FILE="$(normalize_existing_file "--p12-file" "$P12_FILE")"
-  fi
-  if [[ -n "$P12_PASSWORD_FILE" ]]; then
-    P12_PASSWORD_FILE="$(normalize_existing_file "--p12-password-file" "$P12_PASSWORD_FILE")"
-  fi
-  if [[ -n "$SIGNER_BIN" ]]; then
-    if [[ ! -f "$SIGNER_BIN" || ! -x "$SIGNER_BIN" ]]; then
-      printf 'Error: --rcodesign-bin is missing or not executable: %s\n' "$SIGNER_BIN" >&2
-      exit 1
-    fi
-    SIGNER_BIN="$(cd "$(dirname "$SIGNER_BIN")" && pwd)/$(basename "$SIGNER_BIN")"
-  fi
-  if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$SIGNER_BIN" ]]; then
-    if [[ -z "$P12_FILE" || -z "$P12_PASSWORD_FILE" || -z "$SIGNER_BIN" ]]; then
-      printf 'Error: --p12-file, --p12-password-file, and --rcodesign-bin must all be provided together.\n' >&2
-      exit 1
-    fi
-  fi
+  normalize_signing_cli_paths
 
   if [[ ! -f "$ENTITLEMENTS_PATH" ]]; then
     printf 'Error: Release entitlements file not found: %s\n' "$ENTITLEMENTS_PATH" >&2
@@ -273,17 +326,7 @@ if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
   if [[ "$APP_ARCHS_EXPLICIT" -eq 0 ]]; then
     APP_ARCHS="$(xcrun lipo -archs "$APP_PATH/Contents/MacOS/$APP_NAME")"
   fi
-  read -r -a REQUIRED_APP_ARCHS <<< "$APP_ARCHS"
-  if [[ "${#REQUIRED_APP_ARCHS[@]}" -eq 0 ]]; then
-    printf 'Error: --arch-list must specify at least one architecture.\n' >&2
-    exit 1
-  fi
-  for arch_item in "${REQUIRED_APP_ARCHS[@]}"; do
-    if [[ ! "$arch_item" =~ ^[A-Za-z0-9_]+$ ]]; then
-      printf 'Error: Invalid architecture token in --arch-list: %s\n' "$arch_item" >&2
-      exit 1
-    fi
-  done
+  parse_and_validate_arch_list
 
   VERIFY_SCRATCH_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/var/tmp}/clipbook-verify.XXXXXXXXXX")"
   chmod 700 "$VERIFY_SCRATCH_DIR"
@@ -299,35 +342,7 @@ if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
   EXPECTED_AUTHORITY="$SIGNING_IDENTITY"
 
   if [[ -n "$P12_FILE" ]]; then
-    if [[ ! -x /usr/bin/openssl ]]; then
-      printf 'Error: Expected macOS /usr/bin/openssl to be present and executable.\n' >&2
-      exit 1
-    fi
-    if ! LEAF_CERT_PEM="$(/usr/bin/openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin file:"$P12_PASSWORD_FILE" 2>/dev/null)" || [[ -z "$LEAF_CERT_PEM" ]]; then
-      printf 'Error: Could not extract leaf certificate PEM from PKCS#12 file (invalid bundle or passphrase).\n' >&2
-      exit 1
-    fi
-    if ! /usr/bin/openssl x509 -noout -checkend 3600 <<< "$LEAF_CERT_PEM" >/dev/null 2>&1; then
-      printf 'Error: PKCS#12 leaf certificate is expired or expires within 3600 seconds.\n' >&2
-      exit 1
-    fi
-    RAW_FP="$(/usr/bin/openssl x509 -noout -fingerprint -sha1 <<< "$LEAF_CERT_PEM")"
-    LEAF_SHA1="$(printf '%s' "${RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
-    if [[ ! "$LEAF_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
-      printf 'Error: Could not extract 40-hex leaf SHA-1 fingerprint from PKCS#12 certificate (got: %s).\n' "$LEAF_SHA1" >&2
-      exit 1
-    fi
-    LEAF_SUBJECT="$(/usr/bin/openssl x509 -noout -subject -nameopt RFC2253 <<< "$LEAF_CERT_PEM" | tr -d '\r\n')"
-    if [[ "$LEAF_SUBJECT" != *CN=* ]]; then
-      printf 'Error: PKCS#12 leaf certificate subject is missing CN= (got: %s).\n' "$LEAF_SUBJECT" >&2
-      exit 1
-    fi
-    EXPECTED_AUTHORITY="${LEAF_SUBJECT#*CN=}"
-    EXPECTED_AUTHORITY="${EXPECTED_AUTHORITY%%,*}"
-    if [[ -z "$EXPECTED_AUTHORITY" ]]; then
-      printf 'Error: PKCS#12 leaf certificate has an empty Common Name (subject: %s).\n' "$LEAF_SUBJECT" >&2
-      exit 1
-    fi
+    extract_and_verify_p12_leaf 3600
   else
     if [[ "$SMOKE_TEST" -eq 1 ]]; then
       EFFECTIVE_SIGNING_IDENTITY="-"
@@ -348,32 +363,10 @@ mkdir -p "$OUTPUT_DIR" "$DERIVED_DATA_PATH"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 DERIVED_DATA_PATH="$(cd "$DERIVED_DATA_PATH" && pwd)"
 
-if [[ -n "$KEYCHAIN_PATH" ]]; then
-  KEYCHAIN_PATH="$(normalize_existing_file "--keychain" "$KEYCHAIN_PATH")"
-fi
-if [[ -n "$P12_FILE" ]]; then
-  P12_FILE="$(normalize_existing_file "--p12-file" "$P12_FILE")"
-fi
-if [[ -n "$P12_PASSWORD_FILE" ]]; then
-  P12_PASSWORD_FILE="$(normalize_existing_file "--p12-password-file" "$P12_PASSWORD_FILE")"
-fi
 if [[ -n "$ED_KEY_FILE" ]]; then
   ED_KEY_FILE="$(normalize_existing_file "--ed-key-file" "$ED_KEY_FILE")"
 fi
-if [[ -n "$SIGNER_BIN" ]]; then
-  if [[ ! -f "$SIGNER_BIN" || ! -x "$SIGNER_BIN" ]]; then
-    printf 'Error: --rcodesign-bin is missing or not executable: %s\n' "$SIGNER_BIN" >&2
-    exit 1
-  fi
-  SIGNER_BIN="$(cd "$(dirname "$SIGNER_BIN")" && pwd)/$(basename "$SIGNER_BIN")"
-fi
-
-if [[ -n "$P12_FILE" || -n "$P12_PASSWORD_FILE" || -n "$SIGNER_BIN" ]]; then
-  if [[ -z "$P12_FILE" || -z "$P12_PASSWORD_FILE" || -z "$SIGNER_BIN" ]]; then
-    printf 'Error: --p12-file, --p12-password-file, and --rcodesign-bin must all be provided together.\n' >&2
-    exit 1
-  fi
-fi
+normalize_signing_cli_paths
 
 if [[ "$SMOKE_TEST" -eq 1 && -n "$ED_KEY_FILE" ]]; then
   printf 'Error: --smoke-test cannot be combined with --ed-key-file.\n' >&2
@@ -420,17 +413,7 @@ if [[ -n "$PREVIOUS_BUILD" ]]; then
   fi
 fi
 
-read -r -a REQUIRED_APP_ARCHS <<< "$APP_ARCHS"
-if [[ "${#REQUIRED_APP_ARCHS[@]}" -eq 0 ]]; then
-  printf 'Error: --arch-list must specify at least one architecture.\n' >&2
-  exit 1
-fi
-for arch_item in "${REQUIRED_APP_ARCHS[@]}"; do
-  if [[ ! "$arch_item" =~ ^[A-Za-z0-9_]+$ ]]; then
-    printf 'Error: Invalid architecture token in --arch-list: %s\n' "$arch_item" >&2
-    exit 1
-  fi
-done
+parse_and_validate_arch_list
 
 if [[ ! -f "$ENTITLEMENTS_PATH" ]]; then
   printf 'Error: Release entitlements file not found: %s\n' "$ENTITLEMENTS_PATH" >&2
@@ -488,35 +471,11 @@ if [[ "$SMOKE_TEST" -eq 0 ]]; then
 fi
 
 if [[ -n "$P12_FILE" ]]; then
-  if ! LEAF_CERT_PEM="$(/usr/bin/openssl pkcs12 -in "$P12_FILE" -clcerts -nokeys -passin file:"$P12_PASSWORD_FILE" 2>/dev/null)" || [[ -z "$LEAF_CERT_PEM" ]]; then
-    printf 'Error: Could not extract leaf certificate PEM from PKCS#12 file (invalid bundle or passphrase).\n' >&2
-    exit 1
-  fi
   CERT_MIN_SECONDS=172800
   if [[ "$SMOKE_TEST" -eq 1 ]]; then
     CERT_MIN_SECONDS=3600
   fi
-  if ! /usr/bin/openssl x509 -noout -checkend "$CERT_MIN_SECONDS" <<< "$LEAF_CERT_PEM" >/dev/null 2>&1; then
-    printf 'Error: PKCS#12 leaf certificate is expired or expires within %s seconds.\n' "$CERT_MIN_SECONDS" >&2
-    exit 1
-  fi
-  RAW_FP="$(/usr/bin/openssl x509 -noout -fingerprint -sha1 <<< "$LEAF_CERT_PEM")"
-  LEAF_SHA1="$(printf '%s' "${RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
-  if [[ ! "$LEAF_SHA1" =~ ^[0-9a-f]{40}$ ]]; then
-    printf 'Error: Could not extract 40-hex leaf SHA-1 fingerprint from PKCS#12 certificate (got: %s).\n' "$LEAF_SHA1" >&2
-    exit 1
-  fi
-  LEAF_SUBJECT="$(/usr/bin/openssl x509 -noout -subject -nameopt RFC2253 <<< "$LEAF_CERT_PEM" | tr -d '\r\n')"
-  if [[ "$LEAF_SUBJECT" != *CN=* ]]; then
-    printf 'Error: PKCS#12 leaf certificate subject is missing CN= (got: %s).\n' "$LEAF_SUBJECT" >&2
-    exit 1
-  fi
-  EXPECTED_AUTHORITY="${LEAF_SUBJECT#*CN=}"
-  EXPECTED_AUTHORITY="${EXPECTED_AUTHORITY%%,*}"
-  if [[ -z "$EXPECTED_AUTHORITY" ]]; then
-    printf 'Error: PKCS#12 leaf certificate has an empty Common Name (subject: %s).\n' "$LEAF_SUBJECT" >&2
-    exit 1
-  fi
+  extract_and_verify_p12_leaf "$CERT_MIN_SECONDS"
   if [[ "$SMOKE_TEST" -eq 0 && "$LEAF_SHA1" != "$REPO_CERT_SHA1" ]]; then
     printf 'Error: PKCS#12 leaf SHA-1 (%s) does not match committed scripts/ClipBookForkCodeSigning.crt (%s).\n' \
       "$LEAF_SHA1" "$REPO_CERT_SHA1" >&2

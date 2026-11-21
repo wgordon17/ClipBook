@@ -66,6 +66,17 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         var tagIDs: [Int] = []
         var tagNames: [String] = []
         var tagOrders: [Int: Int] = [:]
+
+        mutating func append(row: Row) {
+            let tagID: Int = row["tagId"]
+            let tagName: String = row["name"]
+            let sortOrder: Int? = row["sortOrder"]
+            tagIDs.append(tagID)
+            tagNames.append(tagName)
+            if let sortOrder {
+                tagOrders[tagID] = sortOrder
+            }
+        }
     }
 
     let directory: URL
@@ -2131,24 +2142,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     }
 
     private static func scrubAndRemoveProbeDirectory(at probeDir: URL) {
-        if let entries = try? FileManager.default.contentsOfDirectory(
-            at: probeDir,
-            includingPropertiesForKeys: nil,
-            options: []
-        ) {
-            for entry in entries {
-                var st = stat()
-                if Darwin.lstat(entry.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR {
-                    scrubAndRemoveProbeDirectory(at: entry)
-                } else {
-                    ImageAssetStore.secureUnlink(at: entry)
-                }
-            }
-        }
-        _ = Darwin.rmdir(probeDir.path)
-        if fileOrSymlinkExists(at: probeDir) {
-            try? FileManager.default.removeItem(at: probeDir)
-        }
+        ImageAssetStore.secureRemoveItem(at: probeDir)
     }
 
     private func precreateFreshDatabaseFile() throws {
@@ -3942,16 +3936,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         var map: [String: TagAttachment] = [:]
         while let row = try cursor.next() {
             let clipID: String = row["clipId"]
-            let tagID: Int = row["tagId"]
-            let tagName: String = row["name"]
-            let sortOrder: Int? = row["sortOrder"]
-            var entry = map[clipID] ?? TagAttachment()
-            entry.tagIDs.append(tagID)
-            entry.tagNames.append(tagName)
-            if let sortOrder {
-                entry.tagOrders[tagID] = sortOrder
-            }
-            map[clipID] = entry
+            map[clipID, default: TagAttachment()].append(row: row)
         }
         return map
     }
@@ -3979,16 +3964,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             let cursor = try Row.fetchCursor(db, sql: sql, arguments: StatementArguments(batch))
             while let row = try cursor.next() {
                 let clipID: String = row["clipId"]
-                let tagID: Int = row["tagId"]
-                let tagName: String = row["name"]
-                let sortOrder: Int? = row["sortOrder"]
-                var entry = map[clipID] ?? TagAttachment()
-                entry.tagIDs.append(tagID)
-                entry.tagNames.append(tagName)
-                if let sortOrder {
-                    entry.tagOrders[tagID] = sortOrder
-                }
-                map[clipID] = entry
+                map[clipID, default: TagAttachment()].append(row: row)
             }
             offset = end
         }
@@ -4009,14 +3985,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         )
         var attachment = TagAttachment()
         while let row = try cursor.next() {
-            let tagID: Int = row["tagId"]
-            let tagName: String = row["name"]
-            let sortOrder: Int? = row["sortOrder"]
-            attachment.tagIDs.append(tagID)
-            attachment.tagNames.append(tagName)
-            if let sortOrder {
-                attachment.tagOrders[tagID] = sortOrder
-            }
+            attachment.append(row: row)
         }
         return attachment
     }

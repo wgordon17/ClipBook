@@ -184,21 +184,7 @@ nonisolated enum SensitiveContent {
               candidate.utf16.count > maxEncryptionScanUTF16Length else {
             return candidate
         }
-        let scalars = candidate.unicodeScalars
-        var end = scalars.startIndex
-        var utf16Count = 0
-        while end < scalars.endIndex {
-            let nextCount = utf16Count + scalars[end].utf16.count
-            if nextCount > maxEncryptionScanUTF16Length, end > scalars.startIndex {
-                break
-            }
-            utf16Count = nextCount
-            scalars.formIndex(after: &end)
-            if utf16Count >= maxEncryptionScanUTF16Length {
-                break
-            }
-        }
-        return String(candidate[candidate.startIndex..<end])
+        return String(candidate.scalarBoundedUTF16Prefix(maxEncryptionScanUTF16Length))
     }
 
     /// Puts the masks in place of `secrets` in a text of `length` characters,

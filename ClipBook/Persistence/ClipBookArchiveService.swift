@@ -1354,46 +1354,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
     }
 
     private static func writePrivateFile(_ data: Data, to destinationURL: URL, sync: Bool = false) throws {
-        let fd = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-        guard fd >= 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-
-        var fdOpen = true
-        do {
-            _ = Darwin.fchmod(fd, mode_t(0o600))
-            try data.withUnsafeBytes { rawBuffer in
-                guard rawBuffer.count > 0, let baseAddress = rawBuffer.baseAddress else { return }
-                var writtenTotal = 0
-                while writtenTotal < rawBuffer.count {
-                    let result = Darwin.write(fd, baseAddress.advanced(by: writtenTotal), rawBuffer.count - writtenTotal)
-                    if result > 0 {
-                        writtenTotal += result
-                    } else if result < 0 && errno == EINTR {
-                        continue
-                    } else {
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                }
-            }
-
-            if sync {
-                if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
-                    _ = Darwin.fsync(fd)
-                }
-            }
-
-            fdOpen = false
-            guard Darwin.close(fd) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-        } catch {
-            if fdOpen {
-                _ = Darwin.close(fd)
-            }
-            ImageAssetStore.secureUnlink(at: destinationURL)
-            throw error
-        }
+        try ImageAssetStore.writeExclusivePrivateFile(data, to: destinationURL, sync: sync)
     }
 
     private static func swapStagedArchive(at stagedArchiveURL: URL, into archiveURL: URL) throws {
@@ -1417,30 +1378,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
     }
 
     private static func secureRemoveDirectoryTree(at rootURL: URL) {
-        var st = stat()
-        guard Darwin.lstat(rootURL.path, &st) == 0 else {
-            return
-        }
-        let mode = st.st_mode & S_IFMT
-        if mode == S_IFLNK || mode == S_IFREG {
-            ImageAssetStore.secureUnlink(at: rootURL)
-            return
-        }
-        guard mode == S_IFDIR else {
-            try? FileManager.default.removeItem(at: rootURL)
-            return
-        }
-
-        if let children = try? FileManager.default.contentsOfDirectory(
-            at: rootURL,
-            includingPropertiesForKeys: nil,
-            options: []
-        ) {
-            for child in children {
-                secureRemoveDirectoryTree(at: child)
-            }
-        }
-        try? FileManager.default.removeItem(at: rootURL)
+        ImageAssetStore.secureRemoveItem(at: rootURL)
     }
 
     private static func readRegularFileNoFollow(at url: URL, relativePath: String) throws -> Data {

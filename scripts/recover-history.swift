@@ -712,10 +712,34 @@ private enum RecoveryCryptoAndIO {
             throw RecoveryFailure.fatal("\(label) exceeds maximum expected size (\(maxBytes) bytes).")
         }
 
-        var output: [UInt8] = []
-        output.reserveCapacity(max(0, Int(clamping: fileStat.st_size)))
+        return try readFDBytes(
+            fd: fd,
+            maxBytes: maxBytes,
+            initialCapacity: max(0, Int(clamping: fileStat.st_size)),
+            chunkSize: 64 * 1024,
+            label: label
+        )
+    }
 
-        let chunkSize = 64 * 1024
+    static func readRegularFileDataNoFollow(at url: URL, label: String) throws -> Data {
+        var bytes = try readRegularFileBytesNoFollow(at: url, label: label)
+        defer {
+            zeroBytes(&bytes)
+        }
+        return Data(bytes)
+    }
+
+    static func readFDBytes(
+        fd: Int32,
+        maxBytes: Int? = nil,
+        initialCapacity: Int = 0,
+        chunkSize: Int = 4096,
+        label: String
+    ) throws -> [UInt8] {
+        var output: [UInt8] = []
+        if initialCapacity > 0 {
+            output.reserveCapacity(initialCapacity)
+        }
         var chunk = [UInt8](repeating: 0, count: chunkSize)
         defer {
             zeroBytes(&chunk)
@@ -728,50 +752,6 @@ private enum RecoveryCryptoAndIO {
                     let bytesRead = Darwin.read(fd, base, chunkSize)
                     if bytesRead > 0 {
                         if let maxBytes, output.count + bytesRead > maxBytes {
-                            throw RecoveryFailure.fatal("\(label) exceeds maximum expected size (\(maxBytes) bytes).")
-                        }
-                        let ptr = base.assumingMemoryBound(to: UInt8.self)
-                        output.append(contentsOf: UnsafeBufferPointer(start: ptr, count: bytesRead))
-                    } else if bytesRead == 0 {
-                        break
-                    } else if errno == EINTR {
-                        continue
-                    } else {
-                        let err = errno
-                        throw RecoveryFailure.fatal("Failed reading \(label): \(String(cString: strerror(err)))")
-                    }
-                }
-            }
-            return output
-        } catch {
-            zeroBytes(&output)
-            throw error
-        }
-    }
-
-    static func readRegularFileDataNoFollow(at url: URL, label: String) throws -> Data {
-        var bytes = try readRegularFileBytesNoFollow(at: url, label: label)
-        defer {
-            zeroBytes(&bytes)
-        }
-        return Data(bytes)
-    }
-
-    static func readFDBytes(fd: Int32, maxBytes: Int, label: String) throws -> [UInt8] {
-        var output: [UInt8] = []
-        let chunkSize = 4096
-        var chunk = [UInt8](repeating: 0, count: chunkSize)
-        defer {
-            zeroBytes(&chunk)
-        }
-
-        do {
-            try chunk.withUnsafeMutableBytes { rawBuffer in
-                guard let base = rawBuffer.baseAddress else { return }
-                while true {
-                    let bytesRead = Darwin.read(fd, base, chunkSize)
-                    if bytesRead > 0 {
-                        if output.count + bytesRead > maxBytes {
                             throw RecoveryFailure.fatal("\(label) exceeds maximum expected size (\(maxBytes) bytes).")
                         }
                         let ptr = base.assumingMemoryBound(to: UInt8.self)
@@ -873,6 +853,74 @@ private enum RecoveryCryptoAndIO {
         )
         try createPrivateDirectory(at: fallbackURL)
         return fallbackURL
+    }
+
+    struct StagedV1ArchiveLayout {
+        let stagingRoot: URL
+        let stagedArchiveURL: URL
+        let stagedImagesDir: URL
+        let stagedPreviewsDir: URL
+    }
+
+    static func prepareStagedV1ArchiveLayout(for outputDir: URL) throws -> StagedV1ArchiveLayout {
+        let destinationParent = outputDir.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
+        let stagingRoot = try makeStagingRoot(
+            appropriateFor: destinationParent,
+            outputName: outputDir.lastPathComponent
+        )
+        do {
+            let stagedArchiveURL = stagingRoot.appendingPathComponent(outputDir.lastPathComponent, isDirectory: true)
+            let assetsDirectory = stagedArchiveURL.appendingPathComponent("assets", isDirectory: true)
+            let stagedImagesDir = assetsDirectory.appendingPathComponent("images", isDirectory: true)
+            let stagedPreviewsDir = assetsDirectory.appendingPathComponent("link-previews", isDirectory: true)
+            try createPrivateDirectory(at: stagedArchiveURL)
+            try createPrivateDirectory(at: assetsDirectory)
+            try createPrivateDirectory(at: stagedImagesDir)
+            try createPrivateDirectory(at: stagedPreviewsDir)
+            return StagedV1ArchiveLayout(
+                stagingRoot: stagingRoot,
+                stagedArchiveURL: stagedArchiveURL,
+                stagedImagesDir: stagedImagesDir,
+                stagedPreviewsDir: stagedPreviewsDir
+            )
+        } catch {
+            scrubAndRemoveDirectory(at: stagingRoot)
+            throw error
+        }
+    }
+
+    struct DisambiguatedPlainAsset {
+        let relativeArchivePath: String
+        let writtenURL: URL
+        let usedNameKey: String
+    }
+
+    static func writeDisambiguatedPlainAsset(
+        _ plainData: Data,
+        archiveSubdirectory: String,
+        rawStem: String,
+        defaultStem: String,
+        fileExtension: String,
+        destinationDir: URL,
+        usedPlainFileNames: inout Set<String>
+    ) throws -> DisambiguatedPlainAsset {
+        let baseStem = rawStem.isEmpty ? defaultStem : rawStem
+        var outputFileName = "\(baseStem).\(fileExtension)"
+        var disambiguator = 1
+        while usedPlainFileNames.contains("\(archiveSubdirectory)/\(outputFileName)".lowercased()) {
+            outputFileName = "\(baseStem)-\(disambiguator).\(fileExtension)"
+            disambiguator += 1
+        }
+        let destinationURL = destinationDir.appendingPathComponent(outputFileName, isDirectory: false)
+        try writePrivateFile(plainData, to: destinationURL)
+        let usedKey = "\(archiveSubdirectory)/\(outputFileName)".lowercased()
+        usedPlainFileNames.insert(usedKey)
+        return DisambiguatedPlainAsset(
+            relativeArchivePath: "assets/\(archiveSubdirectory)/\(outputFileName)",
+            writtenURL: destinationURL,
+            usedNameKey: usedKey
+        )
     }
 
     static func swapStagedOutput(at stagedOutputURL: URL, into outputDirURL: URL) throws {
@@ -1199,11 +1247,7 @@ private enum LocalStoreRecovery {
         var tagOrders: [Int64: Int] = [:]
     }
 
-    private struct ResolvedRowAsset {
-        let relativeArchivePath: String
-        let writtenURL: URL
-        let usedNameKey: String
-    }
+    private typealias ResolvedRowAsset = RecoveryCryptoAndIO.DisambiguatedPlainAsset
 
     static func run(
         supportDir: URL,
@@ -1319,24 +1363,14 @@ private enum LocalStoreRecovery {
         let archiveTags = try loadTags(sqliteDB)
         let tagAttachmentsByClipID = try loadTagAttachments(sqliteDB)
 
-        let destinationParent = outputDir.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
-        let stagingRoot = try RecoveryCryptoAndIO.makeStagingRoot(
-            appropriateFor: destinationParent,
-            outputName: outputDir.lastPathComponent
-        )
+        let layout = try RecoveryCryptoAndIO.prepareStagedV1ArchiveLayout(for: outputDir)
+        let stagingRoot = layout.stagingRoot
+        let stagedArchiveURL = layout.stagedArchiveURL
+        let stagedImagesDir = layout.stagedImagesDir
+        let stagedPreviewsDir = layout.stagedPreviewsDir
         defer {
             RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: stagingRoot)
         }
-
-        let stagedArchiveURL = stagingRoot.appendingPathComponent(outputDir.lastPathComponent, isDirectory: true)
-        let assetsDirectory = stagedArchiveURL.appendingPathComponent("assets", isDirectory: true)
-        let stagedImagesDir = assetsDirectory.appendingPathComponent("images", isDirectory: true)
-        let stagedPreviewsDir = assetsDirectory.appendingPathComponent("link-previews", isDirectory: true)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: stagedArchiveURL)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: assetsDirectory)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: stagedImagesDir)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: stagedPreviewsDir)
 
         let whereClause = includeTrashed ? "" : "WHERE c.deletedAt IS NULL"
         let clipsSQL = """
@@ -1655,38 +1689,9 @@ private enum LocalStoreRecovery {
         let html: String?
 
         if sqlite3_column_type(stmt, 26) != SQLITE_NULL {
-            text = try decodeProtectedStringColumn(
+            (text, qrCodeText, rtfData, html) = try decodeClipContentsColumns(
                 stmt: stmt,
-                index: 22,
-                table: "clip_contents",
-                column: "text",
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
-            qrCodeText = try decodeProtectedStringColumn(
-                stmt: stmt,
-                index: 23,
-                table: "clip_contents",
-                column: "qrCodeText",
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
-            rtfData = try decodeProtectedDataColumn(
-                stmt: stmt,
-                index: 24,
-                table: "clip_contents",
-                column: "rtf",
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
-            html = try decodeProtectedStringColumn(
-                stmt: stmt,
-                index: 25,
-                table: "clip_contents",
-                column: "html",
+                baseIndex: 22,
                 clipID: clipID,
                 isEncrypted: isEncrypted,
                 keys: keys
@@ -1821,9 +1826,25 @@ private enum LocalStoreRecovery {
             throw RowCorruptionError.columnMalformed("clip_contents lookup")
         }
 
+        return try decodeClipContentsColumns(
+            stmt: stmt,
+            baseIndex: 0,
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            keys: keys
+        )
+    }
+
+    private static func decodeClipContentsColumns(
+        stmt: OpaquePointer,
+        baseIndex: Int32,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: DerivedStoreKeys
+    ) throws -> (String?, String?, Data?, String?) {
         let text = try decodeProtectedStringColumn(
             stmt: stmt,
-            index: 0,
+            index: baseIndex,
             table: "clip_contents",
             column: "text",
             clipID: clipID,
@@ -1832,7 +1853,7 @@ private enum LocalStoreRecovery {
         )
         let qrCodeText = try decodeProtectedStringColumn(
             stmt: stmt,
-            index: 1,
+            index: baseIndex + 1,
             table: "clip_contents",
             column: "qrCodeText",
             clipID: clipID,
@@ -1841,7 +1862,7 @@ private enum LocalStoreRecovery {
         )
         let rtfData = try decodeProtectedDataColumn(
             stmt: stmt,
-            index: 2,
+            index: baseIndex + 2,
             table: "clip_contents",
             column: "rtf",
             clipID: clipID,
@@ -1850,7 +1871,7 @@ private enum LocalStoreRecovery {
         )
         let html = try decodeProtectedStringColumn(
             stmt: stmt,
-            index: 3,
+            index: baseIndex + 3,
             table: "clip_contents",
             column: "html",
             clipID: clipID,
@@ -1964,25 +1985,14 @@ private enum LocalStoreRecovery {
             )
         }
 
-        let rawStem = sourceURL.deletingPathExtension().lastPathComponent
-        let baseStem = rawStem.isEmpty ? defaultStem : rawStem
-        var outputFileName = "\(baseStem).\(sanitizedExtension)"
-        var disambiguator = 1
-        while usedPlainFileNames.contains("\(role.archiveSubdirectory)/\(outputFileName)".lowercased()) {
-            outputFileName = "\(baseStem)-\(disambiguator).\(sanitizedExtension)"
-            disambiguator += 1
-        }
-        let usedKey = "\(role.archiveSubdirectory)/\(outputFileName)".lowercased()
-        usedPlainFileNames.insert(usedKey)
-
-        let destinationURL = destinationDir.appendingPathComponent(outputFileName, isDirectory: false)
-        try RecoveryCryptoAndIO.writePrivateFile(plainData, to: destinationURL)
-
-        let relativeArchivePath = "assets/\(role.archiveSubdirectory)/\(outputFileName)"
-        let resolved = ResolvedRowAsset(
-            relativeArchivePath: relativeArchivePath,
-            writtenURL: destinationURL,
-            usedNameKey: usedKey
+        let resolved = try RecoveryCryptoAndIO.writeDisambiguatedPlainAsset(
+            plainData,
+            archiveSubdirectory: role.archiveSubdirectory,
+            rawStem: sourceURL.deletingPathExtension().lastPathComponent,
+            defaultStem: defaultStem,
+            fileExtension: sanitizedExtension,
+            destinationDir: destinationDir,
+            usedPlainFileNames: &usedPlainFileNames
         )
         rowWrittenAssets.append(resolved)
         return resolved
@@ -2557,37 +2567,25 @@ private enum EncryptedArchiveRecovery {
 
         let manifestDigest = Data(SHA256.hash(data: rawManifestBytes))
 
-        let tagsEncURL = try validateContainedArchiveFile(in: archiveURL, relativePath: "tags.json.enc")
-        let sealedTags = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: tagsEncURL, label: "tags.json.enc")
-        let decryptedTagsBytes = try RecoveryCryptoAndIO.openArchiveEntry(
-            sealedTags,
+        let archiveTags = try openAndDecodeEncryptedJSON(
+            [ClipBookArchiveTag].self,
+            relativePath: "tags.json.enc",
+            in: archiveURL,
             key: derivedKeys.aeadKey,
             archiveID: encryption.archiveID,
             manifestDigest: manifestDigest,
-            relativePath: "tags.json.enc"
+            decoder: decoder
         )
-        let archiveTags: [ClipBookArchiveTag]
-        do {
-            archiveTags = try decoder.decode([ClipBookArchiveTag].self, from: decryptedTagsBytes)
-        } catch {
-            throw RecoveryFailure.fatal("Corrupted decrypted tags.json.enc payload.")
-        }
 
-        let historyEncURL = try validateContainedArchiveFile(in: archiveURL, relativePath: "history.json.enc")
-        let sealedHistory = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: historyEncURL, label: "history.json.enc")
-        let decryptedHistoryBytes = try RecoveryCryptoAndIO.openArchiveEntry(
-            sealedHistory,
+        let encryptedPayload = try openAndDecodeEncryptedJSON(
+            ClipBookEncryptedHistoryPayload.self,
+            relativePath: "history.json.enc",
+            in: archiveURL,
             key: derivedKeys.aeadKey,
             archiveID: encryption.archiveID,
             manifestDigest: manifestDigest,
-            relativePath: "history.json.enc"
+            decoder: decoder
         )
-        let encryptedPayload: ClipBookEncryptedHistoryPayload
-        do {
-            encryptedPayload = try decoder.decode(ClipBookEncryptedHistoryPayload.self, from: decryptedHistoryBytes)
-        } catch {
-            throw RecoveryFailure.fatal("Corrupted decrypted history.json.enc payload.")
-        }
 
         try verifyExpectedAssetsInventory(
             expectedAssets: encryptedPayload.expectedAssets,
@@ -2595,24 +2593,14 @@ private enum EncryptedArchiveRecovery {
             in: archiveURL
         )
 
-        let destinationParent = outputDir.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
-        let stagingRoot = try RecoveryCryptoAndIO.makeStagingRoot(
-            appropriateFor: destinationParent,
-            outputName: outputDir.lastPathComponent
-        )
+        let layout = try RecoveryCryptoAndIO.prepareStagedV1ArchiveLayout(for: outputDir)
+        let stagingRoot = layout.stagingRoot
+        let stagedArchiveURL = layout.stagedArchiveURL
+        let stagedImagesDir = layout.stagedImagesDir
+        let stagedPreviewsDir = layout.stagedPreviewsDir
         defer {
             RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: stagingRoot)
         }
-
-        let stagedArchiveURL = stagingRoot.appendingPathComponent(outputDir.lastPathComponent, isDirectory: true)
-        let assetsDirectory = stagedArchiveURL.appendingPathComponent("assets", isDirectory: true)
-        let stagedImagesDir = assetsDirectory.appendingPathComponent("images", isDirectory: true)
-        let stagedPreviewsDir = assetsDirectory.appendingPathComponent("link-previews", isDirectory: true)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: stagedArchiveURL)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: assetsDirectory)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: stagedImagesDir)
-        try RecoveryCryptoAndIO.createPrivateDirectory(at: stagedPreviewsDir)
 
         var usedPlainFileNames: Set<String> = []
         var recoveredItems: [ClipBookArchiveItem] = []
@@ -2737,20 +2725,41 @@ private enum EncryptedArchiveRecovery {
             preferred: preferredExtension,
             magicBytes: plainBytes
         )
-        let rawStem = URL(fileURLWithPath: components[2]).deletingPathExtension().lastPathComponent
-        let baseStem = rawStem.isEmpty ? defaultStem : rawStem
+        let resolved = try RecoveryCryptoAndIO.writeDisambiguatedPlainAsset(
+            plainBytes,
+            archiveSubdirectory: archiveSubdir,
+            rawStem: URL(fileURLWithPath: components[2]).deletingPathExtension().lastPathComponent,
+            defaultStem: defaultStem,
+            fileExtension: sanitizedExt,
+            destinationDir: destinationDir,
+            usedPlainFileNames: &usedPlainFileNames
+        )
+        return resolved.relativeArchivePath
+    }
 
-        var fileName = "\(baseStem).\(sanitizedExt)"
-        var disambiguator = 1
-        while usedPlainFileNames.contains("\(archiveSubdir)/\(fileName)".lowercased()) {
-            fileName = "\(baseStem)-\(disambiguator).\(sanitizedExt)"
-            disambiguator += 1
+    private static func openAndDecodeEncryptedJSON<T: Decodable>(
+        _ type: T.Type,
+        relativePath: String,
+        in archiveURL: URL,
+        key: SymmetricKey,
+        archiveID: UUID,
+        manifestDigest: Data,
+        decoder: JSONDecoder
+    ) throws -> T {
+        let encURL = try validateContainedArchiveFile(in: archiveURL, relativePath: relativePath)
+        let sealedBytes = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: encURL, label: relativePath)
+        let decryptedBytes = try RecoveryCryptoAndIO.openArchiveEntry(
+            sealedBytes,
+            key: key,
+            archiveID: archiveID,
+            manifestDigest: manifestDigest,
+            relativePath: relativePath
+        )
+        do {
+            return try decoder.decode(T.self, from: decryptedBytes)
+        } catch {
+            throw RecoveryFailure.fatal("Corrupted decrypted \(relativePath) payload.")
         }
-        usedPlainFileNames.insert("\(archiveSubdir)/\(fileName)".lowercased())
-
-        let destinationURL = destinationDir.appendingPathComponent(fileName, isDirectory: false)
-        try RecoveryCryptoAndIO.writePrivateFile(plainBytes, to: destinationURL)
-        return "assets/\(archiveSubdir)/\(fileName)"
     }
 
     private static func verifyExpectedAssetsInventory(

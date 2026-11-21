@@ -143,39 +143,11 @@ nonisolated enum ImageDragFiles {
     _ = Darwin.chmod(folder.path, mode_t(0o700))
 
     let url = folder.appendingPathComponent(safeLeaf, isDirectory: false)
-    let fd = Darwin.open(url.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-    guard fd >= 0 else {
-      scrubAndRemoveLocked(at: folder)
-      return nil
-    }
-
-    var fdOpen = true
     do {
-      _ = Darwin.fchmod(fd, mode_t(0o600))
-      try pngData.withUnsafeBytes { rawBuffer in
-        guard rawBuffer.count > 0, let baseAddress = rawBuffer.baseAddress else { return }
-        var writtenTotal = 0
-        while writtenTotal < rawBuffer.count {
-          let result = Darwin.write(fd, baseAddress.advanced(by: writtenTotal), rawBuffer.count - writtenTotal)
-          if result > 0 {
-            writtenTotal += result
-          } else if result < 0 && errno == EINTR {
-            continue
-          } else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-          }
-        }
-      }
-      fdOpen = false
-      guard Darwin.close(fd) == 0 else {
-        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-      }
+      try ImageAssetStore.writeExclusivePrivateFile(pngData, to: url)
       folderURLsBySupportDirPath[supportDirPath, default: []].insert(folder.path)
       return url
     } catch {
-      if fdOpen {
-        _ = Darwin.close(fd)
-      }
       scrubAndRemoveLocked(at: folder)
       return nil
     }
@@ -302,28 +274,7 @@ nonisolated enum ImageDragFiles {
   }
 
   private static func scrubAndRemoveLocked(at targetURL: URL) {
-    var st = stat()
-    guard Darwin.lstat(targetURL.path, &st) == 0 else {
-      return
-    }
-
-    if (st.st_mode & S_IFMT) == S_IFDIR {
-      if let children = try? FileManager.default.contentsOfDirectory(
-        at: targetURL,
-        includingPropertiesForKeys: nil,
-        options: []
-      ) {
-        for child in children {
-          scrubAndRemoveLocked(at: child)
-        }
-      }
-      _ = Darwin.rmdir(targetURL.path)
-      if Darwin.lstat(targetURL.path, &st) == 0 {
-        try? FileManager.default.removeItem(at: targetURL)
-      }
-    } else {
-      ImageAssetStore.secureUnlink(at: targetURL)
-    }
+    ImageAssetStore.secureRemoveItem(at: targetURL)
   }
 
   private static func sanitizedLeafFileName(_ fileName: String) -> String {

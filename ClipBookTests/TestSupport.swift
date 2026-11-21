@@ -513,22 +513,37 @@ enum TestSupport {
     }
 
     @MainActor
-    static func makeTestCoordinator() throws -> TestCoordinatorHarness {
+    private static func buildCoordinatorHarness(
+        supportDirectory: URL?,
+        defaultDirectoryPrefix: String,
+        keyProvider: any DatabaseKeyProvider,
+        probeStoreBeforeInit: Bool,
+        wrapStore: (GRDBHistoryStore) -> any HistoryStore,
+        now: @escaping @Sendable () -> Date,
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent,
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent,
+        bindsMonitorDelegate: Bool,
+        configureInitialPreferences: ((inout AppPreferences) -> Void)?
+    ) throws -> (harness: TestCoordinatorHarness, pasteService: PasteService) {
         ensureAppKitInitialized()
         let fileManager = FileManager.default
-        let supportDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("ClipBookCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        let resolvedSupportDir = supportDirectory ?? fileManager.temporaryDirectory
+            .appendingPathComponent("\(defaultDirectoryPrefix)-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: resolvedSupportDir, withIntermediateDirectories: true)
 
         let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
         let userDefaults = try #require(UserDefaults(suiteName: suiteName))
         userDefaults.removePersistentDomain(forName: suiteName)
 
         let pasteboard = NSPasteboard.withUniqueName()
-        let historyStore = GRDBHistoryStore(
-            directory: supportDirectory,
-            keyProvider: InMemoryDatabaseKeyProvider()
+        let baseStore = GRDBHistoryStore(
+            directory: resolvedSupportDir,
+            keyProvider: keyProvider
         )
+        if probeStoreBeforeInit {
+            _ = try? baseStore.fetchAll()
+        }
+        let wiredStore = wrapStore(baseStore)
         let preferencesStore = PreferencesStore(userDefaults: userDefaults)
 
         var initialPreferences = AppPreferences()
@@ -542,6 +557,7 @@ enum TestSupport {
         initialPreferences.launchAtLogin = false
         // Keep link-preview network fetches off unless a test explicitly enables them.
         initialPreferences.showPreviewForLinks = false
+        configureInitialPreferences?(&initialPreferences)
         preferencesStore.save(initialPreferences)
 
         let model = AppModel()
@@ -551,109 +567,36 @@ enum TestSupport {
         let updateService = TestNoOpUpdateService()
         let licensingService = LicensingService()
         let clipboardMonitor = PasteboardMonitor(
-            historyStore: historyStore,
+            historyStore: wiredStore,
             fileManager: fileManager,
-            supportDirectory: supportDirectory,
-            pasteboard: pasteboard
-        )
-
-        let pasteService = PasteService(
+            supportDirectory: resolvedSupportDir,
             pasteboard: pasteboard,
-            loadContent: { [historyStore] item, scope in
-                try historyStore.loadingContent(of: item, scope: scope)
-            }
-        )
-        let coordinator = AppCoordinator(
-            model: model,
-            preferencesStore: preferencesStore,
-            historyStore: historyStore,
-            clipboardMonitor: clipboardMonitor,
-            pasteService: pasteService,
-            globalShortcuts: globalShortcuts,
-            updateService: updateService,
-            licensingService: licensingService,
-            fileManager: fileManager,
-            supportDirectory: supportDirectory
-        )
-
-        return TestCoordinatorHarness(
-            coordinator: coordinator,
-            model: model,
-            historyStore: historyStore,
-            preferencesStore: preferencesStore,
-            clipboardMonitor: clipboardMonitor,
-            globalShortcuts: globalShortcuts,
-            updateService: updateService,
-            pasteboard: pasteboard,
-            userDefaultsSuiteName: suiteName,
-            supportDirectory: supportDirectory
-        )
-    }
-
-    @MainActor
-    static func makeSpiedTestCoordinator(
-        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),
-        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofImageAt:)
-    ) throws -> (harness: TestCoordinatorHarness, spyStore: SpyHistoryStore, pasteService: PasteService) {
-        ensureAppKitInitialized()
-        let fileManager = FileManager.default
-        let supportDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("ClipBookSpiedCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-
-        let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
-        let userDefaults = try #require(UserDefaults(suiteName: suiteName))
-        userDefaults.removePersistentDomain(forName: suiteName)
-
-        let pasteboard = NSPasteboard.withUniqueName()
-        let baseStore = GRDBHistoryStore(
-            directory: supportDirectory,
-            keyProvider: InMemoryDatabaseKeyProvider()
-        )
-        let spyStore = SpyHistoryStore(base: baseStore)
-        let preferencesStore = PreferencesStore(userDefaults: userDefaults)
-
-        var initialPreferences = AppPreferences()
-        initialPreferences.warnOnClearHistory = false
-        initialPreferences.soundEffectsEnabled = false
-        initialPreferences.launchAtLogin = false
-        initialPreferences.showPreviewForLinks = false
-        preferencesStore.save(initialPreferences)
-
-        let model = AppModel()
-        model.preferences = initialPreferences
-
-        let globalShortcuts = GlobalShortcutService(isEnabled: false)
-        let updateService = TestNoOpUpdateService()
-        let licensingService = LicensingService()
-        let clipboardMonitor = PasteboardMonitor(
-            historyStore: spyStore,
-            fileManager: fileManager,
-            supportDirectory: supportDirectory,
-            pasteboard: pasteboard,
+            now: now,
             recognizeImageData: recognizeImageData,
             recognizeImageFile: recognizeImageFile
         )
         let pasteService = PasteService(
             pasteboard: pasteboard,
-            loadContent: { [spyStore] item, scope in
-                try spyStore.loadingContent(of: item, scope: scope)
+            loadContent: { [wiredStore] item, scope in
+                try wiredStore.loadingContent(of: item, scope: scope)
             }
         )
         let coordinator = AppCoordinator(
             model: model,
             preferencesStore: preferencesStore,
-            historyStore: spyStore,
+            historyStore: wiredStore,
             clipboardMonitor: clipboardMonitor,
             pasteService: pasteService,
             globalShortcuts: globalShortcuts,
             updateService: updateService,
             licensingService: licensingService,
             fileManager: fileManager,
-            supportDirectory: supportDirectory
+            supportDirectory: resolvedSupportDir
         )
-        clipboardMonitor.delegate = coordinator
-        clipboardMonitor.updatePreferences(initialPreferences)
+        if bindsMonitorDelegate {
+            clipboardMonitor.delegate = coordinator
+            clipboardMonitor.updatePreferences(initialPreferences)
+        }
 
         let harness = TestCoordinatorHarness(
             coordinator: coordinator,
@@ -665,8 +608,59 @@ enum TestSupport {
             updateService: updateService,
             pasteboard: pasteboard,
             userDefaultsSuiteName: suiteName,
-            supportDirectory: supportDirectory
+            supportDirectory: resolvedSupportDir
         )
+        return (harness, pasteService)
+    }
+
+    @MainActor
+    static func makeTestCoordinator(
+        supportDirectory: URL? = nil,
+        keyProvider: any DatabaseKeyProvider = InMemoryDatabaseKeyProvider(),
+        probeStoreBeforeInit: Bool = false,
+        now: @escaping @Sendable () -> Date = { Date() },
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofImageAt:),
+        bindsMonitorDelegate: Bool = false,
+        configureInitialPreferences: ((inout AppPreferences) -> Void)? = nil
+    ) throws -> TestCoordinatorHarness {
+        try buildCoordinatorHarness(
+            supportDirectory: supportDirectory,
+            defaultDirectoryPrefix: "ClipBookCoordinatorTests",
+            keyProvider: keyProvider,
+            probeStoreBeforeInit: probeStoreBeforeInit,
+            wrapStore: { $0 },
+            now: now,
+            recognizeImageData: recognizeImageData,
+            recognizeImageFile: recognizeImageFile,
+            bindsMonitorDelegate: bindsMonitorDelegate,
+            configureInitialPreferences: configureInitialPreferences
+        ).harness
+    }
+
+    @MainActor
+    static func makeSpiedTestCoordinator(
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofImageAt:)
+    ) throws -> (harness: TestCoordinatorHarness, spyStore: SpyHistoryStore, pasteService: PasteService) {
+        var capturedSpyStore: SpyHistoryStore?
+        let (harness, pasteService) = try buildCoordinatorHarness(
+            supportDirectory: nil,
+            defaultDirectoryPrefix: "ClipBookSpiedCoordinatorTests",
+            keyProvider: InMemoryDatabaseKeyProvider(),
+            probeStoreBeforeInit: false,
+            wrapStore: { baseStore in
+                let spy = SpyHistoryStore(base: baseStore)
+                capturedSpyStore = spy
+                return spy
+            },
+            now: { Date() },
+            recognizeImageData: recognizeImageData,
+            recognizeImageFile: recognizeImageFile,
+            bindsMonitorDelegate: true,
+            configureInitialPreferences: nil
+        )
+        let spyStore = try #require(capturedSpyStore)
         return (harness, spyStore, pasteService)
     }
 

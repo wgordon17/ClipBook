@@ -495,89 +495,15 @@ extension SharedProcessStateTests {
             recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = { _ in .empty },
             configureInitialPreferences: ((inout AppPreferences) -> Void)? = nil
         ) throws -> TestCoordinatorHarness {
-            TestSupport.ensureAppKitInitialized()
-            let fileManager = FileManager.default
-            let resolvedSupportDir: URL
-            if let supportDirectory {
-                resolvedSupportDir = supportDirectory
-                try fileManager.createDirectory(at: resolvedSupportDir, withIntermediateDirectories: true)
-            } else {
-                resolvedSupportDir = fileManager.temporaryDirectory
-                    .appendingPathComponent("ClipBookSecurityCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
-                try fileManager.createDirectory(at: resolvedSupportDir, withIntermediateDirectories: true)
-            }
-
-            let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
-            let userDefaults = try #require(UserDefaults(suiteName: suiteName))
-            userDefaults.removePersistentDomain(forName: suiteName)
-
-            let pasteboard = NSPasteboard.withUniqueName()
-            let historyStore = GRDBHistoryStore(
-                directory: resolvedSupportDir,
-                keyProvider: keyProvider
-            )
-            if probeStoreBeforeInit {
-                _ = try? historyStore.fetchAll()
-            }
-            let preferencesStore = PreferencesStore(userDefaults: userDefaults)
-
-            var initialPreferences = AppPreferences()
-            initialPreferences.warnOnClearHistory = false
-            initialPreferences.soundEffectsEnabled = false
-            initialPreferences.launchAtLogin = false
-            initialPreferences.showPreviewForLinks = false
-            configureInitialPreferences?(&initialPreferences)
-            preferencesStore.save(initialPreferences)
-
-            let model = AppModel()
-            model.preferences = initialPreferences
-
-            let globalShortcuts = GlobalShortcutService(isEnabled: false)
-            let updateService = TestNoOpUpdateService()
-            let licensingService = LicensingService()
-            let clipboardMonitor = PasteboardMonitor(
-                historyStore: historyStore,
-                fileManager: fileManager,
-                supportDirectory: resolvedSupportDir,
-                pasteboard: pasteboard,
+            try TestSupport.makeTestCoordinator(
+                supportDirectory: supportDirectory,
+                keyProvider: keyProvider,
+                probeStoreBeforeInit: probeStoreBeforeInit,
                 now: now,
                 recognizeImageData: recognizeImageData,
-                recognizeImageFile: recognizeImageFile
-            )
-            clipboardMonitor.delegate = nil
-            clipboardMonitor.updatePreferences(initialPreferences)
-
-            let pasteService = PasteService(
-                pasteboard: pasteboard,
-                loadContent: { [historyStore] item, scope in
-                    try historyStore.loadingContent(of: item, scope: scope)
-                }
-            )
-            let coordinator = AppCoordinator(
-                model: model,
-                preferencesStore: preferencesStore,
-                historyStore: historyStore,
-                clipboardMonitor: clipboardMonitor,
-                pasteService: pasteService,
-                globalShortcuts: globalShortcuts,
-                updateService: updateService,
-                licensingService: licensingService,
-                fileManager: fileManager,
-                supportDirectory: resolvedSupportDir
-            )
-            clipboardMonitor.delegate = coordinator
-
-            return TestCoordinatorHarness(
-                coordinator: coordinator,
-                model: model,
-                historyStore: historyStore,
-                preferencesStore: preferencesStore,
-                clipboardMonitor: clipboardMonitor,
-                globalShortcuts: globalShortcuts,
-                updateService: updateService,
-                pasteboard: pasteboard,
-                userDefaultsSuiteName: suiteName,
-                supportDirectory: resolvedSupportDir
+                recognizeImageFile: recognizeImageFile,
+                bindsMonitorDelegate: true,
+                configureInitialPreferences: configureInitialPreferences
             )
         }
 
