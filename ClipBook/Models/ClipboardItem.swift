@@ -1,8 +1,4 @@
 import Foundation
-import SwiftUI
-import AppKit
-import Carbon
-import Combine
 import ImageIO
 import UniformTypeIdentifiers
 import CryptoKit
@@ -456,6 +452,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             && lhs.html == rhs.html
             && lhs.hasFormatting == rhs.hasFormatting
             && lhs.htmlDigest == rhs.htmlDigest
+            && lhs.formattingLoadState == rhs.formattingLoadState
             && lhs.imageDigest == rhs.imageDigest
             && lhs.imageWidth == rhs.imageWidth
             && lhs.imageHeight == rhs.imageHeight
@@ -500,6 +497,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         hasher.combine(html)
         hasher.combine(hasFormatting)
         hasher.combine(htmlDigest)
+        hasher.combine(formattingLoadState)
         hasher.combine(imageDigest)
         hasher.combine(imageWidth)
         hasher.combine(imageHeight)
@@ -667,7 +665,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             html: nil,
             hasFormatting: hasFormatting,
             htmlDigest: htmlDigest,
-            formattingLoadState: .unloaded,
+            formattingLoadState: hasFormatting ? .unloaded : .full,
             imageDigest: imageDigest,
             imageWidth: imageWidth,
             imageHeight: imageHeight,
@@ -715,7 +713,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             html: nil,
             hasFormatting: hasFormatting,
             htmlDigest: htmlDigest,
-            formattingLoadState: .unloaded,
+            formattingLoadState: hasFormatting ? .unloaded : .full,
             imageDigest: imageDigest,
             imageWidth: imageWidth,
             imageHeight: imageHeight,
@@ -859,6 +857,29 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         !(value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
+    private mutating func syncLoadedSecretFlags() {
+        if !kind.canHoldSensitiveContent {
+            containsPreviewSecret = false
+        } else if (text?.isEmpty ?? true) && hasFormatting && !isFormattingLoaded {
+            containsPreviewSecret = containsPreviewSecret || SensitiveContent.livePreviewSecretExists(in: self)
+        } else {
+            containsPreviewSecret = SensitiveContent.livePreviewSecretExists(in: self)
+        }
+
+        let bodySecret = SensitiveContent.detectsBodySecretAtRest(
+            kind: kind,
+            text: text,
+            qrCodeText: qrCodeText,
+            html: html,
+            rtfData: rtfData
+        )
+        if hasFormatting && !isFormattingLoaded {
+            containsRestSecret = containsRestSecret || bodySecret
+        } else {
+            containsRestSecret = bodySecret
+        }
+    }
+
     private mutating func syncDerivedMetadata(textModified: Bool, formattingModified: Bool) {
         if textModified {
             isContentLoaded = true
@@ -869,24 +890,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         }
 
         if isContentLoaded {
-            if (text?.isEmpty ?? true) && hasFormatting && !isFormattingLoaded {
-                containsPreviewSecret = containsPreviewSecret || SensitiveContent.livePreviewSecretExists(in: self)
-            } else {
-                containsPreviewSecret = SensitiveContent.livePreviewSecretExists(in: self)
-            }
-
-            let bodySecret = SensitiveContent.detectsBodySecretAtRest(
-                kind: kind,
-                text: text,
-                qrCodeText: qrCodeText,
-                html: html,
-                rtfData: rtfData
-            )
-            if hasFormatting && !isFormattingLoaded {
-                containsRestSecret = containsRestSecret || bodySecret
-            } else {
-                containsRestSecret = bodySecret
-            }
+            syncLoadedSecretFlags()
         } else if formattingModified {
             let hasNonEmptyFormatting = !(html?.isEmpty ?? true) || !(rtfData?.isEmpty ?? true)
             if hasNonEmptyFormatting,
@@ -911,26 +915,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     private mutating func syncDerivedMetadataForHeaderMutation() {
         if isContentLoaded {
             isSVGText = (kind == .text || kind == .richText) && (text.map(SVGImageRenderer.isSVGMarkup) ?? false)
-            if !kind.canHoldSensitiveContent {
-                containsPreviewSecret = false
-            } else if (text?.isEmpty ?? true) && hasFormatting && !isFormattingLoaded {
-                containsPreviewSecret = containsPreviewSecret || SensitiveContent.livePreviewSecretExists(in: self)
-            } else {
-                containsPreviewSecret = SensitiveContent.livePreviewSecretExists(in: self)
-            }
-
-            let bodySecret = SensitiveContent.detectsBodySecretAtRest(
-                kind: kind,
-                text: text,
-                qrCodeText: qrCodeText,
-                html: html,
-                rtfData: rtfData
-            )
-            if hasFormatting && !isFormattingLoaded {
-                containsRestSecret = containsRestSecret || bodySecret
-            } else {
-                containsRestSecret = bodySecret
-            }
+            syncLoadedSecretFlags()
         } else {
             if kind != .text && kind != .richText {
                 isSVGText = false
@@ -1055,6 +1040,14 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
 
     @MainActor
     var previewText: String {
+        rawPreviewText ?? kind.title
+    }
+
+    var scannablePreviewText: String {
+        rawPreviewText ?? ""
+    }
+
+    private var rawPreviewText: String? {
         // Single-file image items store recognized OCR text in `text` for search,
         // while their preview text remains the file path.
         if kind == .file, !filePaths.isEmpty {
@@ -1072,26 +1065,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         if !filePaths.isEmpty {
             return filePaths.joined(separator: "\n")
         }
-        return title ?? kind.title
-    }
-
-    var scannablePreviewText: String {
-        if kind == .file, !filePaths.isEmpty {
-            return filePaths.joined(separator: "\n")
-        }
-        if let text, !text.isEmpty {
-            return text
-        }
-        if !isContentLoaded, let textPreview, !textPreview.isEmpty {
-            return textPreview
-        }
-        if let html, !html.isEmpty {
-            return html
-        }
-        if !filePaths.isEmpty {
-            return filePaths.joined(separator: "\n")
-        }
-        return title ?? ""
+        return title
     }
 
     var assetURL: URL? {
@@ -1292,6 +1266,18 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         }
     }
 
+    nonisolated static func pixelDimensions(of imageData: Data) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0,
+              height > 0 else {
+            return nil
+        }
+        return (width, height)
+    }
+
     var imageDimensions: (width: Int, height: Int)? {
         guard kind == .image else {
             return nil
@@ -1308,19 +1294,17 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
                 role: .image,
                 ownerClipID: id,
                 requiresEncryption: SensitiveContent.shouldEncryptAtRest(self)
-            ),
-            let source = CGImageSourceCreateWithData(data as CFData, nil),
-            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-            let width = properties[kCGImagePropertyPixelWidth] as? Int,
-            let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+            ) else {
                 return nil
             }
-            return (width, height)
+            return Self.pixelDimensions(of: data)
         }
         guard let source = CGImageSourceCreateWithURL(assetURL as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0,
+              height > 0 else {
             return nil
         }
 

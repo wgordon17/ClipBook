@@ -55,7 +55,6 @@ private struct DerivedStoreKeys {
 
     let dbColumnAEADKey: SymmetricKey
     let assetFileAEADKey: SymmetricKey
-    let contentKeyHMACKey: SymmetricKey
     let keyVerifierHMACKey: SymmetricKey
 
     init(masterKey: SymmetricKey) {
@@ -69,12 +68,6 @@ private struct DerivedStoreKeys {
             inputKeyMaterial: masterKey,
             salt: Self.hkdfSalt,
             info: Data("clipbook.fs.asset.aes256gcm.v1".utf8),
-            outputByteCount: 32
-        )
-        self.contentKeyHMACKey = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: masterKey,
-            salt: Self.hkdfSalt,
-            info: Data("clipbook.db.contentkey.hmacsha256.v1".utf8),
             outputByteCount: 32
         )
         self.keyVerifierHMACKey = HKDF<SHA256>.deriveKey(
@@ -93,7 +86,7 @@ private struct DerivedArchiveKeys {
 
 // MARK: - Wire Codable Types (matching ClipBookArchiveService.swift)
 
-private struct ClipBookArchiveEncryptionMetadata: Codable, Equatable {
+private struct ClipBookArchiveEncryptionMetadata: Codable {
     var archiveID: UUID
     var kdf: String = "PBKDF2-HMAC-SHA256"
     var algorithm: String = "AES-256-GCM"
@@ -102,7 +95,7 @@ private struct ClipBookArchiveEncryptionMetadata: Codable, Equatable {
     var keyVerifierBase64: String
 }
 
-private struct ClipBookArchiveManifest: Codable, Equatable {
+private struct ClipBookArchiveManifest: Codable {
     var formatVersion: Int
     var appName: String
     var appVersion: String?
@@ -110,13 +103,13 @@ private struct ClipBookArchiveManifest: Codable, Equatable {
     var encryption: ClipBookArchiveEncryptionMetadata? = nil
 }
 
-private struct ClipBookArchiveTag: Codable, Equatable {
+private struct ClipBookArchiveTag: Codable {
     var id: String
     var name: String
     var color: String
 }
 
-private struct ClipBookArchiveLinkPreviewDetails: Codable, Equatable {
+private struct ClipBookArchiveLinkPreviewDetails: Codable {
     var url: String
     var title: String?
     var description: String?
@@ -127,7 +120,7 @@ private struct ClipBookArchiveLinkPreviewDetails: Codable, Equatable {
     var faviconExtension: String? = nil
 }
 
-private struct ClipBookArchiveItem: Codable, Equatable {
+private struct ClipBookArchiveItem: Codable {
     var id: UUID
     var kind: String
     var title: String?
@@ -155,7 +148,7 @@ private struct ClipBookArchiveItem: Codable, Equatable {
     var sensitivity: String?
 }
 
-private struct ClipBookEncryptedHistoryPayload: Codable, Equatable {
+private struct ClipBookEncryptedHistoryPayload: Codable {
     var items: [ClipBookArchiveItem]
     var expectedAssets: [String: String]
 }
@@ -812,15 +805,8 @@ private enum RecoveryCryptoAndIO {
         }
     }
 
-    static func writePrivateFile(_ data: Data, to destinationURL: URL) throws {
-        let directoryURL = destinationURL.deletingLastPathComponent()
-        let tempURL = directoryURL.appendingPathComponent(
-            ".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)",
-            isDirectory: false
-        )
-        let tempPath = tempURL.path
-
-        let fd = Darwin.open(tempPath, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+    static func writePrivateFile(_ data: Data, to destinationURL: URL, sync: Bool = false) throws {
+        let fd = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
         guard fd >= 0 else {
             let err = errno
             throw RecoveryFailure.fatal("Unable to create file \(destinationURL.path): \(String(cString: strerror(err)))")
@@ -849,8 +835,10 @@ private enum RecoveryCryptoAndIO {
                 }
             }
 
-            if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
-                _ = Darwin.fsync(fd)
+            if sync {
+                if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+                    _ = Darwin.fsync(fd)
+                }
             }
 
             fdOpen = false
@@ -858,15 +846,11 @@ private enum RecoveryCryptoAndIO {
                 let err = errno
                 throw RecoveryFailure.fatal("Failed closing \(destinationURL.path): \(String(cString: strerror(err)))")
             }
-            guard Darwin.rename(tempPath, destinationURL.path) == 0 else {
-                let err = errno
-                throw RecoveryFailure.fatal("Failed renaming \(destinationURL.path): \(String(cString: strerror(err)))")
-            }
         } catch {
             if fdOpen {
                 _ = Darwin.close(fd)
             }
-            secureUnlink(at: tempURL)
+            secureUnlink(at: destinationURL)
             throw error
         }
     }
@@ -1089,14 +1073,13 @@ private enum CLIParser {
                 try rejectInlineValue(inlineValue, for: flagName)
                 allowTestIterations = true
             default:
-                let sanitizedFlag = flagName
-                if sanitizedFlag.hasPrefix("--key") || sanitizedFlag.hasPrefix("--pass") {
+                if flagName.hasPrefix("--key") || flagName.hasPrefix("--pass") {
                     throw RecoveryFailure.usage(
-                        "Raw secrets are never accepted as CLI arguments (\(sanitizedFlag)); use file or stdin flags."
+                        "Raw secrets are never accepted as CLI arguments (\(flagName)); use file or stdin flags."
                     )
                 }
                 if arg.hasPrefix("-") {
-                    throw RecoveryFailure.usage("Unknown option: \(sanitizedFlag)")
+                    throw RecoveryFailure.usage("Unknown option: \(flagName)")
                 } else {
                     throw RecoveryFailure.usage("Unexpected positional argument.")
                 }
@@ -1143,35 +1126,33 @@ private enum CLIParser {
                 includeTrashed: includeTrashed,
                 strict: strict
             )
-        } else if let archivePath {
-            guard !archivePath.isEmpty else {
-                throw RecoveryFailure.usage("--archive requires a non-empty path.")
-            }
-            if keyFilePath != nil || keyHexStdin || includeTrashed || strict {
-                throw RecoveryFailure.usage("Mode A --support-dir flags cannot be combined with --archive.")
-            }
-            if passphraseFilePath != nil && passphraseStdin {
-                throw RecoveryFailure.usage("Specify at most one of --passphrase-file and --passphrase-stdin.")
-            }
-
-            let passphraseSource: PassphraseInputSource
-            if let passphraseFilePath {
-                passphraseSource = .file(passphraseFilePath)
-            } else if passphraseStdin {
-                passphraseSource = .stdin
-            } else {
-                passphraseSource = .interactiveTTY
-            }
-
-            return .archive(
-                archiveURL: URL(fileURLWithPath: archivePath, isDirectory: true),
-                outputDir: outputURL,
-                passphraseSource: passphraseSource,
-                allowTestIterations: allowTestIterations
-            )
         }
 
-        throw RecoveryFailure.usage("Invalid command configuration.")
+        guard let archivePath, !archivePath.isEmpty else {
+            throw RecoveryFailure.usage("--archive requires a non-empty path.")
+        }
+        if keyFilePath != nil || keyHexStdin || includeTrashed || strict {
+            throw RecoveryFailure.usage("Mode A --support-dir flags cannot be combined with --archive.")
+        }
+        if passphraseFilePath != nil && passphraseStdin {
+            throw RecoveryFailure.usage("Specify at most one of --passphrase-file and --passphrase-stdin.")
+        }
+
+        let passphraseSource: PassphraseInputSource
+        if let passphraseFilePath {
+            passphraseSource = .file(passphraseFilePath)
+        } else if passphraseStdin {
+            passphraseSource = .stdin
+        } else {
+            passphraseSource = .interactiveTTY
+        }
+
+        return .archive(
+            archiveURL: URL(fileURLWithPath: archivePath, isDirectory: true),
+            outputDir: outputURL,
+            passphraseSource: passphraseSource,
+            allowTestIterations: allowTestIterations
+        )
     }
 
     private static func rejectInlineValue(_ inlineValue: String?, for flag: String) throws {
@@ -1488,6 +1469,7 @@ private enum LocalStoreRecovery {
             encryption: nil
         )
 
+        let hasCorruptedItems = !corruptedItemIDs.isEmpty
         try RecoveryCryptoAndIO.writePrivateFile(
             try encoder.encode(manifest),
             to: stagedArchiveURL.appendingPathComponent("manifest.json", isDirectory: false)
@@ -1498,20 +1480,23 @@ private enum LocalStoreRecovery {
         )
         try RecoveryCryptoAndIO.writePrivateFile(
             try encoder.encode(activeItems),
-            to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false)
+            to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false),
+            sync: !includeTrashed && !hasCorruptedItems
         )
 
         if includeTrashed {
             try RecoveryCryptoAndIO.writePrivateFile(
                 try encoder.encode(trashedItems),
-                to: stagedArchiveURL.appendingPathComponent("trashed-history.json", isDirectory: false)
+                to: stagedArchiveURL.appendingPathComponent("trashed-history.json", isDirectory: false),
+                sync: !hasCorruptedItems
             )
         }
 
-        if !corruptedItemIDs.isEmpty {
+        if hasCorruptedItems {
             try RecoveryCryptoAndIO.writePrivateFile(
                 try encoder.encode(corruptedItemIDs),
-                to: stagedArchiveURL.appendingPathComponent("corrupted-items.json", isDirectory: false)
+                to: stagedArchiveURL.appendingPathComponent("corrupted-items.json", isDirectory: false),
+                sync: true
             )
         }
 
@@ -1664,7 +1649,6 @@ private enum LocalStoreRecovery {
             storedLinkPreview = nil
         }
 
-        // Decrypt / decode all 4 protected clip_contents columns.
         let text: String?
         let qrCodeText: String?
         let rtfData: Data?
@@ -2704,7 +2688,8 @@ private enum EncryptedArchiveRecovery {
         )
         try RecoveryCryptoAndIO.writePrivateFile(
             try encoder.encode(recoveredItems),
-            to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false)
+            to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false),
+            sync: true
         )
 
         try RecoveryCryptoAndIO.swapStagedOutput(at: stagedArchiveURL, into: outputDir)

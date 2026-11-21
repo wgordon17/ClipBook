@@ -148,17 +148,7 @@ struct ImportExportSettingsView: View {
     }
 
     private func startExport(mode: ArchiveExportMode) {
-        let initialTotalCount: Int
-        switch mode {
-        case .unencryptedSkippingSensitive:
-            initialTotalCount = model.items.filter {
-                $0.expiresAt == nil
-                    && !SensitiveContent.shouldEncryptAtRest($0)
-                    && !$0.hasUnverifiedEncryptedImageAsset
-            }.count
-        case .unencryptedIncludingSensitive, .encrypted:
-            initialTotalCount = model.items.filter { $0.expiresAt == nil }.count
-        }
+        let initialTotalCount = model.items.count
 
         let didStart = coordinator.beginExportHistoryArchive(
             mode: mode,
@@ -557,15 +547,6 @@ private struct ArchiveOperationProgress {
 
     var itemCountText: String {
         L10n.string("(%d/%d)", completedItemCount, totalItemCount)
-    }
-
-    var resultText: String? {
-        switch result {
-        case .success(let message), .failure(let message):
-            return message
-        case nil:
-            return nil
-        }
     }
 
     func completed(with result: ArchiveOperationResult) -> ArchiveOperationProgress {

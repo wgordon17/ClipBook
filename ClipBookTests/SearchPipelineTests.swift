@@ -1547,6 +1547,20 @@ extension SharedProcessStateTests {
             toolbar.delegate = controller
             controller.attachToolbar(toolbar)
 
+            func findView<T: NSView>(ofType _: T.Type, in root: NSView) -> T? {
+                if let matched = root as? T {
+                    return matched
+                }
+                for subview in root.subviews {
+                    if let found = findView(ofType: T.self, in: subview) {
+                        return found
+                    }
+                }
+                return nil
+            }
+            let listPaneView = try #require(findView(ofType: History.self, in: controller.view))
+            let listTableView = try #require(findView(ofType: NSTableView.self, in: listPaneView))
+
             @MainActor
             func runSearchAndWait(_ query: String) async {
                 controller.historyToolbar(toolbar, didChangeSearchQuery: query)
@@ -1718,17 +1732,41 @@ extension SharedProcessStateTests {
             #expect(degradedResult.corpus.revisions.allSatisfy { $0 == 0 })
             #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
             #expect(harness.model.filteredItems.isEmpty, "Header fallback lacks >8 KB tail sentinel while store throws")
+            #expect(await TestSupport.waitUntil { listPaneView.items.isEmpty && listTableView.numberOfRows == 0 })
 
-            // Re-querying the SAME search term once store recovers re-hydrates via applyPendingSearchQuery's hasCompleteTexts == false guard!
+            // Re-querying the SAME search term once store recovers re-hydrates via applyPendingSearchQuery's hasCompleteTexts == false guard
+            // and reloads listPaneView even though HistorySearchTerms is unchanged!
             spyStore.shouldThrowOnFetchSearchTexts = false
             spyStore.resetRecordedCalls()
             controller.historyToolbar(toolbar, didChangeSearchQuery: sentinel40KB)
             let recovered = await TestSupport.waitUntil {
                 harness.model.searchResult?.corpus.hasCompleteTexts == true
+                    && listPaneView.items.map(\.id) == [item40KB.id]
             }
             #expect(recovered)
             #expect(spyStore.fetchSearchTextsCalls.count == 1)
             #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
+            #expect(listPaneView.items.map(\.id) == [item40KB.id])
+            #expect(listTableView.numberOfRows >= 1)
+            #expect(harness.model.selectedItemID == item40KB.id)
+
+            // Also verify recovery when query changes only by trailing whitespace (HistorySearchTerms unchanged, model.searchQuery changed).
+            controller.clearSearchAfterHiddenInterval()
+            spyStore.shouldThrowOnFetchSearchTexts = true
+            await runSearchAndWait(sentinel40KB)
+            #expect(await TestSupport.waitUntil { listPaneView.items.isEmpty && listTableView.numberOfRows == 0 })
+            spyStore.shouldThrowOnFetchSearchTexts = false
+            spyStore.resetRecordedCalls()
+            controller.historyToolbar(toolbar, didChangeSearchQuery: sentinel40KB + " ")
+            let recoveredWhitespace = await TestSupport.waitUntil {
+                harness.model.searchResult?.corpus.hasCompleteTexts == true
+                    && listPaneView.items.map(\.id) == [item40KB.id]
+            }
+            #expect(recoveredWhitespace)
+            #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
+            #expect(listPaneView.items.map(\.id) == [item40KB.id])
+            #expect(listTableView.numberOfRows >= 1)
+            #expect(harness.model.selectedItemID == item40KB.id)
 
             // (c.8) Toggling Trash (isShowingTrash) never cross-contaminates Active vs Trash results!
             await runSearchAndWait("trashed_only_needle")

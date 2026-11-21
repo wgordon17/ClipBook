@@ -1,8 +1,4 @@
 import Foundation
-import SwiftUI
-import AppKit
-import Carbon
-import Combine
 
 enum AppAppearance: String, Codable, CaseIterable, Identifiable {
     case system

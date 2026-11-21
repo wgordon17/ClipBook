@@ -1,9 +1,7 @@
 import Darwin
 import Foundation
 import os
-import SwiftUI
 import AppKit
-import Carbon
 import Combine
 import UniformTypeIdentifiers
 
@@ -173,10 +171,11 @@ final class AppCoordinator: ObservableObject {
     }
     let initialLockState = syncStoreLockState()
     var didLoadHistory = false
+    var startupTrashedItems: [ClipboardItem]?
     if initialLockState == .unlocked {
       didLoadHistory = loadHistory(sweepsCaches: false)
       if didLoadHistory && syncStoreOpenAndUnlocked() {
-        runReadyStoreStartupMaintenance()
+        startupTrashedItems = runReadyStoreStartupMaintenance()
       }
     } else {
       model.lastError = Self.lockedStoreErrorMessage(for: initialLockState)
@@ -194,7 +193,7 @@ final class AppCoordinator: ObservableObject {
     let isStoreReady = didLoadHistory && syncStoreOpenAndUnlocked()
     clipboardMonitor.isPaused = model.isPaused || !isStoreReady
     if isStoreReady {
-      resumePendingImageRecognitions()
+      resumePendingImageRecognitions(trashedItems: startupTrashedItems)
     }
     applyAppearance()
     #if DEBUG
@@ -242,16 +241,23 @@ final class AppCoordinator: ObservableObject {
     historyStore.isOpen && syncStoreLockState() == .unlocked
   }
 
-  private func runReadyStoreStartupMaintenance() {
+  @discardableResult
+  private func runReadyStoreStartupMaintenance() -> [ClipboardItem] {
     clearHistoryAfterRebootIfNeeded()
     applyRetention()
     deleteExpiredItems()
-    pruneFilePreviewCache()
+    let trashedItems = model.isShowingTrash
+      ? model.trashedItems
+      : ((try? historyStore.fetchTrashedItems()) ?? [])
+    pruneFilePreviewCache(trashedItems: trashedItems)
     removeOrphanedStoredFiles()
+    return trashedItems
   }
 
-  private func resumePendingImageRecognitions() {
-    let resumableItems = model.items + ((try? historyStore.fetchTrashedItems()) ?? [])
+  private func resumePendingImageRecognitions(trashedItems: [ClipboardItem]? = nil) {
+    let resolvedTrashedItems = trashedItems
+      ?? (model.isShowingTrash ? model.trashedItems : ((try? historyStore.fetchTrashedItems()) ?? []))
+    let resumableItems = model.items + resolvedTrashedItems
     clipboardMonitor.resumePendingImageRecognitions(for: resumableItems)
   }
 
@@ -263,8 +269,8 @@ final class AppCoordinator: ObservableObject {
       _ = syncStoreLockState()
       let didLoadHistory = loadHistory(sweepsCaches: false)
       if didLoadHistory && syncStoreOpenAndUnlocked() {
-        runReadyStoreStartupMaintenance()
-        resumePendingImageRecognitions()
+        let trashedItems = runReadyStoreStartupMaintenance()
+        resumePendingImageRecognitions(trashedItems: trashedItems)
       }
       let finalReady = didLoadHistory && syncStoreOpenAndUnlocked()
       clipboardMonitor.isPaused = model.isPaused || !finalReady
@@ -498,18 +504,12 @@ final class AppCoordinator: ObservableObject {
       passphrase = exportPassphrase
     }
     let tags = model.tags
-    // FileManager is thread-safe; the archive is written on a background queue.
-    nonisolated(unsafe) let fileManager = self.fileManager
     let supportDirectory = self.supportDirectory
-    let reportProgress: (ClipBookArchiveProgress) -> Void = { progressValue in
-      DispatchQueue.main.async {
-        progress(progressValue)
-      }
-    }
+    let reportProgress = Self.makeCoalescedArchiveProgressReporter(progress)
 
     let historyStore = self.historyStore
     DispatchQueue.global(qos: .userInitiated).async {
-      let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
+      let archiveService = ClipBookArchiveService(supportDirectory: supportDirectory)
       do {
         try archiveService.export(
           items: items,
@@ -537,6 +537,53 @@ final class AppCoordinator: ObservableObject {
     return true
   }
 
+  private static func makeCoalescedArchiveProgressReporter(
+    _ progress: @escaping (ClipBookArchiveProgress) -> Void
+  ) -> @Sendable (ClipBookArchiveProgress) -> Void {
+    nonisolated(unsafe) let progress = progress
+    let state = OSAllocatedUnfairLock<(latest: ClipBookArchiveProgress?, scheduled: Bool)>(
+      initialState: (latest: nil, scheduled: false)
+    )
+    return { progressValue in
+      let isBoundary = progressValue.completedItemCount == 0
+        || progressValue.completedItemCount == progressValue.totalItemCount
+      if isBoundary {
+        state.withLock { $0.latest = nil }
+        DispatchQueue.main.async {
+          MainActor.assumeIsolated {
+            progress(progressValue)
+          }
+        }
+        return
+      }
+
+      let shouldSchedule = state.withLock { current -> Bool in
+        current.latest = progressValue
+        guard !current.scheduled else {
+          return false
+        }
+        current.scheduled = true
+        return true
+      }
+      guard shouldSchedule else {
+        return
+      }
+      DispatchQueue.main.async {
+        guard let latest = state.withLock({ current -> ClipBookArchiveProgress? in
+          let value = current.latest
+          current.latest = nil
+          current.scheduled = false
+          return value
+        }) else {
+          return
+        }
+        MainActor.assumeIsolated {
+          progress(latest)
+        }
+      }
+    }
+  }
+
   private func finishExportHistoryArchive() {
     isHistoryArchiveOperationRunning = false
     clipboardMonitor.isPaused = model.isPaused || !syncStoreOpenAndUnlocked()
@@ -562,16 +609,15 @@ final class AppCoordinator: ObservableObject {
   }
 
   func inspectArchive(at url: URL) throws -> ClipBookArchiveInspection {
-    let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
+    let archiveService = ClipBookArchiveService(supportDirectory: supportDirectory)
     return try archiveService.inspect(at: url)
   }
 
   func verifyArchivePassphrase(_ passphrase: String, for url: URL) async throws {
-    nonisolated(unsafe) let fileManager = self.fileManager
     let supportDirectory = self.supportDirectory
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       DispatchQueue.global(qos: .userInitiated).async {
-        let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
+        let archiveService = ClipBookArchiveService(supportDirectory: supportDirectory)
         do {
           try archiveService.verifyPassphrase(passphrase, at: url)
           continuation.resume()
@@ -595,14 +641,9 @@ final class AppCoordinator: ObservableObject {
 
     // The import runs on a background queue while clipboard monitoring is
     // stopped, so nothing else touches the store until it completes.
-    nonisolated(unsafe) let fileManager = self.fileManager
     let supportDirectory = self.supportDirectory
     let historyStore = self.historyStore
-    let reportProgress: (ClipBookArchiveProgress) -> Void = { progressValue in
-      DispatchQueue.main.async {
-        progress(progressValue)
-      }
-    }
+    let reportProgress = Self.makeCoalescedArchiveProgressReporter(progress)
     hideHistoryPanel()
     cancelLinkPreviewTasks()
     deferredRecognitionsDuringArchive.removeAll()
@@ -611,7 +652,7 @@ final class AppCoordinator: ObservableObject {
     cancelOrphanedFileSweeps(waitUntilDone: true)
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-      let archiveService = ClipBookArchiveService(fileManager: fileManager, supportDirectory: supportDirectory)
+      let archiveService = ClipBookArchiveService(supportDirectory: supportDirectory)
       do {
         let result = try archiveService.import(
           from: url,
@@ -951,7 +992,6 @@ final class AppCoordinator: ObservableObject {
         removeFilePreviewFiles(for: deletedItems, remainingItems: model.items.filter(shouldKeepWhenClearingHistory))
       } else {
         ImageAssetThumbnailLoader.shared.removeAll()
-        ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: linkPreviewsDirectory)
         scrubManagedDirectoryFiles(at: linkPreviewsDirectory)
         try? fileManager.removeItem(at: linkPreviewsDirectory)
         filePreviewCache.removeAll()
@@ -1473,15 +1513,20 @@ final class AppCoordinator: ObservableObject {
     if items.contains(where: { !$0.filePaths.isEmpty || $0.assetPath != nil }) {
       // An item in the Trash keeps its files, so they are spared as long as it
       // or an item in the history still names them.
+      let remainingTrashedItems = model.isShowingTrash
+        ? model.trashedItems
+        : ((try? historyStore.fetchTrashedItems()) ?? [])
       let remainingItems = model.items.filter { !deletedItemIDs.contains($0.id) }
-        + ((try? historyStore.fetchTrashedItems()) ?? []).filter { !deletedItemIDs.contains($0.id) }
+        + remainingTrashedItems.filter { !deletedItemIDs.contains($0.id) }
       removeFilePreviewFiles(for: items, remainingItems: remainingItems)
       removeAssetFiles(for: items, remainingItems: remainingItems)
     }
     model.remove(deletedItemIDs)
     HistoryRowTextCache.removeAll()
     SensitiveContent.removeAll()
-    SVGImageRenderer.shared.removeAll()
+    for id in deletedItemIDs {
+      SVGImageRenderer.shared.removeRendering(for: id)
+    }
   }
 
   // MARK: - Trash
@@ -1729,13 +1774,7 @@ final class AppCoordinator: ObservableObject {
   }
 
   private func setTrashLoaded(_ isLoaded: Bool) {
-    guard isLoaded else {
-      if !model.trashedItems.isEmpty {
-        model.trashedItems = []
-      }
-      return
-    }
-    guard historyStore.isOpen, historyStore.lockState == .unlocked else {
+    guard isLoaded, historyStore.isOpen, historyStore.lockState == .unlocked else {
       if !model.trashedItems.isEmpty {
         model.trashedItems = []
       }
@@ -1878,7 +1917,7 @@ final class AppCoordinator: ObservableObject {
     let keepsProtectedItems = model.preferences.keepFavoritesOnClearHistory
     var items: [ClipboardItem] = []
     do {
-      items = try historyStore.fetchItems { item in
+      items = try historyStore.fetchAll().filter { item in
         addedApplications.contains { $0.matches(item) }
           && !(keepsProtectedItems && shouldKeepWhenClearingHistory(item))
       }
@@ -1935,9 +1974,9 @@ final class AppCoordinator: ObservableObject {
     let keepsProtectedItems = model.preferences.keepFavoritesOnClearHistory
     var items: [ClipboardItem] = []
     do {
-      items = try historyStore.fetchItems { item in
-        SensitiveContent.containsSensitiveContent(item)
-          && !(keepsProtectedItems && shouldKeepWhenClearingHistory(item))
+      items = try historyStore.fetchAll().filter { item in
+        !(keepsProtectedItems && shouldKeepWhenClearingHistory(item))
+          && SensitiveContent.containsSensitiveContent(item)
       }
     } catch {
       model.lastError = PersistenceErrorLocalization.message(for: error)
@@ -2260,7 +2299,7 @@ final class AppCoordinator: ObservableObject {
       cancelLinkPreviewTask(for: updated.id)
 
       if updated.kind == .image {
-        ImageDragFiles.removeAll()
+        ImageDragFiles.removeCopies(forSupportDirectory: supportDirectory)
         if isItemHiddenInUI(updated), let currentAsset = updated.assetPath {
           ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: currentAsset)
         }
@@ -2286,12 +2325,9 @@ final class AppCoordinator: ObservableObject {
 
       if !wasEncrypted {
         HistoryRowTextCache.removeAll()
-        SensitiveContent.removeAll()
-        SVGImageRenderer.shared.removeAll()
-      } else {
-        SensitiveContent.removeAll()
-        SVGImageRenderer.shared.removeAll()
       }
+      SensitiveContent.removeAll()
+      SVGImageRenderer.shared.removeRendering(for: updated.id)
     }
   }
 
@@ -3002,28 +3038,13 @@ final class AppCoordinator: ObservableObject {
     try historyStore.loadingContent(of: item, scope: scope)
   }
 
-  private nonisolated static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
-    let standardized = directoryURL.standardizedFileURL
-    if standardized.path == "/" || standardized.path.isEmpty {
-      return standardized
-    }
-    var st = stat()
-    if stat(standardized.path, &st) == 0 {
-      return standardized.resolvingSymlinksInPath().standardizedFileURL
-    }
-    let parent = canonicalDirectoryURL(standardized.deletingLastPathComponent())
-    return parent
-      .appendingPathComponent(standardized.lastPathComponent, isDirectory: true)
-      .standardizedFileURL
-  }
-
   private nonisolated static func canonicalFilePath(_ path: String) -> String {
     let url = URL(fileURLWithPath: path, isDirectory: false)
     var st = stat()
     if Darwin.lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK {
       return url.resolvingSymlinksInPath().standardizedFileURL.path
     }
-    let parent = canonicalDirectoryURL(url.deletingLastPathComponent())
+    let parent = ImageAssetStore.canonicalDirectoryURL(url.deletingLastPathComponent())
     return parent
       .appendingPathComponent(url.lastPathComponent, isDirectory: false)
       .standardizedFileURL
@@ -3037,10 +3058,10 @@ final class AppCoordinator: ObservableObject {
           (parentStat.st_mode & S_IFMT) == S_IFDIR else {
       return false
     }
-    let canonicalDirPrefix = Self.canonicalDirectoryURL(directory).path + "/"
+    let canonicalDirPath = ImageAssetStore.canonicalDirectoryURL(directory).path
     let canonicalCandidatePath = Self.canonicalFilePath(fileURL.path)
-    return canonicalCandidatePath.hasPrefix(canonicalDirPrefix)
-      && Self.canonicalDirectoryURL(parentURL).path == Self.canonicalDirectoryURL(directory).path
+    return canonicalCandidatePath.hasPrefix(canonicalDirPath + "/")
+      && ImageAssetStore.canonicalDirectoryURL(parentURL).path == canonicalDirPath
   }
 
   private func scrubManagedDirectoryFiles(at directory: URL) {
@@ -3088,7 +3109,7 @@ final class AppCoordinator: ObservableObject {
   /// anyway, and nothing outside the images folder is ever deleted.
   private func removeAssetFiles(for deletedItems: [ClipboardItem], remainingItems: [ClipboardItem]) {
     if deletedItems.contains(where: { $0.kind == .image || $0.assetPath != nil }) {
-      ImageDragFiles.removeAll()
+      ImageDragFiles.removeCopies(forSupportDirectory: supportDirectory)
     }
     let deletedPaths = Set(deletedItems.compactMap(\.assetPath))
     guard !deletedPaths.isEmpty else {
@@ -3206,16 +3227,16 @@ final class AppCoordinator: ObservableObject {
     }
   }
 
-  private func pruneFilePreviewCache() {
+  private func pruneFilePreviewCache(trashedItems: [ClipboardItem]? = nil) {
     filePreviewCache.prune {
       var keptFilePaths = Set<String>()
-      for item in model.items where !SensitiveContent.shouldEncryptAtRest(item) {
+      for item in model.items where !item.filePaths.isEmpty && !SensitiveContent.shouldEncryptAtRest(item) {
         keptFilePaths.formUnion(item.filePaths)
       }
-      if let trashedItems = try? historyStore.fetchTrashedItems() {
-        for item in trashedItems where !SensitiveContent.shouldEncryptAtRest(item) {
-          keptFilePaths.formUnion(item.filePaths)
-        }
+      let resolvedTrashedItems = trashedItems
+        ?? (model.isShowingTrash ? model.trashedItems : ((try? historyStore.fetchTrashedItems()) ?? []))
+      for item in resolvedTrashedItems where !item.filePaths.isEmpty && !SensitiveContent.shouldEncryptAtRest(item) {
+        keptFilePaths.formUnion(item.filePaths)
       }
       return keptFilePaths
     }
@@ -3824,9 +3845,7 @@ extension AppCoordinator: PasteboardMonitorDelegate {
         && outcome.updated.map(SensitiveContent.shouldEncryptAtRest) == true
         && !(outcome.previous.map(SensitiveContent.shouldEncryptAtRest) ?? false)
       if outcome.purged || upgradedImageToEncrypted {
-        ImageDragFiles.removeAll()
-        SensitiveContent.removeAll()
-        SVGImageRenderer.shared.removeAll()
+        ImageDragFiles.removeCopies(forSupportDirectory: supportDirectory)
       }
 
       if let oldPath = outcome.previous?.assetPath,
@@ -3836,34 +3855,33 @@ extension AppCoordinator: PasteboardMonitorDelegate {
         ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: oldPath)
       }
 
+      let upgradedFileToEncrypted = outcome.previous?.kind == .file
+        && outcome.updated.map(SensitiveContent.shouldEncryptAtRest) == true
       if let prev = outcome.previous,
          prev.kind == .file,
-         outcome.purged || outcome.updated.map(SensitiveContent.shouldEncryptAtRest) == true {
+         outcome.purged || upgradedFileToEncrypted {
         filePreviewCache.removePreviews(forFilePaths: Set(prev.filePaths))
         if outcome.purged || (outcome.updated.map(isItemHiddenInUI) ?? true) {
           for path in prev.filePaths {
             ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
           }
         }
+      }
+
+      if outcome.purged || upgradedImageToEncrypted || upgradedFileToEncrypted {
         SensitiveContent.removeAll()
-        SVGImageRenderer.shared.removeAll()
+        SVGImageRenderer.shared.removeRendering(for: itemID)
       }
 
       if outcome.purged {
         model.remove([itemID])
         HistoryRowTextCache.removeAll()
-        SensitiveContent.removeAll()
-        SVGImageRenderer.shared.removeAll()
         deleteExpiredItems()
         return
       }
 
       if let updated = outcome.updated {
-        if outcome.isTrashed {
-          if model.isShowingTrash {
-            model.replace(updated)
-          }
-        } else {
+        if !outcome.isTrashed || model.isShowingTrash {
           model.replace(updated)
         }
         if updated.expiresAt != nil {

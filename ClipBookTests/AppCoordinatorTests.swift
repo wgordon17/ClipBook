@@ -9,169 +9,6 @@ import Testing
 @Suite
 enum AppCoordinatorTests {
     @Suite
-    struct HistoryMutationTests {
-        private static let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
-
-        /// A text item copied `offset` seconds after `baseDate`.
-        private static func textItem(_ text: String, at offset: TimeInterval, sensitivity: ItemSensitivity? = nil) -> ClipboardItem {
-            .fixture(kind: .text, text: text, copiedAt: baseDate.addingTimeInterval(offset), sensitivity: sensitivity)
-        }
-
-        @Test
-        @MainActor
-        func mergingTextThatIsALinkJoinsTheExistingLinkItem() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let url = "https://example.com/docs"
-            let existingLink = ClipboardItem.fixture(
-                kind: .link,
-                text: url,
-                copiedAt: Self.baseDate.addingTimeInterval(10),
-                firstCopiedAt: Self.baseDate
-            )
-            let part1 = Self.textItem(url, at: 30)
-            let part2 = Self.textItem("   ", at: 20)
-            try harness.seedHistory([Self.textItem("Unrelated clip", at: 40), part1, part2, existingLink])
-
-            harness.coordinator.merge([part1, part2])
-
-            let merged = try #require(harness.model.items.first)
-            #expect(merged.kind == .link)
-            #expect(!merged.isContentLoaded)
-            #expect(merged.storedContentKey != nil)
-            #expect(harness.model.items.filter { $0.kind == .link && $0.hasSameContent(as: merged) }.count == 1)
-        }
-
-        @Test
-        @MainActor
-        func mergingAHexColorWithBlankTextYieldsAColorItem() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let part1 = Self.textItem("#ff0000", at: 50)
-            let part2 = Self.textItem("   ", at: 45)
-            try harness.seedHistory([part1, part2])
-
-            harness.coordinator.merge([part1, part2])
-
-            #expect(harness.model.items.first?.kind == .color)
-        }
-
-        @Test
-        @MainActor
-        func splitClassifiesLinesAndPlacesAtTop() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let multiLineItem = Self.textItem("alpha\nbeta\nhttps://example.com", at: 200)
-            try harness.seedHistory([multiLineItem])
-
-            harness.coordinator.split(multiLineItem)
-
-            let items = harness.model.items
-            #expect(items.count == 4)
-            #expect(items.allSatisfy { !$0.isContentLoaded })
-            #expect(items[0].previewText == "alpha")
-            #expect(items[1].previewText == "beta")
-            #expect(items[2].kind == .link)
-            #expect(items[2].previewText == "https://example.com")
-            #expect(try harness.historyStore.loadingContent(of: items[0], scope: .body).text == "alpha")
-        }
-
-        @Test
-        @MainActor
-        func transformingFormattedTextAppliesEachTransformAndDropsTheFormatting() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let formatted = ClipboardItem.fixture(
-                kind: .richText,
-                text: "  Hello World  ",
-                rtfData: Data("{\\rtf1\\ansi bold}".utf8),
-                html: "<b>Hello World</b>",
-                copiedAt: Self.baseDate.addingTimeInterval(200)
-            )
-            try harness.seedHistory([formatted])
-            #expect(try #require(harness.currentItem(formatted.id)).hasFormatting)
-
-            harness.coordinator.transform(try #require(harness.currentItem(formatted.id)), using: .trimSurroundingWhitespaces)
-            harness.coordinator.transform(try #require(harness.currentItem(formatted.id)), using: .upperCase)
-
-            let transformed = try #require(harness.currentItem(formatted.id))
-            #expect(!transformed.isContentLoaded)
-            #expect(transformed.previewText == "HELLO WORLD")
-            #expect(try harness.historyStore.loadingContent(of: transformed, scope: .body).text == "HELLO WORLD")
-            #expect(transformed.kind == .text)
-            #expect(!transformed.hasFormatting)
-        }
-
-        @Test
-        @MainActor
-        func editingContentReclassifiesTheItem() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let item = Self.textItem("HELLO WORLD", at: 200)
-            try harness.seedHistory([item])
-
-            harness.coordinator.editContent(item, text: "user@example.com")
-
-            #expect(harness.currentItem(item.id)?.kind == .email)
-        }
-
-        @Test
-        @MainActor
-        func editingContentToBlankTrashesTheItemAndUndoRestoresIt() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let item = Self.textItem("Soon blank", at: 200)
-            try harness.seedHistory([item])
-
-            harness.coordinator.editContent(item, text: "   \n  ")
-            #expect(harness.currentItem(item.id) == nil)
-            #expect(try harness.trashedIDs() == [item.id])
-
-            harness.coordinator.undoHistoryChange()
-            #expect(harness.currentItem(item.id) != nil)
-            #expect(try harness.trashedIDs().isEmpty)
-        }
-
-        @Test
-        @MainActor
-        func sensitiveItemsAreDeletedPermanentlyInsteadOfTrashed() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let secretToken = ["sk", "-proj-", String(repeating: "aB3dE5fG", count: 4)].joined()
-            let autoDetectedSecret = Self.textItem("API Key: \(secretToken)", at: 200)
-            let markedSensitive = Self.textItem("Marked sensitive manually", at: 300, sensitivity: .sensitive)
-            let normal = Self.textItem("Normal note", at: 100)
-            try harness.seedHistory([normal, autoDetectedSecret, markedSensitive])
-
-            harness.coordinator.delete([autoDetectedSecret, markedSensitive])
-
-            #expect(harness.model.items.map(\.id) == [normal.id])
-            #expect(try harness.trashedIDs().isEmpty)
-        }
-
-        @Test
-        @MainActor
-        func deletingMovesAnItemToTheTrashAndUndoAndRedoMoveItBack() throws {
-            let harness = try TestSupport.makeTestCoordinator()
-            defer { harness.cleanup() }
-            let item = Self.textItem("Normal note to trash", at: 100)
-            try harness.seedHistory([item])
-
-            harness.coordinator.delete(item)
-            #expect(harness.currentItem(item.id) == nil)
-            #expect(try harness.trashedIDs() == [item.id])
-
-            harness.coordinator.undoHistoryChange()
-            #expect(harness.currentItem(item.id) != nil)
-            #expect(try harness.trashedIDs().isEmpty)
-
-            harness.coordinator.redoHistoryChange()
-            #expect(harness.currentItem(item.id) == nil)
-            #expect(try harness.trashedIDs() == [item.id])
-        }
-    }
-
-    @Suite
     struct RebootTests {
         private static let bootTime: TimeInterval = 1_800_000_000
 
@@ -406,6 +243,173 @@ enum AppCoordinatorTests {
 
             #expect(!FileManager.default.fileExists(atPath: directory.path))
             #expect(UserDefaults(suiteName: suiteName)?.string(forKey: "probe") == nil)
+        }
+    }
+}
+
+// Saving applies appearance and language, which are process-wide; coordinator mutations,
+// drag staging, thumbnail caching, SVG rendering, and modal alerts also touch process-global state.
+extension SharedProcessStateTests {
+    @Suite(.serialized)
+    struct HistoryMutationTests {
+        private static let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        /// A text item copied `offset` seconds after `baseDate`.
+        private static func textItem(_ text: String, at offset: TimeInterval, sensitivity: ItemSensitivity? = nil) -> ClipboardItem {
+            .fixture(kind: .text, text: text, copiedAt: baseDate.addingTimeInterval(offset), sensitivity: sensitivity)
+        }
+
+        @Test
+        @MainActor
+        func mergingTextThatIsALinkJoinsTheExistingLinkItem() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let url = "https://example.com/docs"
+            let existingLink = ClipboardItem.fixture(
+                kind: .link,
+                text: url,
+                copiedAt: Self.baseDate.addingTimeInterval(10),
+                firstCopiedAt: Self.baseDate
+            )
+            let part1 = Self.textItem(url, at: 30)
+            let part2 = Self.textItem("   ", at: 20)
+            try harness.seedHistory([Self.textItem("Unrelated clip", at: 40), part1, part2, existingLink])
+
+            harness.coordinator.merge([part1, part2])
+
+            let merged = try #require(harness.model.items.first)
+            #expect(merged.kind == .link)
+            #expect(!merged.isContentLoaded)
+            #expect(merged.storedContentKey != nil)
+            #expect(harness.model.items.filter { $0.kind == .link && $0.hasSameContent(as: merged) }.count == 1)
+        }
+
+        @Test
+        @MainActor
+        func mergingAHexColorWithBlankTextYieldsAColorItem() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let part1 = Self.textItem("#ff0000", at: 50)
+            let part2 = Self.textItem("   ", at: 45)
+            try harness.seedHistory([part1, part2])
+
+            harness.coordinator.merge([part1, part2])
+
+            #expect(harness.model.items.first?.kind == .color)
+        }
+
+        @Test
+        @MainActor
+        func splitClassifiesLinesAndPlacesAtTop() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let multiLineItem = Self.textItem("alpha\nbeta\nhttps://example.com", at: 200)
+            try harness.seedHistory([multiLineItem])
+
+            harness.coordinator.split(multiLineItem)
+
+            let items = harness.model.items
+            #expect(items.count == 4)
+            #expect(items.allSatisfy { !$0.isContentLoaded })
+            #expect(items[0].previewText == "alpha")
+            #expect(items[1].previewText == "beta")
+            #expect(items[2].kind == .link)
+            #expect(items[2].previewText == "https://example.com")
+            #expect(try harness.historyStore.loadingContent(of: items[0], scope: .body).text == "alpha")
+        }
+
+        @Test
+        @MainActor
+        func transformingFormattedTextAppliesEachTransformAndDropsTheFormatting() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let formatted = ClipboardItem.fixture(
+                kind: .richText,
+                text: "  Hello World  ",
+                rtfData: Data("{\\rtf1\\ansi bold}".utf8),
+                html: "<b>Hello World</b>",
+                copiedAt: Self.baseDate.addingTimeInterval(200)
+            )
+            try harness.seedHistory([formatted])
+            #expect(try #require(harness.currentItem(formatted.id)).hasFormatting)
+
+            harness.coordinator.transform(try #require(harness.currentItem(formatted.id)), using: .trimSurroundingWhitespaces)
+            harness.coordinator.transform(try #require(harness.currentItem(formatted.id)), using: .upperCase)
+
+            let transformed = try #require(harness.currentItem(formatted.id))
+            #expect(!transformed.isContentLoaded)
+            #expect(transformed.previewText == "HELLO WORLD")
+            #expect(try harness.historyStore.loadingContent(of: transformed, scope: .body).text == "HELLO WORLD")
+            #expect(transformed.kind == .text)
+            #expect(!transformed.hasFormatting)
+        }
+
+        @Test
+        @MainActor
+        func editingContentReclassifiesTheItem() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let item = Self.textItem("HELLO WORLD", at: 200)
+            try harness.seedHistory([item])
+
+            harness.coordinator.editContent(item, text: "user@example.com")
+
+            #expect(harness.currentItem(item.id)?.kind == .email)
+        }
+
+        @Test
+        @MainActor
+        func editingContentToBlankTrashesTheItemAndUndoRestoresIt() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let item = Self.textItem("Soon blank", at: 200)
+            try harness.seedHistory([item])
+
+            harness.coordinator.editContent(item, text: "   \n  ")
+            #expect(harness.currentItem(item.id) == nil)
+            #expect(try harness.trashedIDs() == [item.id])
+
+            harness.coordinator.undoHistoryChange()
+            #expect(harness.currentItem(item.id) != nil)
+            #expect(try harness.trashedIDs().isEmpty)
+        }
+
+        @Test
+        @MainActor
+        func sensitiveItemsAreDeletedPermanentlyInsteadOfTrashed() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let secretToken = ["sk", "-proj-", String(repeating: "aB3dE5fG", count: 4)].joined()
+            let autoDetectedSecret = Self.textItem("API Key: \(secretToken)", at: 200)
+            let markedSensitive = Self.textItem("Marked sensitive manually", at: 300, sensitivity: .sensitive)
+            let normal = Self.textItem("Normal note", at: 100)
+            try harness.seedHistory([normal, autoDetectedSecret, markedSensitive])
+
+            harness.coordinator.delete([autoDetectedSecret, markedSensitive])
+
+            #expect(harness.model.items.map(\.id) == [normal.id])
+            #expect(try harness.trashedIDs().isEmpty)
+        }
+
+        @Test
+        @MainActor
+        func deletingMovesAnItemToTheTrashAndUndoAndRedoMoveItBack() throws {
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            let item = Self.textItem("Normal note to trash", at: 100)
+            try harness.seedHistory([item])
+
+            harness.coordinator.delete(item)
+            #expect(harness.currentItem(item.id) == nil)
+            #expect(try harness.trashedIDs() == [item.id])
+
+            harness.coordinator.undoHistoryChange()
+            #expect(harness.currentItem(item.id) != nil)
+            #expect(try harness.trashedIDs().isEmpty)
+
+            harness.coordinator.redoHistoryChange()
+            #expect(harness.currentItem(item.id) == nil)
+            #expect(try harness.trashedIDs() == [item.id])
         }
     }
 
@@ -806,7 +810,7 @@ enum AppCoordinatorTests {
                 try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemPink).write(to: externalFileD)
 
                 let secretDFile = Self.makeSecretToken(tag: "ocr-d-file")
-                fileGate.setImmediate(returning: RecognizedImageContent(text: "Token \(secretDFile)", qrCodeText: nil))
+                fileGate.armSuspended(returning: RecognizedImageContent(text: "Token \(secretDFile)", qrCodeText: nil))
                 let copiedFileAtD = copiedAtD.addingTimeInterval(5)
                 clock.withLock { $0 = copiedFileAtD }
                 harness.pasteboard.clearContents()
@@ -814,10 +818,83 @@ enum AppCoordinatorTests {
                 await harness.clipboardMonitor.pollAndWaitForDelivery()
 
                 let fileItemD = try #require(harness.model.items.first)
+                #expect(fileItemD.kind == .file)
+                #expect(await Task.detached { fileGate.waitForEntry() }.value)
+
+                // Warm both FilePreviewCache and ImageAssetThumbnailLoader.shared before delivering didRecognize.
+                let filePreviewsDir = harness.supportDirectory.appendingPathComponent("FilePreviews", isDirectory: true)
+                var warmedFilePreviewImage: NSImage?
+                _ = harness.coordinator.filePreviewCache.image(
+                    forFileAt: externalFileD.path,
+                    targetSize: CGSize(width: 48, height: 48)
+                ) { generated in
+                    warmedFilePreviewImage = generated
+                }
+                #expect(await TestSupport.waitUntil { warmedFilePreviewImage != nil })
+                let warmedPreviewEntries = (try? FileManager.default.contentsOfDirectory(at: filePreviewsDir, includingPropertiesForKeys: nil)) ?? []
+                #expect(warmedPreviewEntries.count == 2)
+                let cachedPreviewPNG = try #require(warmedPreviewEntries.first { $0.pathExtension == "png" })
+                let cachedPreviewFD = Darwin.open(cachedPreviewPNG.path, O_RDONLY)
+                #expect(cachedPreviewFD >= 0)
+                defer {
+                    if cachedPreviewFD >= 0 { Darwin.close(cachedPreviewFD) }
+                }
+                let cachedPreviewBeforeOCR = harness.coordinator.filePreviewCache.image(
+                    forFileAt: externalFileD.path,
+                    targetSize: CGSize(width: 48, height: 48),
+                    completion: { _ in }
+                )
+                #expect(cachedPreviewBeforeOCR === warmedFilePreviewImage)
+
+                var warmedThumbD: NSImage?
+                if let immediate = ImageAssetThumbnailLoader.shared.thumbnail(
+                    for: externalFileD,
+                    maximumPixelSize: 128,
+                    completion: { img in warmedThumbD = img }
+                ) {
+                    warmedThumbD = immediate
+                }
+                #expect(await TestSupport.waitUntil { warmedThumbD != nil })
+                #expect(
+                    ImageAssetThumbnailLoader.shared.thumbnail(
+                        for: externalFileD,
+                        maximumPixelSize: 128,
+                        completion: { _ in }
+                    ) != nil
+                )
+
+                fileGate.resume()
                 let finalizedFileD = await TestSupport.waitUntil {
                     harness.currentItem(fileItemD.id)?.expiresAt == copiedFileAtD.addingTimeInterval(60)
                 }
                 #expect(finalizedFileD)
+                #expect(harness.currentItem(fileItemD.id) != nil)
+
+                let postOCRPreviewEntries = (try? FileManager.default.contentsOfDirectory(at: filePreviewsDir, includingPropertiesForKeys: nil)) ?? []
+                #expect(postOCRPreviewEntries.isEmpty, "Non-purged .file OCR encryption upgrade must evict FilePreviewCache files")
+                var scrubbedPreviewBytes = [UInt8](repeating: 0xFF, count: 16)
+                let readPreviewBytes = Darwin.pread(cachedPreviewFD, &scrubbedPreviewBytes, scrubbedPreviewBytes.count, 0)
+                #expect(readPreviewBytes == scrubbedPreviewBytes.count)
+                #expect(scrubbedPreviewBytes.allSatisfy { $0 == 0 })
+
+                let cachedPreviewAfterOCR = harness.coordinator.filePreviewCache.image(
+                    forFileAt: externalFileD.path,
+                    targetSize: CGSize(width: 48, height: 48),
+                    completion: { _ in }
+                )
+                #expect(cachedPreviewAfterOCR !== warmedFilePreviewImage)
+                harness.coordinator.filePreviewCache.removePreviews(forFilePaths: [externalFileD.path])
+
+                #expect(
+                    ImageAssetThumbnailLoader.shared.thumbnail(
+                        for: externalFileD,
+                        maximumPixelSize: 128,
+                        completion: { _ in }
+                    ) == nil,
+                    "Non-purged .file OCR encryption upgrade must evict external path from ImageAssetThumbnailLoader.shared"
+                )
+                ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: externalFileD.path)
+
                 harness.historyStore.flushPendingFreePageRelease()
                 let diskDFile = Self.databaseDiskBytes(in: harness.supportDirectory)
                 #expect(diskDFile.firstRange(of: Data(secretDFile.utf8)) == nil)
@@ -1934,11 +2011,7 @@ enum AppCoordinatorTests {
                 )
         }
     }
-}
 
-// Saving applies appearance and language, which are process-wide, and confirming
-// the sensitive-content deletion alert runs NSApp's modal window loop.
-extension SharedProcessStateTests {
     @Suite(.serialized)
     struct LazyConsumerHydrationMatrixTests {
         private static let sentinel = "TAIL_SENTINEL_AT_40KB"

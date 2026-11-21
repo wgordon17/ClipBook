@@ -235,7 +235,7 @@ nonisolated enum PasteboardReader {
                 return nil
             }
 
-            let dimensions = pixelDimensions(of: png)
+            let dimensions = ClipboardItem.pixelDimensions(of: png)
             let digest = request.computeImageDigest(png)
             if let storedImage = request.findStoredImage(digest),
                FileManager.default.fileExists(atPath: storedImage.assetPath) {
@@ -264,16 +264,6 @@ nonisolated enum PasteboardReader {
                 reusesStoredFile: false
             )
         }
-    }
-
-    private static func pixelDimensions(of data: Data) -> (width: Int, height: Int)? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int else {
-            return nil
-        }
-        return (width, height)
     }
 
     /// The PNG to store for the image on the pasteboard.

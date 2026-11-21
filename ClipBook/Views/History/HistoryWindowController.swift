@@ -364,7 +364,17 @@ final class HistoryContentViewController: NSViewController {
       return
     }
 
-    listPaneView.hideRevealedSensitiveContent()
+    let hiddenIDs = listPaneView.hideRevealedSensitiveContent()
+    if !hiddenIDs.isEmpty {
+      if let previewPaneController, hiddenIDs.contains(previewPaneController.item.id) {
+        previewPaneController.update(item: previewPaneController.item, revealsSensitiveContent: false)
+      }
+      if let previewSheetController, previewSheetWindow != nil,
+         hiddenIDs.contains(previewSheetController.item.id) {
+        previewSheetController.update(item: previewSheetController.item, revealsSensitiveContent: false)
+      }
+      evictRenderedMediaCaches(forItemIDs: hiddenIDs)
+    }
     setNeedsPreviewPaneUpdate()
   }
 
@@ -538,7 +548,7 @@ final class HistoryContentViewController: NSViewController {
     reloadList()
   }
 
-  private func reloadList() {
+  private func reloadList(schedulesSearchRefresh: Bool = true) {
     needsListReload = false
     let items = model.filteredItems
     let isArrangedByTag = model.orderingTagID != nil
@@ -571,7 +581,9 @@ final class HistoryContentViewController: NSViewController {
     updateToolbarFilterState()
     updateToolbarState()
     setNeedsPreviewPaneUpdate()
-    scheduleSearchRefreshIfNeeded()
+    if schedulesSearchRefresh {
+      scheduleSearchRefreshIfNeeded()
+    }
   }
 
   /// A history filtered to images only is where the pictures matter most, so
@@ -816,147 +828,6 @@ final class HistoryContentViewController: NSViewController {
     startSearchJob(for: terms)
   }
 
-  nonisolated static func resolveSearchCorpus(
-    _ descriptor: AppModel.SearchCorpusDescriptor,
-    previousCorpus: HistorySearchCorpus?,
-    coordinator: AppCoordinator,
-    isCancelled: () -> Bool
-  ) -> HistorySearchCorpus? {
-    if isCancelled() {
-      return nil
-    }
-    if let cached = descriptor.cachedCorpus {
-      return cached
-    }
-    if let previousCorpus,
-       previousCorpus.revision == descriptor.revision,
-       previousCorpus.hasCompleteTexts {
-      return previousCorpus
-    }
-
-    let count = descriptor.headers.count
-    if count == 0 {
-      return HistorySearchCorpus(
-        revision: descriptor.revision,
-        ids: [],
-        revisions: [],
-        texts: [],
-        tagNamesByID: descriptor.tagNamesByID,
-        hasCompleteTexts: true
-      )
-    }
-
-    let primaryDonor = previousCorpus
-    let secondaryDonor = (descriptor.donorCorpus === previousCorpus) ? nil : descriptor.donorCorpus
-    if primaryDonor?.hasCompleteTexts == true {
-      _ = primaryDonor?.indexByID()
-    }
-    if secondaryDonor?.hasCompleteTexts == true {
-      _ = secondaryDonor?.indexByID()
-    }
-
-    var ids = [UUID](repeating: UUID(), count: count)
-    var revisions = [UInt64](repeating: 0, count: count)
-    var texts = [String](repeating: "", count: count)
-    var missingSlots: [(slotIndex: Int, id: UUID)] = []
-
-    let headers = descriptor.headers
-    let tagNamesByID = descriptor.tagNamesByID
-    headers.withUnsafeBufferPointer { buffer in
-      for i in 0..<count {
-        if (i & 4095) == 0, isCancelled() {
-          return
-        }
-        let header = buffer[i]
-        ids[i] = header.id
-        if header.isContentLoaded {
-          texts[i] = header.searchText
-          revisions[i] = header.searchRevision
-        } else if let reused = primaryDonor?.reusableText(for: header, tagNamesByID: tagNamesByID)
-                    ?? secondaryDonor?.reusableText(for: header, tagNamesByID: tagNamesByID) {
-          texts[i] = reused
-          revisions[i] = header.searchRevision
-        } else {
-          missingSlots.append((slotIndex: i, id: header.id))
-        }
-      }
-    }
-
-    if isCancelled() {
-      return nil
-    }
-
-    if missingSlots.isEmpty {
-      return HistorySearchCorpus(
-        revision: descriptor.revision,
-        ids: ids,
-        revisions: revisions,
-        texts: texts,
-        tagNamesByID: tagNamesByID,
-        hasCompleteTexts: true
-      )
-    }
-
-    var didFetchSucceed = false
-    var usedFallback = false
-    do {
-      guard let fetched = try coordinator.fetchSearchTexts(
-        for: missingSlots.map(\.id),
-        trashed: descriptor.isTrashed,
-        tagNamesByID: tagNamesByID,
-        isCancelled: isCancelled
-      ) else {
-        return nil
-      }
-      didFetchSucceed = true
-      headers.withUnsafeBufferPointer { buffer in
-        for (offset, slot) in missingSlots.enumerated() {
-          if (offset & 4095) == 0, isCancelled() {
-            return
-          }
-          let header = buffer[slot.slotIndex]
-          if offset < fetched.count, let fetchedText = fetched[offset] {
-            texts[slot.slotIndex] = fetchedText
-            revisions[slot.slotIndex] = header.searchRevision
-          } else {
-            usedFallback = true
-            texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
-            revisions[slot.slotIndex] = 0
-          }
-        }
-      }
-    } catch {
-      if isCancelled() {
-        return nil
-      }
-      didFetchSucceed = false
-      usedFallback = true
-      headers.withUnsafeBufferPointer { buffer in
-        for (offset, slot) in missingSlots.enumerated() {
-          if (offset & 4095) == 0, isCancelled() {
-            return
-          }
-          let header = buffer[slot.slotIndex]
-          texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
-          revisions[slot.slotIndex] = 0
-        }
-      }
-    }
-
-    if isCancelled() {
-      return nil
-    }
-
-    return HistorySearchCorpus(
-      revision: descriptor.revision,
-      ids: ids,
-      revisions: revisions,
-      texts: texts,
-      tagNamesByID: tagNamesByID,
-      hasCompleteTexts: didFetchSucceed && !usedFallback
-    )
-  }
-
   private func startSearchJob(for terms: HistorySearchTerms) {
     let coordinator = self.coordinator
     let descriptor = model.prepareSearchCorpusDescriptor()
@@ -968,10 +839,10 @@ final class HistoryContentViewController: NSViewController {
     let resultBox = latestSearchJobResult
 
     searchQueue.async { [weak self] in
-      let corpus = Self.resolveSearchCorpus(
+      let corpus = HistorySearchCorpus.resolve(
         descriptor,
         previousCorpus: previousResult?.corpus,
-        coordinator: coordinator,
+        fetchSearchTexts: coordinator.fetchSearchTexts,
         isCancelled: { job.isCancelled }
       )
       let result = corpus.flatMap { resolvedCorpus in
@@ -1027,9 +898,21 @@ final class HistoryContentViewController: NSViewController {
     }
 
     pendingSearchQuery = nil
-    model.installSearchResult(result)
-    applySearchQuery(query, shouldResetSelection: true)
+    applyCompletedSearchResult(result, for: query)
     scheduleSearchRefreshIfNeeded()
+  }
+
+  private func applyCompletedSearchResult(
+    _ result: HistorySearchResult,
+    for query: String,
+    reloadsWhenTermsUnchanged: Bool = true
+  ) {
+    let unchangedTerms = HistorySearchTerms(query: model.searchQuery) == HistorySearchTerms(query: query)
+    model.installSearchResult(result)
+    applySearchQuery(query, shouldResetSelection: true, reloadsListSeparately: true)
+    if reloadsWhenTermsUnchanged && unchangedTerms {
+      reloadList(schedulesSearchRefresh: false)
+    }
   }
 
   private func scheduleHeldSearchUpdate(_ update: HeldSearchUpdate, delay: TimeInterval) {
@@ -1042,7 +925,7 @@ final class HistoryContentViewController: NSViewController {
     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
   }
 
-  private func applyHeldSearchUpdate() {
+  private func applyHeldSearchUpdate(reloadsWhenTermsUnchanged: Bool = true) {
     heldSearchWorkItem = nil
     guard let held = heldSearchUpdate else {
       return
@@ -1057,8 +940,11 @@ final class HistoryContentViewController: NSViewController {
         return
       }
       pendingSearchQuery = nil
-      model.installSearchResult(result)
-      applySearchQuery(query, shouldResetSelection: true)
+      applyCompletedSearchResult(
+        result,
+        for: query,
+        reloadsWhenTermsUnchanged: reloadsWhenTermsUnchanged
+      )
       scheduleSearchRefreshIfNeeded()
     case .clear(let heldQuery, let shouldResetSelection):
       let query = pendingSearchQuery ?? heldQuery
@@ -1093,9 +979,10 @@ final class HistoryContentViewController: NSViewController {
         pendingSearchQuery = nil
         if let result {
           setLastCompletedSearchResult(result)
-          model.installSearchResult(result)
+          applyCompletedSearchResult(result, for: query, reloadsWhenTermsUnchanged: false)
+        } else {
+          applySearchQuery(query, shouldResetSelection: true, reloadsListSeparately: true)
         }
-        applySearchQuery(query, shouldResetSelection: true)
         scheduleSearchRefreshIfNeeded()
         didApplySearchUpdate = true
       } else {
@@ -1106,7 +993,7 @@ final class HistoryContentViewController: NSViewController {
     if heldSearchUpdate != nil {
       heldSearchWorkItem?.cancel()
       heldSearchWorkItem = nil
-      applyHeldSearchUpdate()
+      applyHeldSearchUpdate(reloadsWhenTermsUnchanged: false)
       didApplySearchUpdate = true
     }
 
@@ -1129,7 +1016,8 @@ final class HistoryContentViewController: NSViewController {
 
     guard model.searchResult?.terms != terms
             || model.searchResult?.revision != model.sortedListRevision
-            || model.searchResult?.locale != Locale.current else {
+            || model.searchResult?.locale != Locale.current
+            || (model.searchResult?.corpus.hasCompleteTexts == false && model.storeLockState == .unlocked) else {
       cancelSearchRefresh()
       return
     }
@@ -1161,7 +1049,8 @@ final class HistoryContentViewController: NSViewController {
 
     guard model.searchResult?.terms != terms
             || model.searchResult?.revision != model.sortedListRevision
-            || model.searchResult?.locale != Locale.current else {
+            || model.searchResult?.locale != Locale.current
+            || (model.searchResult?.corpus.hasCompleteTexts == false && model.storeLockState == .unlocked) else {
       searchRefreshJob?.cancel()
       searchRefreshJob = nil
       return
@@ -1176,10 +1065,10 @@ final class HistoryContentViewController: NSViewController {
     searchRefreshJob = job
 
     searchQueue.async { [weak self] in
-      let corpus = Self.resolveSearchCorpus(
+      let corpus = HistorySearchCorpus.resolve(
         descriptor,
         previousCorpus: previousResult?.corpus,
-        coordinator: coordinator,
+        fetchSearchTexts: coordinator.fetchSearchTexts,
         isCancelled: { job.isCancelled }
       )
       let result = corpus.flatMap { resolvedCorpus in
@@ -1216,26 +1105,34 @@ final class HistoryContentViewController: NSViewController {
 
     setLastCompletedSearchResult(result)
     model.installSearchResult(result)
+    reloadList(schedulesSearchRefresh: false)
   }
 
-  private func applySearchQuery(_ query: String, shouldResetSelection: Bool = false) {
+  private func applySearchQuery(
+    _ query: String,
+    shouldResetSelection: Bool = false,
+    reloadsListSeparately: Bool = false
+  ) {
     if HistorySearchTerms(query: query).isEmpty {
       setLastCompletedSearchResult(nil)
     }
     guard model.searchQuery != query else {
-      updateToolbarState()
       if shouldResetSelection {
-        selectFirstHistoryItem()
+        selectFirstHistoryItem(syncsList: !reloadsListSeparately)
+      }
+      if !reloadsListSeparately {
+        updateToolbarState()
       }
       return
     }
 
     let changesTerms = HistorySearchTerms(query: model.searchQuery) != HistorySearchTerms(query: query)
+    let syncsImmediately = !changesTerms && !reloadsListSeparately
     model.searchQuery = query
     if shouldResetSelection {
-      selectFirstHistoryItem(syncsList: !changesTerms)
+      selectFirstHistoryItem(syncsList: syncsImmediately)
     }
-    if !changesTerms {
+    if syncsImmediately {
       updateToolbarState()
     }
   }
@@ -2677,6 +2574,46 @@ final class HistoryContentViewController: NSViewController {
     isSensitiveContentMasked(in: item) || SensitiveContent.shouldEncryptAtRest(item)
   }
 
+  private func evictRenderedMediaCaches(for item: ClipboardItem) {
+    SVGImageRenderer.shared.removeRendering(for: item.id)
+    if let assetPath = item.assetPath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: assetPath)
+    }
+    if let imagePath = item.linkPreviewDetails?.imagePath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: imagePath)
+    }
+    if let faviconPath = item.linkPreviewDetails?.faviconPath {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: faviconPath)
+    }
+    for filePath in item.filePaths where ClipboardItem.isImageFile(at: filePath) {
+      ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: filePath)
+    }
+  }
+
+  private func evictRenderedMediaCaches(forItemIDs ids: Set<UUID>) {
+    guard !ids.isEmpty else {
+      return
+    }
+    for id in ids {
+      SVGImageRenderer.shared.removeRendering(for: id)
+    }
+    for item in model.items where ids.contains(item.id) {
+      evictRenderedMediaCaches(for: item)
+    }
+    for item in model.trashedItems where ids.contains(item.id) {
+      evictRenderedMediaCaches(for: item)
+    }
+    for item in listPaneView.items where ids.contains(item.id) {
+      evictRenderedMediaCaches(for: item)
+    }
+    if let paneItem = previewPaneController?.item, ids.contains(paneItem.id) {
+      evictRenderedMediaCaches(for: paneItem)
+    }
+    if let sheetItem = previewSheetController?.item, ids.contains(sheetItem.id) {
+      evictRenderedMediaCaches(for: sheetItem)
+    }
+  }
+
   // An item with content to hide, marked by the user or found by the app, becomes one
   // the user wants shown, and any other item becomes one the user wants hidden.
   private func toggleSensitive(_ item: ClipboardItem) {
@@ -2685,7 +2622,18 @@ final class HistoryContentViewController: NSViewController {
     }
 
     let isSensitive = !canMarkAsNotSensitive(item)
+    let wasRevealed = listPaneView.revealsSensitiveContent(of: item)
     listPaneView.setRevealsSensitiveContent(false, of: item)
+    if wasRevealed {
+      if let previewPaneController, previewPaneController.item.id == item.id {
+        previewPaneController.update(item: previewPaneController.item, revealsSensitiveContent: false)
+      }
+      if let previewSheetController, previewSheetWindow != nil,
+         previewSheetController.item.id == item.id {
+        previewSheetController.update(item: previewSheetController.item, revealsSensitiveContent: false)
+      }
+      evictRenderedMediaCaches(for: item)
+    }
     coordinator.setSensitive(isSensitive, for: item)
   }
 
@@ -2696,6 +2644,12 @@ final class HistoryContentViewController: NSViewController {
 
     let reveals = !listPaneView.revealsSensitiveContent(of: item)
     listPaneView.setRevealsSensitiveContent(reveals, of: item)
+    if !reveals {
+      if let previewPaneController, previewPaneController.item.id == item.id {
+        previewPaneController.update(item: previewPaneController.item, revealsSensitiveContent: false)
+      }
+      evictRenderedMediaCaches(for: item)
+    }
     setNeedsPreviewPaneUpdate()
 
     guard let previewSheetController, previewSheetWindow != nil,
@@ -2703,6 +2657,9 @@ final class HistoryContentViewController: NSViewController {
       return
     }
     previewSheetController.update(item: previewSheetController.item, revealsSensitiveContent: reveals)
+    if !reveals {
+      evictRenderedMediaCaches(for: previewSheetController.item)
+    }
   }
 
   @objc func applyTransformMenuItem(_ sender: NSMenuItem) {
@@ -4244,13 +4201,6 @@ extension HistoryContentViewController: HistoryToolbarDelegate {
     shortcut: String?,
     section: Int
   ) -> [CommandPaletteCommand] {
-    guard item.kind.canHoldSensitiveContent
-            || item.kind == .image
-            || item.kind == .file
-            || item.kind == .color else {
-      return []
-    }
-
     var commands: [CommandPaletteCommand] = []
     if isSensitiveContentMasked(in: item) {
       let hidesContent = hidesSensitiveContent(of: item)

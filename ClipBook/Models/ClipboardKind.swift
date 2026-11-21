@@ -1,7 +1,4 @@
 import Foundation
-import AppKit
-import Carbon
-import Combine
 
 nonisolated enum ClipboardKind: String, Codable, CaseIterable, Identifiable, Hashable, Sendable {
     case text

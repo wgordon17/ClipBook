@@ -1,7 +1,6 @@
 import CryptoKit
 import Darwin
 import Foundation
-import ImageIO
 import Security
 
 nonisolated struct ClipBookArchiveImportResult: Equatable, Sendable {
@@ -148,13 +147,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         case throwCorruptedArchive
     }
 
-    private struct ExportEncryptionContext {
-        let archiveID: UUID
-        let keys: ClipBookArchiveDerivedKeys
-        let manifestDigest: Data
-    }
-
-    private struct ImportEncryptionContext {
+    private struct ArchiveEncryptionContext {
         let archiveID: UUID
         let keys: ClipBookArchiveDerivedKeys
         let manifestDigest: Data
@@ -202,12 +195,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
             throw ClipBookArchiveError.corruptedEncryptedArchive("manifest.json")
         }
 
-        let nfcPassphrase = passphrase.precomposedStringWithCanonicalMapping
-        guard !nfcPassphrase.isEmpty else {
-            throw ClipBookArchiveError.emptyPassphrase
-        }
-
-        _ = try validateAndDeriveArchiveKeys(encryption: encryption, nfcPassphrase: nfcPassphrase)
+        _ = try validateAndDeriveArchiveKeys(encryption: encryption, passphrase: passphrase)
     }
 
     func export(
@@ -269,7 +257,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
 
         let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
         let exportedAt = Date()
-        let encryptionContext: ExportEncryptionContext?
+        let encryptionContext: ArchiveEncryptionContext?
         if let pendingEncryption {
             let verifier = HistoryCrypto.makeArchiveKeyVerifier(
                 verifierKey: pendingEncryption.keys.verifierHMACKey,
@@ -291,7 +279,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
             let rawManifestBytes = try encoder.encode(manifest)
             try Self.writePrivateFile(rawManifestBytes, to: stagedArchiveURL.appendingPathComponent("manifest.json", isDirectory: false))
             let manifestDigest = Data(SHA256.hash(data: rawManifestBytes))
-            encryptionContext = ExportEncryptionContext(
+            encryptionContext = ArchiveEncryptionContext(
                 archiveID: pendingEncryption.archiveID,
                 keys: pendingEncryption.keys,
                 manifestDigest: manifestDigest
@@ -355,7 +343,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
             )
             try Self.writePrivateFile(
                 sealedHistory,
-                to: stagedArchiveURL.appendingPathComponent("history.json.enc", isDirectory: false)
+                to: stagedArchiveURL.appendingPathComponent("history.json.enc", isDirectory: false),
+                sync: true
             )
         } else {
             let manifest = ClipBookArchiveManifest(
@@ -375,7 +364,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
             )
             try Self.writePrivateFile(
                 try encoder.encode(archiveItems),
-                to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false)
+                to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false),
+                sync: true
             )
         }
 
@@ -394,51 +384,16 @@ nonisolated final class ClipBookArchiveService: Sendable {
         let (manifest, rawManifestBytes) = try readValidatedManifest(at: archiveURL)
         let archiveTags: [ClipBookArchiveTag]
         let archiveItems: [ClipBookArchiveItem]
-        let encryptionContext: ImportEncryptionContext?
+        let encryptionContext: ArchiveEncryptionContext?
 
         if manifest.formatVersion == Self.encryptedFormatVersion {
             guard let encryption = manifest.encryption else {
                 throw ClipBookArchiveError.corruptedEncryptedArchive("manifest.json")
             }
 
-            // Validate KDF/algorithm/salt/verifier metadata before inspecting passphrase.
-            let salt = try validateEncryptionParameters(encryption)
-            guard let verifier = Data(base64Encoded: encryption.keyVerifierBase64),
-                  verifier.count == SHA256.byteCount else {
-                throw ClipBookArchiveError.corruptedEncryptedArchive("manifest.json")
-            }
-
-            guard let passphrase else {
-                throw ClipBookArchiveError.passphraseRequired
-            }
-            let nfcPassphrase = passphrase.precomposedStringWithCanonicalMapping
-            guard !nfcPassphrase.isEmpty else {
-                throw ClipBookArchiveError.emptyPassphrase
-            }
-
-            let archiveKeys: ClipBookArchiveDerivedKeys
-            do {
-                archiveKeys = try HistoryCrypto.deriveArchiveKeys(
-                    passphrase: nfcPassphrase,
-                    salt: salt,
-                    iterations: encryption.iterations,
-                    archiveID: encryption.archiveID,
-                    allowTestIterations: allowTestIterations
-                )
-            } catch HistoryStoreError.invalidArchiveKeyParameters {
-                throw ClipBookArchiveError.invalidKeyParameters
-            }
-
-            guard HistoryCrypto.verifyArchiveKeyVerifier(
-                verifier,
-                verifierKey: archiveKeys.verifierHMACKey,
-                archiveID: encryption.archiveID
-            ) else {
-                throw ClipBookArchiveError.incorrectPassphrase
-            }
-
+            let archiveKeys = try validateAndDeriveArchiveKeys(encryption: encryption, passphrase: passphrase)
             let manifestDigest = Data(SHA256.hash(data: rawManifestBytes))
-            let context = ImportEncryptionContext(
+            let context = ArchiveEncryptionContext(
                 archiveID: encryption.archiveID,
                 keys: archiveKeys,
                 manifestDigest: manifestDigest
@@ -497,7 +452,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         )
         try Self.createPrivateDirectory(at: rollbackDirectory)
         defer {
-            try? fileManager.removeItem(at: rollbackDirectory)
+            Self.secureRemoveDirectoryTree(at: rollbackDirectory)
         }
 
         let existingImagesByStem = Self.indexExistingFilesByLowercaseStem(
@@ -562,10 +517,6 @@ nonisolated final class ClipBookArchiveService: Sendable {
             throw error
         }
 
-        for backedUp in backedUpFiles {
-            ImageAssetStore.secureUnlink(at: backedUp.backupURL)
-        }
-
         return ClipBookArchiveImportResult(itemIDs: importedItemIDs, tagCount: archiveTags.count)
     }
 
@@ -576,7 +527,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         tagNamesByID: [Tag.ID: String],
         imagesDirectory: URL,
         linkPreviewsDirectory: URL,
-        encryptionContext: ExportEncryptionContext?,
+        encryptionContext: ArchiveEncryptionContext?,
         expectedAssets: inout [String: String],
         usedPlainFileNames: inout Set<String>
     ) throws -> ClipBookArchiveItem {
@@ -676,7 +627,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         defaultStem: String,
         destinationDirectory: URL,
         archiveSubdirectory: String,
-        encryptionContext: ExportEncryptionContext?,
+        encryptionContext: ArchiveEncryptionContext?,
         expectedAssets: inout [String: String],
         usedPlainFileNames: inout Set<String>
     ) throws -> ExportedAssetReference? {
@@ -732,11 +683,11 @@ nonisolated final class ClipBookArchiveService: Sendable {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
 
-        let canonicalSupportDir = Self.canonicalDirectoryURL(supportDirectory)
+        let canonicalSupportDir = ImageAssetStore.canonicalDirectoryURL(supportDirectory)
         let canonicalExpectedParent = canonicalSupportDir
             .appendingPathComponent(expectedSubdirName, isDirectory: true)
             .standardizedFileURL
-        let canonicalActualParent = Self.canonicalDirectoryURL(sourceParentURL)
+        let canonicalActualParent = ImageAssetStore.canonicalDirectoryURL(sourceParentURL)
         guard canonicalActualParent == canonicalExpectedParent else {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
@@ -800,7 +751,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         from archiveItem: ClipBookArchiveItem,
         archiveURL: URL,
         historyStore: any HistoryStore,
-        encryptionContext: ImportEncryptionContext?,
+        encryptionContext: ArchiveEncryptionContext?,
         tagIDsByArchiveID: [String: Tag.ID],
         tagNamesByID: [Tag.ID: String],
         rollbackDirectory: URL,
@@ -859,7 +810,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
             )
         }
 
-        let imageDimensions = (kind == .image) ? imagePayload.flatMap { Self.pixelDimensions(of: $0.bytes) } : nil
+        let imageDimensions = (kind == .image) ? imagePayload.flatMap { ClipboardItem.pixelDimensions(of: $0.bytes) } : nil
         let imageDigest = (kind == .image) ? imagePayload.map { historyStore.computeImageDigest(forPNGData: $0.bytes) } : nil
 
         let provisionalCandidate = ClipboardItem(
@@ -1017,7 +968,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         relativePath: String?,
         preferredExtension: String?,
         in archiveURL: URL,
-        encryptionContext: ImportEncryptionContext?
+        encryptionContext: ArchiveEncryptionContext?
     ) throws -> ImportedAssetPayload? {
         guard let relativePath, !relativePath.isEmpty else {
             return nil
@@ -1164,12 +1115,20 @@ nonisolated final class ClipBookArchiveService: Sendable {
 
     private func validateAndDeriveArchiveKeys(
         encryption: ClipBookArchiveEncryptionMetadata,
-        nfcPassphrase: String
+        passphrase: String?
     ) throws -> ClipBookArchiveDerivedKeys {
         let salt = try validateEncryptionParameters(encryption)
         guard let verifier = Data(base64Encoded: encryption.keyVerifierBase64),
               verifier.count == SHA256.byteCount else {
             throw ClipBookArchiveError.corruptedEncryptedArchive("manifest.json")
+        }
+
+        guard let passphrase else {
+            throw ClipBookArchiveError.passphraseRequired
+        }
+        let nfcPassphrase = passphrase.precomposedStringWithCanonicalMapping
+        guard !nfcPassphrase.isEmpty else {
+            throw ClipBookArchiveError.emptyPassphrase
         }
 
         let archiveKeys: ClipBookArchiveDerivedKeys
@@ -1199,7 +1158,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
         _ type: T.Type,
         in archiveURL: URL,
         relativePath: String,
-        context: ImportEncryptionContext,
+        context: ArchiveEncryptionContext,
         decoder: JSONDecoder
     ) throws -> T {
         guard let fileURL = try validateContainedRegularFile(
@@ -1396,15 +1355,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
         _ = Darwin.chmod(url.path, mode_t(0o700))
     }
 
-    private static func writePrivateFile(_ data: Data, to destinationURL: URL) throws {
-        let directoryURL = destinationURL.deletingLastPathComponent()
-        let tempURL = directoryURL.appendingPathComponent(
-            ".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)",
-            isDirectory: false
-        )
-        let tempPath = tempURL.path
-
-        let fd = Darwin.open(tempPath, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+    private static func writePrivateFile(_ data: Data, to destinationURL: URL, sync: Bool = false) throws {
+        let fd = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
@@ -1427,22 +1379,21 @@ nonisolated final class ClipBookArchiveService: Sendable {
                 }
             }
 
-            if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
-                _ = Darwin.fsync(fd)
+            if sync {
+                if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+                    _ = Darwin.fsync(fd)
+                }
             }
 
             fdOpen = false
             guard Darwin.close(fd) == 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            guard Darwin.rename(tempPath, destinationURL.path) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
         } catch {
             if fdOpen {
                 _ = Darwin.close(fd)
             }
-            ImageAssetStore.secureUnlink(at: tempURL)
+            ImageAssetStore.secureUnlink(at: destinationURL)
             throw error
         }
     }
@@ -1585,19 +1536,6 @@ nonisolated final class ClipBookArchiveService: Sendable {
         return hex.utf8.allSatisfy { ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }
     }
 
-    private static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
-        let standardized = directoryURL.standardizedFileURL
-        if standardized.path == "/" || standardized.path.isEmpty {
-            return standardized
-        }
-        var st = stat()
-        if stat(standardized.path, &st) == 0 {
-            return standardized.resolvingSymlinksInPath().standardizedFileURL
-        }
-        let parent = canonicalDirectoryURL(standardized.deletingLastPathComponent())
-        return parent.appendingPathComponent(standardized.lastPathComponent, isDirectory: true).standardizedFileURL
-    }
-
     private static func indexExistingFilesByLowercaseStem(in directoryURL: URL) -> [String: [URL]] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: directoryURL,
@@ -1615,17 +1553,5 @@ nonisolated final class ClipBookArchiveService: Sendable {
             }
         }
         return map
-    }
-
-    private static func pixelDimensions(of imageData: Data) -> (width: Int, height: Int)? {
-        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int,
-              width > 0,
-              height > 0 else {
-            return nil
-        }
-        return (width, height)
     }
 }

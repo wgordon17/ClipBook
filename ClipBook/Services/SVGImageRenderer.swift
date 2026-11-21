@@ -81,8 +81,23 @@ final class SVGImageRenderer: @unchecked Sendable {
 
   private struct PendingRender {
     let id: UInt64
-    let startEpoch: UInt64
+    let startGlobalEpoch: UInt64
+    let startClipEpoch: UInt64
     var callbacks: [(Rendering?) -> Void]
+  }
+
+  private nonisolated struct CacheState: Sendable {
+    var globalEpoch: UInt64 = 0
+    var clipEpochs: [UUID: UInt64] = [:]
+    var ownerEpochs: [UUID: UInt64] = [:]
+    var keysByClipID: [UUID: Set<String>] = [:]
+    var keysByOwnerID: [UUID: Set<String>] = [:]
+    var metaByKey: [String: (clipID: UUID, ownerID: UUID?)] = [:]
+  }
+
+  private nonisolated struct RegisteredLoader: Sendable {
+    let loadText: @Sendable (UUID) -> String?
+    let ownsClip: @Sendable (UUID) -> Bool
   }
 
   nonisolated(unsafe) private let cache: NSCache<NSString, CacheEntry> = {
@@ -90,9 +105,9 @@ final class SVGImageRenderer: @unchecked Sendable {
     cache.countLimit = 200
     return cache
   }()
-  private nonisolated let evictionEpoch = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+  private nonisolated let cacheState = OSAllocatedUnfairLock<CacheState>(initialState: CacheState())
   private nonisolated static let loaders = OSAllocatedUnfairLock(
-    initialState: [UUID: @Sendable (UUID) -> String?]()
+    initialState: [UUID: RegisteredLoader]()
   )
   // One document at a time: drawing SVG is quick once AppKit is set up, and
   // the rows ask for only the few in view.
@@ -101,30 +116,163 @@ final class SVGImageRenderer: @unchecked Sendable {
   private var pendingCompletions: [String: PendingRender] = [:]
 
   nonisolated func removeAll() {
-    evictionEpoch.withLock { $0 &+= 1 }
-    cache.removeAllObjects()
+    cacheState.withLock { state in
+      state.globalEpoch &+= 1
+      state.clipEpochs.removeAll()
+      state.ownerEpochs.removeAll()
+      state.keysByClipID.removeAll()
+      state.keysByOwnerID.removeAll()
+      state.metaByKey.removeAll()
+      cache.removeAllObjects()
+    }
+  }
+
+  nonisolated func removeRendering(for clipID: UUID) {
+    cacheState.withLock { state in
+      state.clipEpochs[clipID, default: 0] &+= 1
+      if state.clipEpochs.count > 16_384 {
+        state.globalEpoch &+= 1
+        state.clipEpochs.removeAll(keepingCapacity: false)
+      }
+      guard let keys = state.keysByClipID.removeValue(forKey: clipID) else {
+        return
+      }
+      for key in keys {
+        if let meta = state.metaByKey.removeValue(forKey: key),
+           let ownerID = meta.ownerID,
+           var ownerKeys = state.keysByOwnerID[ownerID] {
+          ownerKeys.remove(key)
+          if ownerKeys.isEmpty {
+            state.keysByOwnerID.removeValue(forKey: ownerID)
+          } else {
+            state.keysByOwnerID[ownerID] = ownerKeys
+          }
+        }
+        cache.removeObject(forKey: key as NSString)
+      }
+    }
+  }
+
+  nonisolated func removeRenderings(forOwner ownerID: UUID) {
+    cacheState.withLock { state in
+      state.ownerEpochs[ownerID, default: 0] &+= 1
+      if state.ownerEpochs.count > 4_096 {
+        state.globalEpoch &+= 1
+        state.ownerEpochs.removeAll(keepingCapacity: false)
+      }
+      guard let keys = state.keysByOwnerID.removeValue(forKey: ownerID) else {
+        return
+      }
+      for key in keys {
+        if let meta = state.metaByKey.removeValue(forKey: key),
+           var clipKeys = state.keysByClipID[meta.clipID] {
+          clipKeys.remove(key)
+          if clipKeys.isEmpty {
+            state.keysByClipID.removeValue(forKey: meta.clipID)
+          } else {
+            state.keysByClipID[meta.clipID] = clipKeys
+          }
+        }
+        cache.removeObject(forKey: key as NSString)
+      }
+    }
+  }
+
+  nonisolated func hasCachedRendering(for clipID: UUID) -> Bool {
+    cacheState.withLock { state in
+      guard let keys = state.keysByClipID[clipID] else {
+        return false
+      }
+      return keys.contains { cache.object(forKey: $0 as NSString)?.rendering != nil }
+    }
+  }
+
+  nonisolated func hasCachedOwnerAssociation(for clipID: UUID) -> Bool {
+    cacheState.withLock { state in
+      guard let keys = state.keysByClipID[clipID] else {
+        return false
+      }
+      return keys.contains { key in
+        guard let ownerID = state.metaByKey[key]?.ownerID else {
+          return false
+        }
+        return state.keysByOwnerID[ownerID]?.contains(key) == true
+          && cache.object(forKey: key as NSString)?.rendering != nil
+      }
+    }
   }
 
   nonisolated static func registerTextLoader(
     _ loader: @escaping @Sendable (UUID) -> String?,
+    ownsClip: @escaping @Sendable (UUID) -> Bool = { _ in false },
     ownerID: UUID
   ) {
-    loaders.withLock { $0[ownerID] = loader }
+    loaders.withLock {
+      $0[ownerID] = RegisteredLoader(loadText: loader, ownsClip: ownsClip)
+    }
   }
 
   nonisolated static func unregisterTextLoader(ownerID: UUID) {
     loaders.withLock { _ = $0.removeValue(forKey: ownerID) }
-    shared.removeAll()
+    shared.removeRenderings(forOwner: ownerID)
   }
 
-  private nonisolated static func loadRegisteredSVGText(for id: UUID) -> String? {
-    let activeLoaders = loaders.withLock { Array($0.values) }
-    for loader in activeLoaders {
-      if let text = loader(id) {
-        return text
+  private nonisolated static func loadRegisteredSVGText(for id: UUID) -> (text: String, ownerID: UUID)? {
+    let activeLoaders = loaders.withLock { Array($0) }
+    for (ownerID, entry) in activeLoaders {
+      if let text = entry.loadText(id) {
+        return (text, ownerID)
       }
     }
     return nil
+  }
+
+  private nonisolated static func resolveOwnerID(for id: UUID) -> UUID? {
+    let activeLoaders = loaders.withLock { Array($0) }
+    for (ownerID, entry) in activeLoaders {
+      if entry.ownsClip(id) {
+        return ownerID
+      }
+    }
+    return nil
+  }
+
+  private nonisolated func cachedEntry(forKey key: String) -> CacheEntry? {
+    cacheState.withLock { _ in
+      cache.object(forKey: key as NSString)
+    }
+  }
+
+  private nonisolated func cacheRenderingIfCurrent(
+    _ rendering: Rendering?,
+    forKey key: String,
+    clipID: UUID,
+    ownerID: UUID?,
+    startGlobalEpoch: UInt64,
+    startClipEpoch: UInt64,
+    startOwnerEpoch: UInt64?,
+    didObtainText: Bool
+  ) -> Bool {
+    cacheState.withLock { state in
+      guard state.globalEpoch == startGlobalEpoch,
+            (state.clipEpochs[clipID] ?? 0) == startClipEpoch else {
+        return false
+      }
+      if let ownerID,
+         let startOwnerEpoch,
+         (state.ownerEpochs[ownerID] ?? 0) != startOwnerEpoch {
+        return false
+      }
+      if didObtainText {
+        state.keysByClipID[clipID, default: []].insert(key)
+        if let ownerID {
+          state.keysByOwnerID[ownerID, default: []].insert(key)
+        }
+        state.metaByKey[key] = (clipID: clipID, ownerID: ownerID)
+        cache.setObject(CacheEntry(rendering), forKey: key as NSString)
+      }
+      return true
+    }
   }
 
   /// The picture the item's text describes, or nil when the text is not an SVG
@@ -136,22 +284,42 @@ final class SVGImageRenderer: @unchecked Sendable {
       return nil
     }
 
-    if let entry = cache.object(forKey: key as NSString) {
+    if let entry = cachedEntry(forKey: key) {
       return entry.rendering
     }
 
-    let startEpoch = evictionEpoch.withLock { $0 }
-    let inlineText = item.isContentLoaded ? item.text : nil
-    guard let text = inlineText ?? Self.loadRegisteredSVGText(for: item.id) else {
+    let itemID = item.id
+    let (startGlobalEpoch, startClipEpoch, ownerEpochsSnapshot) = cacheState.withLock {
+      ($0.globalEpoch, $0.clipEpochs[itemID] ?? 0, $0.ownerEpochs)
+    }
+    let resolvedText: String
+    let resolvedOwnerID: UUID?
+    let startOwnerEpoch: UInt64?
+    if item.isContentLoaded, let inlineText = item.text {
+      resolvedText = inlineText
+      let ownerID = Self.resolveOwnerID(for: itemID)
+      resolvedOwnerID = ownerID
+      startOwnerEpoch = ownerID.map { ownerEpochsSnapshot[$0] ?? 0 }
+    } else if let loaded = Self.loadRegisteredSVGText(for: itemID) {
+      resolvedText = loaded.text
+      resolvedOwnerID = loaded.ownerID
+      startOwnerEpoch = ownerEpochsSnapshot[loaded.ownerID] ?? 0
+    } else {
       return nil
     }
 
-    let rendering = Self.render(text)
-    guard evictionEpoch.withLock({ $0 == startEpoch }) else {
-      return nil
-    }
-    cache.setObject(CacheEntry(rendering), forKey: key as NSString)
-    return rendering
+    let rendering = Self.render(resolvedText)
+    let didCache = cacheRenderingIfCurrent(
+      rendering,
+      forKey: key,
+      clipID: itemID,
+      ownerID: resolvedOwnerID,
+      startGlobalEpoch: startGlobalEpoch,
+      startClipEpoch: startClipEpoch,
+      startOwnerEpoch: startOwnerEpoch,
+      didObtainText: true
+    )
+    return didCache ? rendering : nil
   }
 
   /// Returns the picture the item's text describes when it is already drawn.
@@ -163,13 +331,16 @@ final class SVGImageRenderer: @unchecked Sendable {
       return nil
     }
 
-    if let entry = cache.object(forKey: key as NSString) {
+    if let entry = cachedEntry(forKey: key) {
       return entry.rendering
     }
 
-    let startEpoch = evictionEpoch.withLock { $0 }
+    let itemID = item.id
+    let (startGlobalEpoch, startClipEpoch) = cacheState.withLock {
+      ($0.globalEpoch, $0.clipEpochs[itemID] ?? 0)
+    }
     if var existing = pendingCompletions[key] {
-      if existing.startEpoch == startEpoch {
+      if existing.startGlobalEpoch == startGlobalEpoch && existing.startClipEpoch == startClipEpoch {
         existing.callbacks.append(completion)
         pendingCompletions[key] = existing
         return nil
@@ -184,15 +355,22 @@ final class SVGImageRenderer: @unchecked Sendable {
 
     nextRenderID &+= 1
     let renderID = nextRenderID
-    let itemID = item.id
     let inlineText = item.isContentLoaded ? item.text : nil
     pendingCompletions[key] = PendingRender(
       id: renderID,
-      startEpoch: startEpoch,
+      startGlobalEpoch: startGlobalEpoch,
+      startClipEpoch: startClipEpoch,
       callbacks: [completion]
     )
     renderQueue.async {
-      guard self.evictionEpoch.withLock({ $0 == startEpoch }) else {
+      let preRenderSnapshot = self.cacheState.withLock { state -> [UUID: UInt64]? in
+        guard state.globalEpoch == startGlobalEpoch,
+              (state.clipEpochs[itemID] ?? 0) == startClipEpoch else {
+          return nil
+        }
+        return state.ownerEpochs
+      }
+      guard let ownerEpochsSnapshot = preRenderSnapshot else {
         DispatchQueue.main.async {
           MainActor.assumeIsolated {
             if self.pendingCompletions[key]?.id == renderID {
@@ -203,15 +381,37 @@ final class SVGImageRenderer: @unchecked Sendable {
         }
         return
       }
-      let resolvedText = inlineText ?? Self.loadRegisteredSVGText(for: itemID)
+      let resolvedText: String?
+      let resolvedOwnerID: UUID?
+      let startOwnerEpoch: UInt64?
+      if let inlineText {
+        resolvedText = inlineText
+        let ownerID = Self.resolveOwnerID(for: itemID)
+        resolvedOwnerID = ownerID
+        startOwnerEpoch = ownerID.map { ownerEpochsSnapshot[$0] ?? 0 }
+      } else if let loaded = Self.loadRegisteredSVGText(for: itemID) {
+        resolvedText = loaded.text
+        resolvedOwnerID = loaded.ownerID
+        startOwnerEpoch = ownerEpochsSnapshot[loaded.ownerID] ?? 0
+      } else {
+        resolvedText = nil
+        resolvedOwnerID = nil
+        startOwnerEpoch = nil
+      }
       let rendering = resolvedText.flatMap(Self.render)
       let didObtainText = resolvedText != nil
       DispatchQueue.main.async {
         MainActor.assumeIsolated {
-          let isCurrentEpoch = self.evictionEpoch.withLock { $0 == startEpoch }
-          if isCurrentEpoch, didObtainText {
-            self.cache.setObject(CacheEntry(rendering), forKey: key as NSString)
-          }
+          let isCurrentEpoch = self.cacheRenderingIfCurrent(
+            rendering,
+            forKey: key,
+            clipID: itemID,
+            ownerID: resolvedOwnerID,
+            startGlobalEpoch: startGlobalEpoch,
+            startClipEpoch: startClipEpoch,
+            startOwnerEpoch: startOwnerEpoch,
+            didObtainText: didObtainText
+          )
           let callbacks: [(Rendering?) -> Void]
           if self.pendingCompletions[key]?.id == renderID {
             callbacks = self.pendingCompletions.removeValue(forKey: key)?.callbacks ?? []

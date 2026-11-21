@@ -94,6 +94,7 @@ private final class ImageAssetDataProvider: NSObject, NSPasteboardItemDataProvid
 nonisolated enum ImageDragFiles {
   private static let maximumAge: TimeInterval = 60 * 60
   private static let lock = NSLock()
+  nonisolated(unsafe) private static var folderURLsBySupportDirPath: [String: Set<String>] = [:]
 
   static var directory: URL {
     FileManager.default.temporaryDirectory.appendingPathComponent("Dragged Images", isDirectory: true)
@@ -120,6 +121,10 @@ nonisolated enum ImageDragFiles {
     guard !safeLeaf.isEmpty else {
       return nil
     }
+
+    let supportDirPath = ImageAssetStore.canonicalDirectoryURL(
+      assetURL.deletingLastPathComponent().deletingLastPathComponent()
+    ).path
 
     lock.lock()
     defer { lock.unlock() }
@@ -165,6 +170,7 @@ nonisolated enum ImageDragFiles {
       guard Darwin.close(fd) == 0 else {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
       }
+      folderURLsBySupportDirPath[supportDirPath, default: []].insert(folder.path)
       return url
     } catch {
       if fdOpen {
@@ -182,6 +188,7 @@ nonisolated enum ImageDragFiles {
     let root = directory
     var st = stat()
     guard Darwin.lstat(root.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else {
+      folderURLsBySupportDirPath.removeAll()
       return
     }
 
@@ -193,13 +200,46 @@ nonisolated enum ImageDragFiles {
       return
     }
 
+    var survivingFolderPaths = Set<String>()
     let cutoff = now.addingTimeInterval(-maximumAge)
     for entry in entries {
       let values = try? entry.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
       let timestamp = values?.creationDate ?? values?.contentModificationDate
       if let timestamp, timestamp < cutoff {
         scrubAndRemoveLocked(at: entry)
+      } else {
+        survivingFolderPaths.insert(entry.path)
       }
+    }
+    pruneTrackedFoldersLocked(keepingOnly: survivingFolderPaths)
+  }
+
+  static func removeCopies(forSupportDirectory directoryURL: URL) {
+    let supportDirPath = ImageAssetStore.canonicalDirectoryURL(directoryURL).path
+
+    lock.lock()
+    defer { lock.unlock() }
+
+    guard let folderPaths = folderURLsBySupportDirPath.removeValue(forKey: supportDirPath),
+          !folderPaths.isEmpty else {
+      return
+    }
+
+    for folderPath in folderPaths {
+      scrubAndRemoveLocked(at: URL(fileURLWithPath: folderPath, isDirectory: true))
+    }
+
+    let root = directory
+    var st = stat()
+    if Darwin.lstat(root.path, &st) == 0,
+       (st.st_mode & S_IFMT) == S_IFDIR,
+       let remaining = try? FileManager.default.contentsOfDirectory(
+         at: root,
+         includingPropertiesForKeys: nil,
+         options: []
+       ),
+       remaining.isEmpty {
+      _ = Darwin.rmdir(root.path)
     }
   }
 
@@ -207,12 +247,27 @@ nonisolated enum ImageDragFiles {
     lock.lock()
     defer { lock.unlock() }
 
+    folderURLsBySupportDirPath.removeAll()
     let root = directory
     var st = stat()
     guard Darwin.lstat(root.path, &st) == 0 else {
       return
     }
     scrubAndRemoveLocked(at: root)
+  }
+
+  private static func pruneTrackedFoldersLocked(keepingOnly survivingPaths: Set<String>) {
+    guard !folderURLsBySupportDirPath.isEmpty else {
+      return
+    }
+    var updated: [String: Set<String>] = [:]
+    for (supportDirPath, folders) in folderURLsBySupportDirPath {
+      let remaining = folders.intersection(survivingPaths)
+      if !remaining.isEmpty {
+        updated[supportDirPath] = remaining
+      }
+    }
+    folderURLsBySupportDirPath = updated
   }
 
   private static func ensureHardenedRootDirectoryLocked() -> URL? {

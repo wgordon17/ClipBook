@@ -1171,8 +1171,101 @@ enum PasteboardAndServicesTests {
                 #expect(fixture.pasteboard.string(forType: PasteboardMonitor.ghostType) == "1")
             }
         }
-    }
 
+        @Test
+        @MainActor
+        func copyAndMergeIntoLinkClearsPreviewDetailsAndScrubsManagedLinkPreviewFiles() async throws {
+            let previewPNG = try TestSupport.makePNGData(pixelWidth: 40, pixelHeight: 24, color: .systemTeal)
+            let faviconPNG = try TestSupport.makePNGData(pixelWidth: 16, pixelHeight: 16, color: .systemOrange)
+
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                    $0.copyAndMergeSeparator = CopyAndMergeSeparatorPreference.space.rawValue
+                    $0.copyToClipboardAfterMerge = true
+                }
+            ) { fixture in
+                let linkID = UUID()
+                let previewURL = try fixture.store.writeManagedAsset(
+                    pngData: previewPNG,
+                    role: .linkPreview,
+                    clipID: linkID,
+                    encrypted: false
+                )
+                let faviconURL = try fixture.store.writeManagedAsset(
+                    pngData: faviconPNG,
+                    role: .linkFavicon,
+                    clipID: linkID,
+                    encrypted: false
+                )
+                #expect(previewURL.lastPathComponent == "\(linkID.uuidString)-preview.png")
+                #expect(faviconURL.lastPathComponent == "\(linkID.uuidString)-favicon.png")
+                #expect(FileManager.default.fileExists(atPath: previewURL.path))
+                #expect(FileManager.default.fileExists(atPath: faviconURL.path))
+
+                let previewFD = Darwin.open(previewURL.path, O_RDONLY)
+                let faviconFD = Darwin.open(faviconURL.path, O_RDONLY)
+                #expect(previewFD >= 0)
+                #expect(faviconFD >= 0)
+                defer {
+                    if previewFD >= 0 { Darwin.close(previewFD) }
+                    if faviconFD >= 0 { Darwin.close(faviconFD) }
+                }
+
+                let seededLink = try fixture.store.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        id: linkID,
+                        kind: .link,
+                        text: "https://example.com/article",
+                        copiedAt: fixture.clock.current,
+                        linkPreviewDetails: LinkPreviewDetails(
+                            url: "https://example.com/article",
+                            title: "Example Article",
+                            description: "Summary preview",
+                            imagePath: previewURL.path,
+                            faviconPath: faviconURL.path,
+                            fetchedAt: fixture.clock.current
+                        )
+                    ),
+                    convertingExternalAssets: true
+                )
+                #expect(seededLink.linkPreviewDetails?.imagePath == previewURL.path)
+                #expect(seededLink.linkPreviewDetails?.faviconPath == faviconURL.path)
+
+                // Double-copy text within the 0.5s hold window so Copy & Merge folds into the seeded link item.
+                fixture.clock.advance(by: 1)
+                await fixture.deliver(.text("extra note"), changeCount: 1)
+                fixture.clock.advance(by: 0.1)
+                await fixture.deliver(.text("extra note"), changeCount: 2)
+
+                let merged = try #require(fixture.delegate.capturedHistory.last?.item)
+                #expect(merged.id == linkID)
+                #expect(merged.kind == .text)
+                #expect(merged.linkPreviewDetails == nil)
+                let hydratedMerged = try fixture.store.loadingContent(of: merged, scope: .body)
+                #expect(hydratedMerged.text == "https://example.com/article extra note")
+
+                let storedMerged = try #require(try fixture.store.fetchAll().first { $0.id == linkID })
+                #expect(storedMerged.linkPreviewDetails == nil)
+
+                #expect(!FileManager.default.fileExists(atPath: previewURL.path))
+                #expect(!FileManager.default.fileExists(atPath: faviconURL.path))
+
+                var scrubbedPreviewHeader = [UInt8](repeating: 0xFF, count: 16)
+                let readPreview = Darwin.pread(previewFD, &scrubbedPreviewHeader, scrubbedPreviewHeader.count, 0)
+                #expect(readPreview == scrubbedPreviewHeader.count)
+                #expect(scrubbedPreviewHeader.allSatisfy { $0 == 0 })
+
+                var scrubbedFaviconHeader = [UInt8](repeating: 0xFF, count: 16)
+                let readFavicon = Darwin.pread(faviconFD, &scrubbedFaviconHeader, scrubbedFaviconHeader.count, 0)
+                #expect(readFavicon == scrubbedFaviconHeader.count)
+                #expect(scrubbedFaviconHeader.allSatisfy { $0 == 0 })
+            }
+        }
+    }
+}
+
+extension SharedProcessStateTests {
     @Suite(.serialized)
     struct EncryptedAssetReadersAndDragTests {
         @Test

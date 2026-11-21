@@ -1,8 +1,5 @@
 import Foundation
-import SwiftUI
 import AppKit
-import Carbon
-import Combine
 
 enum HistoryItemActionPreference: String, Codable, CaseIterable, Identifiable {
     case paste

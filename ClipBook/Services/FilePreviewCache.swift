@@ -178,6 +178,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     }
 
     let canonicalPaths = Set(filePaths.map(Self.canonicalPath))
+    var urlsToScrub: [URL] = []
     pendingLock.withLock {
       for path in canonicalPaths {
         pathEpochs[path, default: 0] &+= 1
@@ -189,11 +190,14 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         imageFileCache.removeValue(forKey: rawPath)
       }
       compactPathEpochsIfNeeded()
-      removeCacheEntriesLocked { metadata in
+      stageCacheEntriesForScrubLocked(into: &urlsToScrub) { metadata in
         canonicalPaths.contains(metadata.sourcePath)
           || canonicalPaths.contains(Self.canonicalPath(metadata.sourcePath))
           || filePaths.contains(metadata.sourcePath)
       }
+    }
+    for scrubURL in urlsToScrub {
+      ImageAssetStore.secureUnlink(at: scrubURL)
     }
   }
 
@@ -221,6 +225,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
 
     let rawKeptPaths = makeFilePaths()
     let canonicalKeptPaths = Set(rawKeptPaths.map(Self.canonicalPath))
+    var urlsToScrub: [URL] = []
 
     pendingLock.withLock {
       for (_, entry) in inFlightByKey where !canonicalKeptPaths.contains(entry.canonicalPath) {
@@ -238,12 +243,16 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         return
       }
 
-      removeCacheEntriesLocked(in: entryURLs) { metadata in
+      for entryURL in entryURLs where entryURL.lastPathComponent.hasPrefix(".scrubbing-") {
+        urlsToScrub.append(entryURL)
+      }
+
+      stageCacheEntriesForScrubLocked(in: entryURLs, into: &urlsToScrub) { metadata in
         let canonicalMeta = Self.canonicalPath(metadata.sourcePath)
         return !canonicalKeptPaths.contains(canonicalMeta) && !rawKeptPaths.contains(metadata.sourcePath)
       }
 
-      // Scrub any orphaned .png files lacking a matching .json metadata entry.
+      // Stage any orphaned .png files lacking a matching .json metadata entry.
       if let remainingURLs = try? fileManager.contentsOfDirectory(
         at: directory,
         includingPropertiesForKeys: nil,
@@ -257,15 +266,20 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         for url in remainingURLs where url.pathExtension.lowercased() == "png" {
           let key = url.deletingPathExtension().lastPathComponent
           if !jsonKeys.contains(key) {
-            ImageAssetStore.secureUnlink(at: url)
+            stageForScrubLocked(url, into: &urlsToScrub)
             imageCache.removeObject(forKey: key as NSString)
           }
         }
       }
     }
+
+    for scrubURL in urlsToScrub {
+      ImageAssetStore.secureUnlink(at: scrubURL)
+    }
   }
 
   func removeAll() {
+    var urlsToScrub: [URL] = []
     pendingLock.withLock {
       globalEpoch &+= 1
       pathEpochs.removeAll()
@@ -279,11 +293,14 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         options: []
       ) {
         for entry in entries {
-          ImageAssetStore.secureUnlink(at: entry)
+          stageForScrubLocked(entry, into: &urlsToScrub)
         }
       }
-      try? fileManager.removeItem(at: directory)
     }
+    for scrubURL in urlsToScrub {
+      ImageAssetStore.secureUnlink(at: scrubURL)
+    }
+    _ = Darwin.rmdir(directory.path)
   }
 
   private func cachedImage(canonicalFilePath: String, targetSize: CGSize, key: String) -> NSImage? {
@@ -398,6 +415,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         let tempMetadata = try Self.stageTempFile0600(metadataData, for: targetMetadataURL, in: self.directory)
         stagedMetadataURL = tempMetadata
 
+        var failedPersistImageURL: URL? = nil
         let didPersist: Bool = self.pendingLock.withLock {
           guard self.globalEpoch == startGlobalEpoch,
                 (self.pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
@@ -408,7 +426,12 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
           }
           stagedImageURL = nil
           guard Darwin.rename(tempMetadata.path, targetMetadataURL.path) == 0 else {
-            ImageAssetStore.secureUnlink(at: targetImageURL)
+            let scrubURL = self.directory.appendingPathComponent(".scrubbing-\(UUID().uuidString)", isDirectory: false)
+            if Darwin.rename(targetImageURL.path, scrubURL.path) == 0 {
+              failedPersistImageURL = scrubURL
+            } else {
+              failedPersistImageURL = targetImageURL
+            }
             return false
           }
           stagedMetadataURL = nil
@@ -416,6 +439,9 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
           return true
         }
 
+        if let failedPersistImageURL {
+          ImageAssetStore.secureUnlink(at: failedPersistImageURL)
+        }
         if !didPersist {
           cleanupStagedFiles()
           return
@@ -555,26 +581,11 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     if stat(url.path, &st) == 0 {
       return url.resolvingSymlinksInPath().standardizedFileURL.path
     }
-    let parent = canonicalDirectoryURL(url.deletingLastPathComponent())
+    let parent = ImageAssetStore.canonicalDirectoryURL(url.deletingLastPathComponent())
     return parent
       .appendingPathComponent(url.lastPathComponent, isDirectory: false)
       .standardizedFileURL
       .path
-  }
-
-  private static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
-    let standardized = directoryURL.standardizedFileURL
-    if standardized.path == "/" || standardized.path.isEmpty {
-      return standardized
-    }
-    var st = stat()
-    if stat(standardized.path, &st) == 0 {
-      return standardized.resolvingSymlinksInPath().standardizedFileURL
-    }
-    let parent = canonicalDirectoryURL(standardized.deletingLastPathComponent())
-    return parent
-      .appendingPathComponent(standardized.lastPathComponent, isDirectory: true)
-      .standardizedFileURL
   }
 
   private func cacheKey(canonicalFilePath: String, targetSize: CGSize) -> String {
@@ -603,7 +614,27 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     return try? decoder.decode(Metadata.self, from: data)
   }
 
-  private func removeCacheEntriesLocked(where shouldRemove: (Metadata) -> Bool) {
+  private func stageForScrubLocked(_ url: URL, into urlsToScrub: inout [URL]) {
+    if url.lastPathComponent.hasPrefix(".scrubbing-") {
+      urlsToScrub.append(url)
+      return
+    }
+    var st = stat()
+    guard Darwin.lstat(url.path, &st) == 0 else {
+      return
+    }
+    let scrubURL = directory.appendingPathComponent(".scrubbing-\(UUID().uuidString)", isDirectory: false)
+    if Darwin.rename(url.path, scrubURL.path) == 0 {
+      urlsToScrub.append(scrubURL)
+    } else {
+      urlsToScrub.append(url)
+    }
+  }
+
+  private func stageCacheEntriesForScrubLocked(
+    into urlsToScrub: inout [URL],
+    where shouldRemove: (Metadata) -> Bool
+  ) {
     guard let metadataURLs = try? fileManager.contentsOfDirectory(
       at: directory,
       includingPropertiesForKeys: nil,
@@ -612,10 +643,14 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       return
     }
 
-    removeCacheEntriesLocked(in: metadataURLs, where: shouldRemove)
+    stageCacheEntriesForScrubLocked(in: metadataURLs, into: &urlsToScrub, where: shouldRemove)
   }
 
-  private func removeCacheEntriesLocked(in metadataURLs: [URL], where shouldRemove: (Metadata) -> Bool) {
+  private func stageCacheEntriesForScrubLocked(
+    in metadataURLs: [URL],
+    into urlsToScrub: inout [URL],
+    where shouldRemove: (Metadata) -> Bool
+  ) {
     for metadataURL in metadataURLs where metadataURL.pathExtension == "json" {
       guard let data = try? Data(contentsOf: metadataURL),
             let metadata = try? decoder.decode(Metadata.self, from: data),
@@ -626,8 +661,8 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       let canonicalMetaPath = Self.canonicalPath(metadata.sourcePath)
       pathEpochs[canonicalMetaPath, default: 0] &+= 1
       let key = metadataURL.deletingPathExtension().lastPathComponent
-      ImageAssetStore.secureUnlink(at: metadataURL)
-      ImageAssetStore.secureUnlink(at: imageURL(forKey: key))
+      stageForScrubLocked(metadataURL, into: &urlsToScrub)
+      stageForScrubLocked(imageURL(forKey: key), into: &urlsToScrub)
       imageCache.removeObject(forKey: key as NSString)
       displaySizeCache.removeValue(forKey: metadata.sourcePath)
       displaySizeCache.removeValue(forKey: canonicalMetaPath)

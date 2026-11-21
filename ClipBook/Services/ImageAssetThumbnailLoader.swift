@@ -179,6 +179,19 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     }
   }
 
+  func hasCachedThumbnails(forPath path: String) -> Bool {
+    guard !path.isEmpty else {
+      return false
+    }
+    let normalizedPath = Self.normalizedFilePath(path)
+    return lock.withLock {
+      guard let keys = cachedKeysByPath[normalizedPath] else {
+        return false
+      }
+      return keys.contains { cache.object(forKey: $0 as NSString) != nil }
+    }
+  }
+
   func removeThumbnails(forPath path: String) {
     guard !path.isEmpty else {
       return
@@ -197,7 +210,7 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
   }
 
   func removeThumbnails(inDirectory directoryURL: URL) {
-    let normalizedDirPath = Self.normalizedDirectoryPath(directoryURL)
+    let normalizedDirPath = ImageAssetStore.canonicalDirectoryURL(directoryURL).path
     guard !normalizedDirPath.isEmpty else {
       return
     }
@@ -287,30 +300,11 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     if stat(url.path, &st) == 0 {
       return url.resolvingSymlinksInPath().standardizedFileURL.path
     }
-    let parentDir = canonicalDirectoryURL(url.deletingLastPathComponent())
+    let parentDir = ImageAssetStore.canonicalDirectoryURL(url.deletingLastPathComponent())
     return parentDir
       .appendingPathComponent(url.lastPathComponent, isDirectory: false)
       .standardizedFileURL
       .path
-  }
-
-  private static func normalizedDirectoryPath(_ directoryURL: URL) -> String {
-    canonicalDirectoryURL(directoryURL).path
-  }
-
-  private static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
-    let standardized = directoryURL.standardizedFileURL
-    if standardized.path == "/" || standardized.path.isEmpty {
-      return standardized
-    }
-    var st = stat()
-    if stat(standardized.path, &st) == 0 {
-      return standardized.resolvingSymlinksInPath().standardizedFileURL
-    }
-    let parent = canonicalDirectoryURL(standardized.deletingLastPathComponent())
-    return parent
-      .appendingPathComponent(standardized.lastPathComponent, isDirectory: true)
-      .standardizedFileURL
   }
 
   private static func decodeThumbnail(

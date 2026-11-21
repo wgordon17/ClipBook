@@ -613,8 +613,7 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let keyProvider = InMemoryDatabaseKeyProvider()
                 let store = GRDBHistoryStore(
                     directory: directory,
-                    keyProvider: keyProvider,
-                    loadsBodiesOnFetchAll: false
+                    keyProvider: keyProvider
                 )
                 defer { store.close() }
 
@@ -1689,6 +1688,766 @@ enum SQLiteHistoryStoreAndArchiveTests {
                     #expect(Set(try mismatchStore.fetchAll().map(\.id)) == [textClipID, encImageID])
                     #expect(try Data(contentsOf: encAssetURL) == encBytesBaseline)
                 }
+            }
+        }
+
+        @Test
+        func startupMigrationCutoverAndPostCommitDualAssetCrashRecovery() throws {
+            try TestSupport.withTemporaryDirectory { rootDir in
+                let fileManager = FileManager.default
+
+                func makeLegacyV4MainAndWALSnapshots(
+                    mainID: UUID,
+                    mainText: String,
+                    walID: UUID,
+                    walText: String
+                ) throws -> (dbBytes: Data, walBytes: Data) {
+                    let scratchDir = rootDir.appendingPathComponent("Scratch-\(UUID().uuidString)", isDirectory: true)
+                    try fileManager.createDirectory(at: scratchDir, withIntermediateDirectories: true)
+                    defer { try? fileManager.removeItem(at: scratchDir) }
+
+                    let scratchDB = scratchDir.appendingPathComponent("History.sqlite")
+                    let scratchWAL = scratchDir.appendingPathComponent("History.sqlite-wal")
+                    var dbSnapshot = Data()
+                    var walSnapshot = Data()
+
+                    try Self.withDatabase(at: scratchDB) { db in
+                        func exec(_ sql: String) throws {
+                            guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+                                throw HistoryStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                            }
+                        }
+
+                        func insertV4TextClip(id: UUID, text: String, copiedAt: Double) throws {
+                            let payloadObj: [String: Any] = [
+                                "id": id.uuidString,
+                                "kind": ClipboardKind.text.rawValue,
+                                "text": text,
+                                "filePaths": [String](),
+                                "sourceAppName": "LegacyApp",
+                                "copiedAt": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: copiedAt)),
+                                "byteSize": text.utf8.count,
+                                "isFavorite": false,
+                                "tags": [Int](),
+                                "searchText": text,
+                                "copyCount": 1,
+                            ]
+                            let payloadData = try JSONSerialization.data(withJSONObject: payloadObj, options: [.sortedKeys])
+                            try exec("""
+                                INSERT INTO clips (id, kind, copiedAt, favorite, sourceApp, searchText, contentKey, payload, html, rtf, deletedAt, expiresAt)
+                                VALUES ('\(id.uuidString)', 'text', \(copiedAt), 0, 'LegacyApp', '\(text)', '', \(Self.sqlHex(payloadData)), NULL, NULL, NULL, NULL);
+                                """)
+                        }
+
+                        try exec("""
+                            PRAGMA auto_vacuum = NONE;
+                            PRAGMA secure_delete = OFF;
+                            PRAGMA journal_mode = WAL;
+                            PRAGMA synchronous = NORMAL;
+                            PRAGMA wal_autocheckpoint = 0;
+                            CREATE TABLE tags (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                                color TEXT NOT NULL
+                            );
+                            CREATE TABLE clips (
+                                id TEXT PRIMARY KEY,
+                                kind TEXT NOT NULL,
+                                copiedAt REAL NOT NULL,
+                                favorite INTEGER NOT NULL,
+                                sourceApp TEXT,
+                                searchText TEXT NOT NULL,
+                                contentKey TEXT NOT NULL DEFAULT '',
+                                payload BLOB NOT NULL,
+                                html TEXT,
+                                rtf BLOB,
+                                deletedAt REAL,
+                                expiresAt REAL
+                            );
+                            PRAGMA user_version = 4;
+                            """)
+
+                        try insertV4TextClip(id: mainID, text: mainText, copiedAt: 1_700_000_100)
+                        try exec("PRAGMA wal_checkpoint(TRUNCATE);")
+                        try insertV4TextClip(id: walID, text: walText, copiedAt: 1_700_000_200)
+
+                        dbSnapshot = try Data(contentsOf: scratchDB)
+                        walSnapshot = try Data(contentsOf: scratchWAL)
+                    }
+
+                    #expect(dbSnapshot.range(of: Data(walText.utf8)) == nil)
+                    #expect(walSnapshot.range(of: Data(walText.utf8)) != nil)
+                    return (dbSnapshot, walSnapshot)
+                }
+
+                // Case A: Incomplete History.v5.migrating.sqlite (user_version = 0) + History.sqlite.scrubbing + History.sqlite-wal.scrubbing with History.sqlite absent.
+                let dirA = rootDir.appendingPathComponent("CaseA", isDirectory: true)
+                try fileManager.createDirectory(at: dirA, withIntermediateDirectories: true)
+                let dbURLA = dirA.appendingPathComponent("History.sqlite")
+                let migratingURLA = dirA.appendingPathComponent("History.v5.migrating.sqlite")
+                let scrubbingDBA = dirA.appendingPathComponent("History.sqlite.scrubbing")
+                let scrubbingWALA = dirA.appendingPathComponent("History.sqlite-wal.scrubbing")
+
+                let mainIDA = UUID()
+                let walIDA = UUID()
+                let snapshotsA = try makeLegacyV4MainAndWALSnapshots(
+                    mainID: mainIDA,
+                    mainText: "RecoveredLegacyMainRowA",
+                    walID: walIDA,
+                    walText: "RecoveredLegacyWALRowA"
+                )
+                try snapshotsA.dbBytes.write(to: scrubbingDBA, options: .atomic)
+                try snapshotsA.walBytes.write(to: scrubbingWALA, options: .atomic)
+                try Self.executeSQL(
+                    at: migratingURLA,
+                    """
+                    CREATE TABLE store_metadata (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL);
+                    PRAGMA user_version = 0;
+                    """
+                )
+                #expect(!fileManager.fileExists(atPath: dbURLA.path))
+                #expect(try Self.queryInt(at: migratingURLA, "PRAGMA user_version;") == 0)
+
+                do {
+                    let storeA = GRDBHistoryStore(directory: dirA, keyProvider: InMemoryDatabaseKeyProvider())
+                    defer { storeA.close() }
+                    #expect(storeA.lockState == .unlocked)
+                    let itemsA = try storeA.fetchAll()
+                    #expect(Set(itemsA.map(\.id)) == [mainIDA, walIDA])
+                    let hydratedTextsA = Set(try itemsA.compactMap { try storeA.loadingContent(of: $0, scope: .body).text })
+                    #expect(hydratedTextsA == ["RecoveredLegacyMainRowA", "RecoveredLegacyWALRowA"])
+                    #expect(try Self.inspectDatabaseState(at: dbURLA).schemaVersion == 5)
+
+                    for fileURL in try Self.allRegularFilesRecursively(in: dirA) {
+                        let name = fileURL.lastPathComponent
+                        #expect(!name.contains(".migrating"))
+                        #expect(!name.hasSuffix(".scrubbing"))
+                    }
+                }
+
+                // Case B: Completed v5 History.v5.migrating.sqlite (matching key_verifier_v1) + History.sqlite.scrubbing with secret canary and History.sqlite absent.
+                let seedDirB = rootDir.appendingPathComponent("SeedB", isDirectory: true)
+                let dirB = rootDir.appendingPathComponent("CaseB", isDirectory: true)
+                try fileManager.createDirectory(at: seedDirB, withIntermediateDirectories: true)
+                try fileManager.createDirectory(at: dirB, withIntermediateDirectories: true)
+
+                let masterKeyB = SymmetricKey(size: .bits256)
+                let keyProviderB = InMemoryDatabaseKeyProvider(key: masterKeyB)
+                let promotedClipID = UUID()
+                do {
+                    let seedStoreB = GRDBHistoryStore(directory: seedDirB, keyProvider: keyProviderB)
+                    try seedStoreB.upsert(
+                        ClipboardItem.fixture(
+                            id: promotedClipID,
+                            kind: .text,
+                            text: "PromotedCompletedV5Clip",
+                            copiedAt: Date(timeIntervalSince1970: 1_700_000_300)
+                        )
+                    )
+                    seedStoreB.close()
+                }
+
+                let seedDBURLB = seedDirB.appendingPathComponent("History.sqlite")
+                try Self.executeSQL(at: seedDBURLB, "PRAGMA journal_mode = DELETE;")
+
+                let dbURLB = dirB.appendingPathComponent("History.sqlite")
+                let migratingURLB = dirB.appendingPathComponent("History.v5.migrating.sqlite")
+                let scrubbingDBB = dirB.appendingPathComponent("History.sqlite.scrubbing")
+                try fileManager.copyItem(
+                    at: seedDBURLB,
+                    to: migratingURLB
+                )
+                #expect(!fileManager.fileExists(atPath: dbURLB.path))
+                #expect(try Self.queryInt(at: migratingURLB, "PRAGMA user_version;") == 5)
+
+                let secretCanaryB = ["sk", "-proj-", "CANARY_CUTOVER_B_", "8473625190abcdef"].joined()
+                let scrubbingPayloadB = Data(repeating: 0x42, count: 128) + Data(secretCanaryB.utf8) + Data(repeating: 0x24, count: 128)
+                try scrubbingPayloadB.write(to: scrubbingDBB, options: .atomic)
+                let scrubbingFDB = Darwin.open(scrubbingDBB.path, O_RDONLY)
+                #expect(scrubbingFDB >= 0)
+                defer {
+                    if scrubbingFDB >= 0 { Darwin.close(scrubbingFDB) }
+                }
+
+                do {
+                    let storeB = GRDBHistoryStore(directory: dirB, keyProvider: keyProviderB)
+                    defer { storeB.close() }
+                    #expect(storeB.lockState == .unlocked)
+                    #expect(fileManager.fileExists(atPath: dbURLB.path))
+                    #expect(!fileManager.fileExists(atPath: migratingURLB.path))
+                    #expect(!fileManager.fileExists(atPath: scrubbingDBB.path))
+
+                    let itemsB = try storeB.fetchAll()
+                    #expect(itemsB.map(\.id) == [promotedClipID])
+                    #expect(try storeB.loadingContent(of: try #require(itemsB.first), scope: .body).text == "PromotedCompletedV5Clip")
+
+                    var zeroedBytesB = [UInt8](repeating: 0xFF, count: scrubbingPayloadB.count)
+                    let readScrubbedB = Darwin.pread(scrubbingFDB, &zeroedBytesB, zeroedBytesB.count, 0)
+                    #expect(readScrubbedB == zeroedBytesB.count)
+                    #expect(zeroedBytesB.allSatisfy { $0 == 0 })
+
+                    for fileURL in try Self.allRegularFilesRecursively(in: dirB) {
+                        let name = fileURL.lastPathComponent
+                        #expect(!name.contains(".migrating"))
+                        #expect(!name.hasSuffix(".scrubbing"))
+                        let rawBytes = try Data(contentsOf: fileURL)
+                        for (encodingLabel, needle) in Self.canaryBytePatterns(for: secretCanaryB) {
+                            #expect(
+                                rawBytes.range(of: needle) == nil,
+                                "Found canary (\(encodingLabel)) in \(fileURL.path)"
+                            )
+                        }
+                    }
+                }
+
+                // Case C: Hardlinked History.sqlite == History.sqlite.scrubbing (same inode) + History.sqlite-wal.scrubbing.
+                let dirC = rootDir.appendingPathComponent("CaseC", isDirectory: true)
+                try fileManager.createDirectory(at: dirC, withIntermediateDirectories: true)
+                let dbURLC = dirC.appendingPathComponent("History.sqlite")
+                let walURLC = dirC.appendingPathComponent("History.sqlite-wal")
+                let scrubbingDBC = dirC.appendingPathComponent("History.sqlite.scrubbing")
+                let scrubbingWALC = dirC.appendingPathComponent("History.sqlite-wal.scrubbing")
+
+                let mainIDC = UUID()
+                let walIDC = UUID()
+                let snapshotsC = try makeLegacyV4MainAndWALSnapshots(
+                    mainID: mainIDC,
+                    mainText: "HardlinkedMainRowC",
+                    walID: walIDC,
+                    walText: "HardlinkedWALRowC"
+                )
+                try snapshotsC.dbBytes.write(to: dbURLC, options: .atomic)
+                #expect(Darwin.link(dbURLC.path, scrubbingDBC.path) == 0)
+                try snapshotsC.walBytes.write(to: scrubbingWALC, options: .atomic)
+
+                var dbStatC = stat()
+                var scrubStatC = stat()
+                #expect(Darwin.lstat(dbURLC.path, &dbStatC) == 0)
+                #expect(Darwin.lstat(scrubbingDBC.path, &scrubStatC) == 0)
+                #expect(dbStatC.st_ino == scrubStatC.st_ino)
+                #expect(!fileManager.fileExists(atPath: walURLC.path))
+
+                do {
+                    let storeC = GRDBHistoryStore(directory: dirC, keyProvider: InMemoryDatabaseKeyProvider())
+                    defer { storeC.close() }
+                    #expect(storeC.lockState == .unlocked)
+                    let itemsC = try storeC.fetchAll()
+                    #expect(Set(itemsC.map(\.id)) == [mainIDC, walIDC])
+                    let hydratedTextsC = Set(try itemsC.compactMap { try storeC.loadingContent(of: $0, scope: .body).text })
+                    #expect(hydratedTextsC == ["HardlinkedMainRowC", "HardlinkedWALRowC"])
+                    #expect(try Self.inspectDatabaseState(at: dbURLC).schemaVersion == 5)
+                    #expect(!fileManager.fileExists(atPath: scrubbingDBC.path))
+                    #expect(!fileManager.fileExists(atPath: scrubbingWALC.path))
+                }
+
+                // Case D: Coexisting .png + .enc in Images/ and LinkPreviews/ for encrypted (isEncrypted == 1) and plain (isEncrypted == 0) clips.
+                let dirD = rootDir.appendingPathComponent("CaseD", isDirectory: true)
+                try fileManager.createDirectory(at: dirD, withIntermediateDirectories: true)
+                let dbURLD = dirD.appendingPathComponent("History.sqlite")
+                let imagesDirD = dirD.appendingPathComponent("Images", isDirectory: true)
+                let linkPreviewsDirD = dirD.appendingPathComponent("LinkPreviews", isDirectory: true)
+
+                let masterKeyD = SymmetricKey(size: .bits256)
+                let keyProviderD = InMemoryDatabaseKeyProvider(key: masterKeyD)
+                let encImgID = UUID()
+                let encLinkID = UUID()
+                let plainImgID = UUID()
+                let plainLinkID = UUID()
+
+                let encImgPNG = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemRed)
+                let encPreviewPNG = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 20, color: .systemPink)
+                let plainImgPNG = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20, color: .systemGreen)
+                let plainPreviewPNG = try TestSupport.makePNGData(pixelWidth: 28, pixelHeight: 18, color: .systemBlue)
+
+                do {
+                    let seedStoreD = GRDBHistoryStore(directory: dirD, keyProvider: keyProviderD)
+                    let encImgURL = try seedStoreD.writeManagedAsset(pngData: encImgPNG, role: .image, clipID: encImgID, encrypted: true)
+                    let encPreviewURL = try seedStoreD.writeManagedAsset(pngData: encPreviewPNG, role: .linkPreview, clipID: encLinkID, encrypted: true)
+                    let plainImgURL = try seedStoreD.writeManagedAsset(pngData: plainImgPNG, role: .image, clipID: plainImgID, encrypted: false)
+                    let plainPreviewURL = try seedStoreD.writeManagedAsset(pngData: plainPreviewPNG, role: .linkPreview, clipID: plainLinkID, encrypted: false)
+
+                    _ = try seedStoreD.saveAndReconcileItem(
+                        ClipboardItem.fixture(
+                            id: encImgID,
+                            kind: .image,
+                            assetPath: encImgURL.path,
+                            imageDigest: "enc-img-d",
+                            copiedAt: Date(timeIntervalSince1970: 1_700_000_400),
+                            sensitivity: .sensitive
+                        ),
+                        convertingExternalAssets: true
+                    )
+                    _ = try seedStoreD.saveAndReconcileItem(
+                        ClipboardItem.fixture(
+                            id: encLinkID,
+                            kind: .link,
+                            text: "https://internal.example.com/secret",
+                            copiedAt: Date(timeIntervalSince1970: 1_700_000_410),
+                            linkPreviewDetails: LinkPreviewDetails(
+                                url: "https://internal.example.com/secret",
+                                title: "Internal Card",
+                                description: nil,
+                                imagePath: encPreviewURL.path,
+                                faviconPath: nil,
+                                fetchedAt: Date(timeIntervalSince1970: 1_700_000_410)
+                            ),
+                            sensitivity: .sensitive
+                        ),
+                        convertingExternalAssets: true
+                    )
+                    _ = try seedStoreD.saveAndReconcileItem(
+                        ClipboardItem.fixture(
+                            id: plainImgID,
+                            kind: .image,
+                            assetPath: plainImgURL.path,
+                            imageDigest: "plain-img-d",
+                            copiedAt: Date(timeIntervalSince1970: 1_700_000_420),
+                            sensitivity: nil
+                        ),
+                        convertingExternalAssets: true
+                    )
+                    _ = try seedStoreD.saveAndReconcileItem(
+                        ClipboardItem.fixture(
+                            id: plainLinkID,
+                            kind: .link,
+                            text: "https://public.example.com/post",
+                            copiedAt: Date(timeIntervalSince1970: 1_700_000_430),
+                            linkPreviewDetails: LinkPreviewDetails(
+                                url: "https://public.example.com/post",
+                                title: "Public Post",
+                                description: nil,
+                                imagePath: plainPreviewURL.path,
+                                faviconPath: nil,
+                                fetchedAt: Date(timeIntervalSince1970: 1_700_000_430)
+                            ),
+                            sensitivity: nil
+                        ),
+                        convertingExternalAssets: true
+                    )
+
+                    _ = try seedStoreD.writeManagedAsset(pngData: plainImgPNG, role: .image, clipID: plainImgID, encrypted: true)
+                    _ = try seedStoreD.writeManagedAsset(pngData: plainPreviewPNG, role: .linkPreview, clipID: plainLinkID, encrypted: true)
+                    seedStoreD.close()
+                }
+
+                #expect(try Self.queryInt(at: dbURLD, "SELECT isEncrypted FROM clips WHERE id = '\(encImgID.uuidString)';") == 1)
+                #expect(try Self.queryInt(at: dbURLD, "SELECT isEncrypted FROM clips WHERE id = '\(encLinkID.uuidString)';") == 1)
+                #expect(try Self.queryInt(at: dbURLD, "SELECT isEncrypted FROM clips WHERE id = '\(plainImgID.uuidString)';") == 0)
+                #expect(try Self.queryInt(at: dbURLD, "SELECT isEncrypted FROM clips WHERE id = '\(plainLinkID.uuidString)';") == 0)
+
+                let keptEncImgURL = imagesDirD.appendingPathComponent("\(encImgID.uuidString).enc")
+                let orphanPlainForEncImgURL = imagesDirD.appendingPathComponent("\(encImgID.uuidString).png")
+                let keptEncPreviewURL = linkPreviewsDirD.appendingPathComponent("\(encLinkID.uuidString)-preview.enc")
+                let orphanPlainForEncPreviewURL = linkPreviewsDirD.appendingPathComponent("\(encLinkID.uuidString)-preview.png")
+
+                let keptPlainImgURL = imagesDirD.appendingPathComponent("\(plainImgID.uuidString).png")
+                let orphanEncForPlainImgURL = imagesDirD.appendingPathComponent("\(plainImgID.uuidString).enc")
+                let keptPlainPreviewURL = linkPreviewsDirD.appendingPathComponent("\(plainLinkID.uuidString)-preview.png")
+                let orphanEncForPlainPreviewURL = linkPreviewsDirD.appendingPathComponent("\(plainLinkID.uuidString)-preview.enc")
+
+                try encImgPNG.write(to: orphanPlainForEncImgURL, options: .atomic)
+                try encPreviewPNG.write(to: orphanPlainForEncPreviewURL, options: .atomic)
+
+                for url in [
+                    keptEncImgURL, orphanPlainForEncImgURL,
+                    keptEncPreviewURL, orphanPlainForEncPreviewURL,
+                    keptPlainImgURL, orphanEncForPlainImgURL,
+                    keptPlainPreviewURL, orphanEncForPlainPreviewURL,
+                ] {
+                    #expect(fileManager.fileExists(atPath: url.path))
+                }
+
+                let orphanFDs = [
+                    orphanPlainForEncImgURL,
+                    orphanPlainForEncPreviewURL,
+                    orphanEncForPlainImgURL,
+                    orphanEncForPlainPreviewURL,
+                ].map { Darwin.open($0.path, O_RDONLY) }
+                #expect(orphanFDs.allSatisfy { $0 >= 0 })
+                defer {
+                    for fd in orphanFDs where fd >= 0 { Darwin.close(fd) }
+                }
+
+                do {
+                    let reopenedStoreD = GRDBHistoryStore(directory: dirD, keyProvider: keyProviderD)
+                    defer { reopenedStoreD.close() }
+                    #expect(reopenedStoreD.lockState == .unlocked)
+                    _ = try reopenedStoreD.fetchAll()
+
+                    #expect(fileManager.fileExists(atPath: keptEncImgURL.path))
+                    #expect(fileManager.fileExists(atPath: keptEncPreviewURL.path))
+                    #expect(fileManager.fileExists(atPath: keptPlainImgURL.path))
+                    #expect(fileManager.fileExists(atPath: keptPlainPreviewURL.path))
+                    #expect(try Data(contentsOf: keptPlainImgURL) == plainImgPNG)
+                    #expect(try Data(contentsOf: keptPlainPreviewURL) == plainPreviewPNG)
+                    #expect(
+                        try ImageAssetStore.readAssetData(
+                            at: keptEncImgURL,
+                            role: .image,
+                            ownerClipID: encImgID,
+                            requiresEncryption: true
+                        ) == encImgPNG
+                    )
+                    #expect(
+                        try ImageAssetStore.readAssetData(
+                            at: keptEncPreviewURL,
+                            role: .linkPreview,
+                            ownerClipID: encLinkID,
+                            requiresEncryption: true
+                        ) == encPreviewPNG
+                    )
+
+                    #expect(!fileManager.fileExists(atPath: orphanPlainForEncImgURL.path))
+                    #expect(!fileManager.fileExists(atPath: orphanPlainForEncPreviewURL.path))
+                    #expect(!fileManager.fileExists(atPath: orphanEncForPlainImgURL.path))
+                    #expect(!fileManager.fileExists(atPath: orphanEncForPlainPreviewURL.path))
+
+                    for fd in orphanFDs {
+                        var header = [UInt8](repeating: 0xFF, count: 16)
+                        let readCount = Darwin.pread(fd, &header, header.count, 0)
+                        #expect(readCount == header.count)
+                        #expect(header.allSatisfy { $0 == 0 })
+                    }
+                }
+            }
+        }
+
+        @Test
+        func saveAndReconcileItemScrubsClearedOrReplacedManagedAssetsOnCommitAndPreservesThemOnRollback() throws {
+            struct IntentionalAssetRollbackError: Error {}
+
+            try TestSupport.withTemporaryDirectory { rootDir in
+                let fileManager = FileManager.default
+                let supportDir = rootDir.appendingPathComponent("Support", isDirectory: true)
+                let externalDir = rootDir.appendingPathComponent("External", isDirectory: true)
+                try fileManager.createDirectory(at: supportDir, withIntermediateDirectories: true)
+                try fileManager.createDirectory(at: externalDir, withIntermediateDirectories: true)
+
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { store.close() }
+
+                let imgID = UUID()
+                let linkID = UUID()
+                let jpegHeaderBytes = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD])
+                let icoBytes = Data([0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+
+                let initialImgURL = try store.writeManagedAsset(
+                    pngData: jpegHeaderBytes,
+                    role: .image,
+                    clipID: imgID,
+                    encrypted: false,
+                    preferredPlainExtension: "jpg"
+                )
+                let initialPreviewURL = try store.writeManagedAsset(
+                    pngData: jpegHeaderBytes,
+                    role: .linkPreview,
+                    clipID: linkID,
+                    encrypted: false,
+                    preferredPlainExtension: "jpg"
+                )
+                let initialFaviconURL = try store.writeManagedAsset(
+                    pngData: icoBytes,
+                    role: .linkFavicon,
+                    clipID: linkID,
+                    encrypted: false,
+                    preferredPlainExtension: "ico"
+                )
+                #expect(initialImgURL.pathExtension == "jpg")
+                #expect(initialPreviewURL.pathExtension == "jpg")
+                #expect(initialFaviconURL.pathExtension == "ico")
+
+                let fetchedAt = Date(timeIntervalSince1970: 1_700_000_500)
+                var savedImg = try store.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        id: imgID,
+                        kind: .image,
+                        assetPath: initialImgURL.path,
+                        imageDigest: "img-jpg-digest",
+                        copiedAt: fetchedAt
+                    ),
+                    convertingExternalAssets: true
+                )
+                var savedLink = try store.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        id: linkID,
+                        kind: .link,
+                        text: "https://example.com/resource",
+                        copiedAt: fetchedAt.addingTimeInterval(10),
+                        linkPreviewDetails: LinkPreviewDetails(
+                            url: "https://example.com/resource",
+                            title: "Initial Resource",
+                            description: "Initial preview",
+                            imagePath: initialPreviewURL.path,
+                            faviconPath: initialFaviconURL.path,
+                            fetchedAt: fetchedAt
+                        )
+                    ),
+                    convertingExternalAssets: true
+                )
+
+                let extImgPNGBytes = try TestSupport.makePNGData(pixelWidth: 26, pixelHeight: 20, color: .systemBlue)
+                let extPreviewPNGBytes = try TestSupport.makePNGData(pixelWidth: 36, pixelHeight: 22, color: .systemCyan)
+                let extFaviconPNGBytes = try TestSupport.makePNGData(pixelWidth: 16, pixelHeight: 16, color: .systemMint)
+                let extImgURL = externalDir.appendingPathComponent("next-image.png")
+                let extPreviewURL = externalDir.appendingPathComponent("next-preview.png")
+                let extFaviconURL = externalDir.appendingPathComponent("next-favicon.png")
+                try extImgPNGBytes.write(to: extImgURL)
+                try extPreviewPNGBytes.write(to: extPreviewURL)
+                try extFaviconPNGBytes.write(to: extFaviconURL)
+
+                let managedImgPNGURL = supportDir.appendingPathComponent("Images/\(imgID.uuidString).png")
+                let managedPreviewPNGURL = supportDir.appendingPathComponent("LinkPreviews/\(linkID.uuidString)-preview.png")
+                let managedFaviconPNGURL = supportDir.appendingPathComponent("LinkPreviews/\(linkID.uuidString)-favicon.png")
+
+                #expect(throws: IntentionalAssetRollbackError.self) {
+                    try store.performInTransaction {
+                        var nextImg = savedImg
+                        nextImg.assetPath = extImgURL.path
+                        _ = try store.saveAndReconcileItem(nextImg, convertingExternalAssets: true)
+
+                        var nextLink = savedLink
+                        nextLink.linkPreviewDetails = LinkPreviewDetails(
+                            url: "https://example.com/resource",
+                            title: "Updated Resource",
+                            description: "Updated preview",
+                            imagePath: extPreviewURL.path,
+                            faviconPath: extFaviconURL.path,
+                            fetchedAt: fetchedAt
+                        )
+                        _ = try store.saveAndReconcileItem(nextLink, convertingExternalAssets: true)
+
+                        #expect(fileManager.fileExists(atPath: managedImgPNGURL.path))
+                        #expect(fileManager.fileExists(atPath: initialImgURL.path))
+                        throw IntentionalAssetRollbackError()
+                    }
+                }
+                #expect(!fileManager.fileExists(atPath: managedImgPNGURL.path))
+                #expect(!fileManager.fileExists(atPath: managedPreviewPNGURL.path))
+                #expect(!fileManager.fileExists(atPath: managedFaviconPNGURL.path))
+                #expect(try Data(contentsOf: initialImgURL) == jpegHeaderBytes)
+                #expect(try Data(contentsOf: initialPreviewURL) == jpegHeaderBytes)
+                #expect(try Data(contentsOf: initialFaviconURL) == icoBytes)
+                #expect(try Self.fetchItem(imgID, from: store).assetPath == initialImgURL.path)
+                #expect(try Self.fetchItem(linkID, from: store).linkPreviewDetails?.imagePath == initialPreviewURL.path)
+                #expect(try Self.fetchItem(linkID, from: store).linkPreviewDetails?.faviconPath == initialFaviconURL.path)
+
+                #expect(throws: IntentionalAssetRollbackError.self) {
+                    try store.performInTransaction {
+                        var clearingImg = savedImg
+                        clearingImg.assetPath = nil
+                        _ = try store.saveAndReconcileItem(clearingImg, convertingExternalAssets: true)
+
+                        var clearingLink = savedLink
+                        clearingLink.linkPreviewDetails = nil
+                        _ = try store.saveAndReconcileItem(clearingLink, convertingExternalAssets: true)
+
+                        throw IntentionalAssetRollbackError()
+                    }
+                }
+                #expect(try Data(contentsOf: initialImgURL) == jpegHeaderBytes)
+                #expect(try Data(contentsOf: initialPreviewURL) == jpegHeaderBytes)
+                #expect(try Data(contentsOf: initialFaviconURL) == icoBytes)
+                #expect(try Self.fetchItem(imgID, from: store).assetPath == initialImgURL.path)
+                #expect(try Self.fetchItem(linkID, from: store).linkPreviewDetails?.imagePath == initialPreviewURL.path)
+                #expect(try Self.fetchItem(linkID, from: store).linkPreviewDetails?.faviconPath == initialFaviconURL.path)
+
+                let initialFDs = [initialImgURL, initialPreviewURL, initialFaviconURL].map { Darwin.open($0.path, O_RDONLY) }
+                #expect(initialFDs.allSatisfy { $0 >= 0 })
+                defer {
+                    for fd in initialFDs where fd >= 0 { Darwin.close(fd) }
+                }
+
+                savedImg.assetPath = extImgURL.path
+                savedImg = try store.saveAndReconcileItem(savedImg, convertingExternalAssets: true)
+
+                savedLink.linkPreviewDetails = LinkPreviewDetails(
+                    url: "https://example.com/resource",
+                    title: "Updated Resource",
+                    description: "Updated preview",
+                    imagePath: extPreviewURL.path,
+                    faviconPath: extFaviconURL.path,
+                    fetchedAt: fetchedAt
+                )
+                savedLink = try store.saveAndReconcileItem(savedLink, convertingExternalAssets: true)
+
+                #expect(!fileManager.fileExists(atPath: initialImgURL.path))
+                #expect(!fileManager.fileExists(atPath: initialPreviewURL.path))
+                #expect(!fileManager.fileExists(atPath: initialFaviconURL.path))
+                #expect(try Data(contentsOf: managedImgPNGURL) == extImgPNGBytes)
+                #expect(try Data(contentsOf: managedPreviewPNGURL) == extPreviewPNGBytes)
+                #expect(try Data(contentsOf: managedFaviconPNGURL) == extFaviconPNGBytes)
+
+                for fd in initialFDs {
+                    var scrubbed = [UInt8](repeating: 0xFF, count: 16)
+                    let readCount = Darwin.pread(fd, &scrubbed, scrubbed.count, 0)
+                    #expect(readCount == scrubbed.count)
+                    #expect(scrubbed.allSatisfy { $0 == 0 })
+                }
+
+                let activePNGFDs = [managedImgPNGURL, managedPreviewPNGURL, managedFaviconPNGURL].map {
+                    Darwin.open($0.path, O_RDONLY)
+                }
+                #expect(activePNGFDs.allSatisfy { $0 >= 0 })
+                defer {
+                    for fd in activePNGFDs where fd >= 0 { Darwin.close(fd) }
+                }
+
+                var clearedImg = try store.loadingContent(of: savedImg, scope: .body)
+                clearedImg.assetPath = nil
+                _ = try store.saveAndReconcileItem(clearedImg, convertingExternalAssets: true)
+
+                var clearedLink = try store.loadingContent(of: savedLink, scope: .body)
+                clearedLink.linkPreviewDetails = nil
+                _ = try store.saveAndReconcileItem(clearedLink, convertingExternalAssets: true)
+
+                #expect(!fileManager.fileExists(atPath: managedImgPNGURL.path))
+                #expect(!fileManager.fileExists(atPath: managedPreviewPNGURL.path))
+                #expect(!fileManager.fileExists(atPath: managedFaviconPNGURL.path))
+                #expect(try Self.fetchItem(imgID, from: store).assetPath == nil)
+                #expect(try Self.fetchItem(linkID, from: store).linkPreviewDetails == nil)
+
+                for fd in activePNGFDs {
+                    var scrubbed = [UInt8](repeating: 0xFF, count: 16)
+                    let readCount = Darwin.pread(fd, &scrubbed, scrubbed.count, 0)
+                    #expect(readCount == scrubbed.count)
+                    #expect(scrubbed.allSatisfy { $0 == 0 })
+                }
+            }
+        }
+
+        @Test
+        @MainActor
+        func fetchItemsWhereHydratesLongPlainAndEncryptedBodyAndQRCodeTextWhileCoordinatorSweepsHeaders() throws {
+            try TestSupport.withTemporaryHistoryStore { store, _ in
+                let plainTag = try store.createTag(name: "PlainHydratedTag", color: "#1E88E5")
+                let encryptedTag = try store.createTag(name: "EncryptedHydratedTag", color: "#E53935")
+
+                let plainTailMarker = [" FetchPlainBodyMarker", "9911"].joined()
+                let encryptedTailMarker = [" FetchEncryptedBodyMarker", "8822"].joined()
+                let plainQRTailMarker = [" FetchPlainQRMarker", "7733"].joined()
+                let encryptedQRTailMarker = [" FetchEncryptedQRMarker", "6644"].joined()
+
+                let plainLongText = String(repeating: "p", count: 12_500) + plainTailMarker
+                let encryptedLongText = String(repeating: "e", count: 12_500) + encryptedTailMarker
+                let plainLongOCR = String(repeating: "o", count: 10_200) + "_OCR_PLAIN"
+                let encryptedLongOCR = String(repeating: "s", count: 10_200) + "_OCR_ENC"
+                let plainLongQR = String(repeating: "q", count: 9_200) + plainQRTailMarker
+                let encryptedLongQR = String(repeating: "r", count: 9_200) + encryptedQRTailMarker
+
+                let plainTextItem = ClipboardItem.fixture(
+                    kind: .text,
+                    text: plainLongText,
+                    sourceAppName: "Notes",
+                    sourceBundleIdentifier: "com.apple.Notes",
+                    copiedAt: Date(timeIntervalSince1970: 1_700_001_010),
+                    isFavorite: true,
+                    tags: [plainTag.id]
+                )
+                let encryptedTextItem = ClipboardItem.fixture(
+                    kind: .text,
+                    text: encryptedLongText,
+                    sourceAppName: "Terminal",
+                    sourceBundleIdentifier: "com.apple.Terminal",
+                    copiedAt: Date(timeIntervalSince1970: 1_700_001_020),
+                    isFavorite: true,
+                    tags: [encryptedTag.id],
+                    sensitivity: .sensitive
+                )
+
+                let pngData = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemBlue)
+                let plainImgID = UUID()
+                let plainImgURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: plainImgID, encrypted: false)
+                let plainImgItem = ClipboardItem.fixture(
+                    id: plainImgID,
+                    kind: .image,
+                    text: plainLongOCR,
+                    qrCodeText: plainLongQR,
+                    assetPath: plainImgURL.path,
+                    imageDigest: store.computeImageDigest(forPNGData: pngData),
+                    copiedAt: Date(timeIntervalSince1970: 1_700_001_030),
+                    isFavorite: true
+                )
+
+                let encImgID = UUID()
+                let encImgURL = try store.writeManagedAsset(pngData: pngData, role: .image, clipID: encImgID, encrypted: true)
+                let encImgItem = ClipboardItem.fixture(
+                    id: encImgID,
+                    kind: .image,
+                    text: encryptedLongOCR,
+                    qrCodeText: encryptedLongQR,
+                    assetPath: encImgURL.path,
+                    imageDigest: store.computeImageDigest(forPNGData: pngData),
+                    copiedAt: Date(timeIntervalSince1970: 1_700_001_040),
+                    isFavorite: true,
+                    sensitivity: .sensitive
+                )
+
+                let nonMatchingItem = ClipboardItem.fixture(
+                    kind: .text,
+                    text: String(repeating: "x", count: 10_000),
+                    copiedAt: Date(timeIntervalSince1970: 1_700_001_050),
+                    isFavorite: true
+                )
+                let trashedMatchingItem = ClipboardItem.fixture(
+                    kind: .text,
+                    text: String(repeating: "t", count: 12_000) + plainTailMarker,
+                    copiedAt: Date(timeIntervalSince1970: 1_700_001_060)
+                )
+
+                for item in [plainTextItem, encryptedTextItem, plainImgItem, encImgItem, nonMatchingItem, trashedMatchingItem] {
+                    _ = try store.saveAndReconcileItem(item, convertingExternalAssets: true)
+                }
+                try store.moveToTrash(ids: [trashedMatchingItem.id], at: Date(timeIntervalSince1970: 1_700_001_070))
+
+                // Compact headers from fetchAll() leave >8 KB bodies and qrCodeText unloaded.
+                let allHeaders = try store.fetchAll()
+                #expect(allHeaders.count == 5)
+                for header in allHeaders {
+                    #expect(!header.isContentLoaded)
+                    #expect(header.qrCodeText == nil)
+                }
+
+                // fetchItems(where:) hydrates full >8,096-char text and qrCodeText before evaluating isIncluded across plain & encrypted rows.
+                let matched = try store.fetchItems { item in
+                    item.text?.contains(plainTailMarker) == true
+                        || item.text?.contains(encryptedTailMarker) == true
+                        || item.qrCodeText?.contains(plainQRTailMarker) == true
+                        || item.qrCodeText?.contains(encryptedQRTailMarker) == true
+                }
+                #expect(matched.map(\.id) == [encImgItem.id, plainImgItem.id, encryptedTextItem.id, plainTextItem.id])
+                for item in matched {
+                    #expect(item.isContentLoaded)
+                }
+
+                let byID = Dictionary(uniqueKeysWithValues: matched.map { ($0.id, $0) })
+                #expect(byID[plainTextItem.id]?.text == plainLongText)
+                #expect(byID[plainTextItem.id]?.searchText.contains("PlainHydratedTag") == true)
+                #expect(byID[plainTextItem.id]?.searchText.contains(plainTailMarker) == true)
+
+                #expect(byID[encryptedTextItem.id]?.text == encryptedLongText)
+                #expect(byID[encryptedTextItem.id]?.searchText.contains("EncryptedHydratedTag") == true)
+                #expect(byID[encryptedTextItem.id]?.searchText.contains(encryptedTailMarker) == true)
+
+                #expect(byID[plainImgItem.id]?.text == plainLongOCR)
+                #expect(byID[plainImgItem.id]?.qrCodeText == plainLongQR)
+                #expect(byID[plainImgItem.id]?.searchText.contains(plainQRTailMarker) == true)
+
+                #expect(byID[encImgItem.id]?.text == encryptedLongOCR)
+                #expect(byID[encImgItem.id]?.qrCodeText == encryptedLongQR)
+                #expect(byID[encImgItem.id]?.searchText.contains(encryptedQRTailMarker) == true)
+
+                // Verify AppCoordinator settings sweeps scan compact headers via fetchAll() without invoking fetchItems(where:) or loadingContent.
+                let (harness, spyStore, _) = try TestSupport.makeSpiedTestCoordinator()
+                defer { harness.cleanup() }
+                try harness.seedHistory([plainTextItem, encryptedTextItem])
+                harness.model.preferences.keepFavoritesOnClearHistory = true
+                spyStore.resetRecordedCalls()
+
+                harness.coordinator.addIgnoredApplications(atPaths: ["/Applications/NonexistentIgnoredAppForHeaderSweep.app"])
+                harness.coordinator.setSensitiveContentLifetime(ContentLifetime.dontSave)
+
+                #expect(spyStore.fetchItemsWhereCalls == 0)
+                #expect(spyStore.loadingContentCalls.isEmpty)
             }
         }
 

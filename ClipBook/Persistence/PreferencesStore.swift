@@ -1,8 +1,4 @@
 import Foundation
-import SwiftUI
-import AppKit
-import Carbon
-import Combine
 
 final class PreferencesStore {
     static let kernelBootTimeKey = "ClipBookLastKnownKernelBootTime"

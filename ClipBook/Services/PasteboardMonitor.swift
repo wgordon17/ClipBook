@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 final class PasteboardMonitor {
     static let ghostType = PasteboardReader.ghostType
@@ -449,7 +447,7 @@ final class PasteboardMonitor {
             let pendingID = pendingItem.id
             clearPendingCopyAndMergeItem()
             do {
-                if isDuplicateCopyAndMergeItem(item, of: pendingItem) {
+                if item.hasSameContent(as: pendingItem) {
                     discardPendingCaptureResources(for: pendingID)
                     try mergeCopiedItem(item)
                 } else {
@@ -515,10 +513,6 @@ final class PasteboardMonitor {
             discardPendingCaptureResources(for: item.id)
         }
         try saveMergedItem(mergedItem)
-    }
-
-    private func isDuplicateCopyAndMergeItem(_ item: ClipboardItem, of pendingItem: ClipboardItem) -> Bool {
-        item.hasSameContent(as: pendingItem)
     }
 
     @discardableResult
@@ -634,7 +628,7 @@ final class PasteboardMonitor {
     }
 
     private func saveMergedItem(_ mergedItem: ClipboardItem) throws {
-        let saved = try historyStore.saveAndReconcileItem(mergedItem, convertingExternalAssets: false)
+        let saved = try historyStore.saveAndReconcileItem(mergedItem, convertingExternalAssets: true)
         if preferences.copyToClipboardAfterMerge,
            let text = saved.text {
             copyMergedTextToClipboard(text, isConcealed: SensitiveContent.shouldEncryptAtRest(saved))

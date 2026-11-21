@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 final class PasteService {
   private static let interKeyDelay: TimeInterval = 0.06

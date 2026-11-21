@@ -3,7 +3,6 @@ import Darwin
 import Foundation
 import GRDB
 import GRDBSQLite
-import ImageIO
 import os
 
 nonisolated enum GRDBRuntimeInfo {
@@ -50,6 +49,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         var newlyWrittenURLs: [URL] = []
         var supersededManagedURLs: [URL] = []
         var evictedThumbnailPaths: [String] = []
+        var evictedSVGClipIDs: [UUID] = []
+        var insertedSVGClipIDs: Set<UUID> = []
+        var removedSVGClipIDs: Set<UUID> = []
+        var purgeOwnerSVGRenderingsOnCommit: Bool = false
         var purgeSensitiveCachesOnCommit: Bool = false
     }
 
@@ -66,7 +69,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     }
 
     let directory: URL
-    let loadsBodiesOnFetchAll: Bool
 
     private let instanceID = UUID()
     private let keyProvider: any DatabaseKeyProvider
@@ -74,6 +76,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private let openLock = NSLock()
     private let state = OSAllocatedUnfairLock<StoreState>(initialState: StoreState())
     private let writeAssetContext = OSAllocatedUnfairLock<TransactionAssetContext>(initialState: TransactionAssetContext())
+    private let knownSVGClipIDs = OSAllocatedUnfairLock<Set<UUID>>(initialState: [])
     private let activeAccessGroup = DispatchGroup()
 
     private var databaseURL: URL {
@@ -114,11 +117,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     init(
         directory: URL,
-        keyProvider: (any DatabaseKeyProvider)? = nil,
-        loadsBodiesOnFetchAll: Bool = false
+        keyProvider: (any DatabaseKeyProvider)? = nil
     ) {
         self.directory = directory
-        self.loadsBodiesOnFetchAll = loadsBodiesOnFetchAll
         self.assetStore = ImageAssetStore(supportDirectory: directory)
 
         if let keyProvider {
@@ -167,16 +168,32 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
 
+        let trackedSVGIDs = knownSVGClipIDs.withLock { ids -> Set<UUID> in
+            let snapshot = ids
+            ids.removeAll()
+            return snapshot
+        }
+        for clipID in trackedSVGIDs {
+            SVGImageRenderer.shared.removeRendering(for: clipID)
+        }
         SensitiveContent.removeAll()
         SVGImageRenderer.unregisterTextLoader(ownerID: instanceID)
-        SVGImageRenderer.shared.removeAll()
         ImageAssetStore.unregisterKeys(forSupportDirectory: directory, ownerID: instanceID)
         ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: directory)
-        ImageDragFiles.removeAll()
+        ImageDragFiles.removeCopies(forSupportDirectory: directory)
 
         if let writer = transition.writer {
             writer.interrupt()
             activeAccessGroup.wait()
+            if let svgIDStrings = try? writer.unsafeReentrantRead({ db in
+                try String.fetchAll(db, sql: "SELECT id FROM clips WHERE isSVGText != 0")
+            }) {
+                for idString in svgIDStrings {
+                    if let clipID = UUID(uuidString: idString) {
+                        SVGImageRenderer.shared.removeRendering(for: clipID)
+                    }
+                }
+            }
             let hadPendingRelease = transition.hadPendingRelease || state.withLock {
                 $0.needsFreePageRelease || $0.isFreePageReleaseScheduled
             }
@@ -287,7 +304,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             guard let existing = try self.fetchFullItemByID(
                 in: db,
                 id: id,
-                includeTrashed: true,
                 keys: keys
             ) else {
                 return (nil, nil, false, false)
@@ -315,16 +331,19 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
             if (isTrashed && shouldEncrypt)
                 || (hasDetectedOCRSecret && !existing.isKeptByUser && sensitiveContentLifetime == Self.dontSaveContentLifetime) {
-                try db.execute(sql: "DELETE FROM clips WHERE id = ?", arguments: [id.uuidString])
+                let deleteStmt = try db.cachedStatement(sql: "DELETE FROM clips WHERE id = ?")
+                try deleteStmt.execute(arguments: [id.uuidString])
                 self.markNeedsFreePageRelease()
                 if let assetPath = existing.assetPath {
                     let assetURL = URL(fileURLWithPath: assetPath, isDirectory: false)
                     let superseded = self.assetStore.isManagedAssetURL(assetURL) ? assetURL : nil
                     self.recordSupersededAsset(supersededURL: superseded, evictedPath: assetPath)
                 }
-                self.writeAssetContext.withLock { $0.purgeSensitiveCachesOnCommit = true }
-                let formattedPrevious = self.loadsBodiesOnFetchAll ? existing : existing.unloadingContent()
-                return (nil, formattedPrevious, isTrashed, true)
+                self.recordSVGMembershipRemoval(id)
+                self.writeAssetContext.withLock {
+                    $0.purgeSensitiveCachesOnCommit = true
+                }
+                return (nil, existing.unloadingContent(), isTrashed, true)
             }
 
             if hasDetectedOCRSecret && !candidate.isKeptByUser && sensitiveContentLifetime > 0 {
@@ -346,27 +365,26 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 self.markNeedsFreePageRelease()
             }
 
-            let formattedUpdated = self.loadsBodiesOnFetchAll ? saved : saved.unloadingContent()
-            let formattedPrevious = self.loadsBodiesOnFetchAll ? existing : existing.unloadingContent()
-            return (formattedUpdated, formattedPrevious, isTrashed, false)
+            return (saved.unloadingContent(), existing.unloadingContent(), isTrashed, false)
         }
     }
 
     // MARK: - HistoryStore Queries & Mutations
 
-    private var clipBatchSelectClause: String {
-        loadsBodiesOnFetchAll
-            ? "SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText FROM clips c LEFT JOIN clip_contents cc ON cc.clipId = c.id"
-            : "SELECT c.* FROM clips c"
-    }
+    private static let clipBatchSelectClause = "SELECT c.* FROM clips c"
+    private static let clipBatchWithBodySelectClause =
+        "SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText FROM clips c LEFT JOIN clip_contents cc ON cc.clipId = c.id"
 
     private func fetchBatchedCursorItems(
         in db: Database,
         whereAndOrderSQL: String,
         tagAttachments: [String: TagAttachment],
-        keys: ClipBookDerivedKeys
+        hydratesBody: Bool = false,
+        keys: ClipBookDerivedKeys,
+        where isIncluded: (ClipboardItem) -> Bool = { _ in true }
     ) throws -> [ClipboardItem] {
-        let sql = "\(clipBatchSelectClause) \(whereAndOrderSQL)"
+        let selectClause = hydratesBody ? Self.clipBatchWithBodySelectClause : Self.clipBatchSelectClause
+        let sql = "\(selectClause) \(whereAndOrderSQL)"
         let decoder = Self.makeJSONDecoder()
         let cursor = try Row.fetchCursor(db, sql: sql)
         var items: [ClipboardItem] = []
@@ -385,10 +403,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                     if let item = try self.decodeBatchRow(
                         row,
                         attachment: attachment,
-                        hydratesBody: self.loadsBodiesOnFetchAll,
+                        hydratesBody: hydratesBody,
                         keys: keys,
                         decoder: decoder
-                    ) {
+                    ), isIncluded(item) {
                         items.append(item)
                     }
                 }
@@ -400,6 +418,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private func decodeFetchedBatchRows(
         _ rows: [Row],
         tagAttachments: [String: TagAttachment],
+        hydratesBody: Bool = false,
         keys: ClipBookDerivedKeys,
         where isIncluded: ((ClipboardItem) -> Bool)? = nil
     ) throws -> [ClipboardItem] {
@@ -412,7 +431,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             if let item = try decodeBatchRow(
                 row,
                 attachment: attachment,
-                hydratesBody: loadsBodiesOnFetchAll,
+                hydratesBody: hydratesBody,
                 keys: keys,
                 decoder: decoder
             ), isIncluded?(item) ?? true {
@@ -448,7 +467,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     func fetchItems(trashedBefore date: Date) throws -> [ClipboardItem] {
         try withRead { db, keys in
-            let sql = "\(self.clipBatchSelectClause) WHERE c.deletedAt < ? ORDER BY c.deletedAt DESC"
+            let sql = "\(Self.clipBatchSelectClause) WHERE c.deletedAt < ? ORDER BY c.deletedAt DESC"
             let rows = try Row.fetchAll(db, sql: sql, arguments: [date.timeIntervalSince1970])
             guard !rows.isEmpty else {
                 return []
@@ -465,11 +484,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
         try withWrite { db, _ in
             let timestamp = date.timeIntervalSince1970
+            let stmt = try db.cachedStatement(sql: "UPDATE clips SET deletedAt = ? WHERE id = ?")
             for id in ids {
-                try db.execute(
-                    sql: "UPDATE clips SET deletedAt = ? WHERE id = ?",
-                    arguments: [timestamp, id.uuidString]
-                )
+                try stmt.execute(arguments: [timestamp, id.uuidString])
             }
         }
     }
@@ -479,11 +496,11 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
         try withWrite { db, _ in
+            let stmt = try db.cachedStatement(
+                sql: "UPDATE clips SET deletedAt = NULL WHERE id = ? AND deletedAt IS NOT NULL"
+            )
             for id in ids {
-                try db.execute(
-                    sql: "UPDATE clips SET deletedAt = NULL WHERE id = ?",
-                    arguments: [id.uuidString]
-                )
+                try stmt.execute(arguments: [id.uuidString])
             }
         }
     }
@@ -663,7 +680,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             guard var existing = try self.fetchFullItemByID(
                 in: db,
                 id: id,
-                includeTrashed: true,
                 keys: keys
             ) else {
                 return nil
@@ -847,7 +863,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     func delete(_ id: UUID) throws {
         try withWrite { db, _ in
-            try db.execute(sql: "DELETE FROM clips WHERE id = ?", arguments: [id.uuidString])
+            let stmt = try db.cachedStatement(sql: "DELETE FROM clips WHERE id = ?")
+            try stmt.execute(arguments: [id.uuidString])
+            self.recordSVGMembershipRemoval(id)
             self.markNeedsFreePageRelease()
         }
     }
@@ -857,16 +875,25 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return
         }
         try withWrite { db, _ in
+            let stmt = try db.cachedStatement(sql: "DELETE FROM clips WHERE id = ?")
             for id in ids {
-                try db.execute(sql: "DELETE FROM clips WHERE id = ?", arguments: [id.uuidString])
+                try stmt.execute(arguments: [id.uuidString])
             }
+            self.recordSVGMembershipRemovals(ids)
             self.markNeedsFreePageRelease()
         }
     }
 
     func clear() throws {
         try withWrite { db, _ in
+            let svgIDs = try String.fetchAll(db, sql: "SELECT id FROM clips WHERE isSVGText != 0")
+                .compactMap(UUID.init(uuidString:))
+            let allRemovedSVGIDs = Array(Set(svgIDs).union(self.knownSVGClipIDs.withLock { $0 }))
             try db.execute(sql: "DELETE FROM clips")
+            self.recordSVGMembershipRemovals(allRemovedSVGIDs)
+            self.writeAssetContext.withLock {
+                $0.purgeOwnerSVGRenderingsOnCommit = true
+            }
             self.markNeedsFreePageRelease()
         }
     }
@@ -878,6 +905,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         try withWrite { db, _ in
+            let svgIDs = try String.fetchAll(db, sql: """
+                SELECT id FROM clips
+                WHERE isSVGText != 0
+                  AND (deletedAt IS NOT NULL
+                       OR (isFavorite = 0 AND NOT EXISTS (
+                           SELECT 1 FROM clip_tags WHERE clip_tags.clipId = clips.id
+                       )))
+                """).compactMap(UUID.init(uuidString:))
             try db.execute(sql: """
                 DELETE FROM clips
                 WHERE deletedAt IS NOT NULL
@@ -886,6 +921,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                    ))
                 """)
             if db.changesCount > 0 {
+                self.recordSVGMembershipRemovals(svgIDs)
                 self.markNeedsFreePageRelease()
             }
         }
@@ -893,21 +929,20 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     func incrementCopyCount(_ id: UUID) throws {
         try withWrite { db, _ in
-            try db.execute(
-                sql: "UPDATE clips SET copyCount = copyCount + 1 WHERE id = ? AND deletedAt IS NULL",
-                arguments: [id.uuidString]
+            let stmt = try db.cachedStatement(
+                sql: "UPDATE clips SET copyCount = copyCount + 1 WHERE id = ? AND deletedAt IS NULL"
             )
+            try stmt.execute(arguments: [id.uuidString])
         }
     }
 
     func recordAction(_ id: UUID, copiedAt: Date?, incrementsCopyCount: Bool) throws -> ClipboardItem? {
         try withWrite { db, keys in
             let idString = id.uuidString
-            guard let existingCounts = try Row.fetchOne(
-                db,
-                sql: "SELECT copiedAt, copyCount FROM clips WHERE id = ? AND deletedAt IS NULL LIMIT 1",
-                arguments: [idString]
-            ) else {
+            let selectCountsStmt = try db.cachedStatement(
+                sql: "SELECT copiedAt, copyCount FROM clips WHERE id = ? AND deletedAt IS NULL LIMIT 1"
+            )
+            guard let existingCounts = try Row.fetchOne(selectCountsStmt, arguments: [idString]) else {
                 return nil
             }
 
@@ -915,50 +950,26 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             let currentCopyCount: Int = existingCounts["copyCount"]
             let newCopyCount = incrementsCopyCount ? (currentCopyCount + 1) : currentCopyCount
 
-            try db.execute(
-                sql: "UPDATE clips SET copiedAt = ?, copyCount = ? WHERE id = ? AND deletedAt IS NULL",
-                arguments: [newCopiedAt, newCopyCount, idString]
+            let updateStmt = try db.cachedStatement(
+                sql: "UPDATE clips SET copiedAt = ?, copyCount = ? WHERE id = ? AND deletedAt IS NULL"
             )
+            try updateStmt.execute(arguments: [newCopiedAt, newCopyCount, idString])
 
             let attachment = try self.fetchTagAttachment(in: db, clipIDString: idString)
             let decoder = Self.makeJSONDecoder()
-            if self.loadsBodiesOnFetchAll {
-                guard let row = try Row.fetchOne(
-                    db,
-                    sql: """
-                        SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                        FROM clips c
-                        LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                        WHERE c.id = ? AND c.deletedAt IS NULL
-                        LIMIT 1
-                        """,
-                    arguments: [idString]
-                ) else {
-                    return nil
-                }
-                return try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: true,
-                    keys: keys,
-                    decoder: decoder
-                )
-            } else {
-                guard let row = try Row.fetchOne(
-                    db,
-                    sql: "SELECT c.* FROM clips c WHERE c.id = ? AND c.deletedAt IS NULL LIMIT 1",
-                    arguments: [idString]
-                ) else {
-                    return nil
-                }
-                return try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: false,
-                    keys: keys,
-                    decoder: decoder
-                )
+            let selectClipStmt = try db.cachedStatement(
+                sql: "\(Self.clipBatchSelectClause) WHERE c.id = ? AND c.deletedAt IS NULL LIMIT 1"
+            )
+            guard let row = try Row.fetchOne(selectClipStmt, arguments: [idString]) else {
+                return nil
             }
+            return try self.decodeBatchRow(
+                row,
+                attachment: attachment,
+                hydratesBody: false,
+                keys: keys,
+                decoder: decoder
+            )
         }
     }
 
@@ -981,7 +992,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 ? " AND c.isFavorite = 0 AND NOT EXISTS (SELECT 1 FROM clip_tags ct WHERE ct.clipId = c.id)"
                 : ""
             let sql = """
-                \(self.clipBatchSelectClause)
+                \(Self.clipBatchSelectClause)
                 WHERE c.deletedAt IS NULL AND (\(conditions))\(protectedClause)
                 ORDER BY c.copiedAt DESC
                 """
@@ -1010,7 +1021,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     func fetchItems(expiringBy date: Date) throws -> [ClipboardItem] {
         try withRead { db, keys in
             let sql = """
-                \(self.clipBatchSelectClause)
+                \(Self.clipBatchSelectClause)
                 WHERE c.expiresAt IS NOT NULL AND c.expiresAt <= ?
                 ORDER BY c.copiedAt DESC
                 """
@@ -1063,36 +1074,47 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             let decoder = Self.makeJSONDecoder()
             let cursor = try Row.fetchCursor(db, sql: sql)
             var paths: Set<String> = []
-            while let row = try cursor.next() {
-                guard let idString: String = row["id"],
-                      let clipID = UUID(uuidString: idString) else {
-                    throw HistoryStoreError.authenticationFailed
-                }
-                let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
+            var reachedEnd = false
+            while !reachedEnd {
+                try autoreleasepool {
+                    var batchCount = 0
+                    while batchCount < 512 {
+                        guard let row = try cursor.next() else {
+                            reachedEnd = true
+                            break
+                        }
+                        batchCount += 1
+                        guard let idString: String = row["id"],
+                              let clipID = UUID(uuidString: idString) else {
+                            throw HistoryStoreError.authenticationFailed
+                        }
+                        let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
 
-                if let assetPath = try Self.decodeProtectedAssetPath(
-                    from: row,
-                    column: "assetPath",
-                    clipID: clipID,
-                    isEncrypted: isEncrypted,
-                    keys: keys
-                ) {
-                    paths.insert(assetPath)
-                }
+                        if let assetPath = try Self.decodeProtectedAssetPath(
+                            from: row,
+                            column: "assetPath",
+                            clipID: clipID,
+                            isEncrypted: isEncrypted,
+                            keys: keys
+                        ) {
+                            paths.insert(assetPath)
+                        }
 
-                if let details = try Self.decodeProtectedLinkPreview(
-                    from: row,
-                    column: "linkPreviewData",
-                    clipID: clipID,
-                    isEncrypted: isEncrypted,
-                    keys: keys,
-                    decoder: decoder
-                ) {
-                    if let imagePath = details.imagePath {
-                        paths.insert(imagePath)
-                    }
-                    if let faviconPath = details.faviconPath {
-                        paths.insert(faviconPath)
+                        if let details = try Self.decodeProtectedLinkPreview(
+                            from: row,
+                            column: "linkPreviewData",
+                            clipID: clipID,
+                            isEncrypted: isEncrypted,
+                            keys: keys,
+                            decoder: decoder
+                        ) {
+                            if let imagePath = details.imagePath {
+                                paths.insert(imagePath)
+                            }
+                            if let faviconPath = details.faviconPath {
+                                paths.insert(faviconPath)
+                            }
+                        }
                     }
                 }
             }
@@ -1249,30 +1271,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     func fetchItems(where isIncluded: (ClipboardItem) -> Bool) throws -> [ClipboardItem] {
         try withRead { db, keys in
             let tagAttachments = try self.fetchTagAttachments(in: db, trashedFilter: false)
-            let sql = """
-                SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
-                FROM clips c
-                LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                WHERE c.deletedAt IS NULL
-                ORDER BY c.copiedAt DESC
-                """
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql)
-            var items: [ClipboardItem] = []
-            while let row = try cursor.next() {
-                let idString: String? = row["id"]
-                let attachment = idString.flatMap { tagAttachments[$0] } ?? TagAttachment()
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: true,
-                    keys: keys,
-                    decoder: decoder
-                ), isIncluded(item) {
-                    items.append(item)
-                }
-            }
-            return items
+            return try self.fetchBatchedCursorItems(
+                in: db,
+                whereAndOrderSQL: "WHERE c.deletedAt IS NULL ORDER BY c.copiedAt DESC",
+                tagAttachments: tagAttachments,
+                hydratesBody: true,
+                keys: keys,
+                where: isIncluded
+            )
         }
     }
 
@@ -1410,9 +1416,20 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             for evictedPath in committedAssets.evictedThumbnailPaths {
                 ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: evictedPath)
             }
+            if !committedAssets.removedSVGClipIDs.isEmpty || !committedAssets.insertedSVGClipIDs.isEmpty {
+                knownSVGClipIDs.withLock { set in
+                    set.subtract(committedAssets.removedSVGClipIDs)
+                    set.formUnion(committedAssets.insertedSVGClipIDs)
+                }
+            }
+            for clipID in Set(committedAssets.evictedSVGClipIDs) {
+                SVGImageRenderer.shared.removeRendering(for: clipID)
+            }
+            if committedAssets.purgeOwnerSVGRenderingsOnCommit {
+                SVGImageRenderer.shared.removeRenderings(forOwner: self.instanceID)
+            }
             if committedAssets.purgeSensitiveCachesOnCommit {
                 SensitiveContent.removeAll()
-                SVGImageRenderer.shared.removeAll()
             }
             scheduleAsyncFreePageReleaseIfNeeded(on: writer)
         }
@@ -1428,19 +1445,45 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    private func recordAssetOutcome(_ outcome: ImageAssetStore.AssetConversionOutcome, evictedPath: String?) {
-        let canonicalWritten = Self.canonicalFileURL(outcome.writtenURL)
-        let canonicalSuperseded = outcome.supersededManagedURL.map(Self.canonicalFileURL)
+    private func recordSVGMembershipInsert(_ id: UUID) {
         writeAssetContext.withLock { ctx in
-            ctx.supersededManagedURLs.removeAll { Self.canonicalFileURL($0) == canonicalWritten }
+            ctx.insertedSVGClipIDs.insert(id)
+            ctx.removedSVGClipIDs.remove(id)
+        }
+    }
+
+    private func recordSVGMembershipRemoval(_ id: UUID) {
+        writeAssetContext.withLock { ctx in
+            ctx.removedSVGClipIDs.insert(id)
+            ctx.insertedSVGClipIDs.remove(id)
+            ctx.evictedSVGClipIDs.append(id)
+        }
+    }
+
+    private func recordSVGMembershipRemovals(_ ids: [UUID]) {
+        guard !ids.isEmpty else {
+            return
+        }
+        writeAssetContext.withLock { ctx in
+            ctx.removedSVGClipIDs.formUnion(ids)
+            ctx.insertedSVGClipIDs.subtract(ids)
+            ctx.evictedSVGClipIDs.append(contentsOf: ids)
+        }
+    }
+
+    private func recordAssetOutcome(_ outcome: ImageAssetStore.AssetConversionOutcome, evictedPath: String?) {
+        let canonicalWritten = ImageAssetStore.canonicalFileURL(outcome.writtenURL)
+        let canonicalSuperseded = outcome.supersededManagedURL.map(ImageAssetStore.canonicalFileURL)
+        writeAssetContext.withLock { ctx in
+            ctx.supersededManagedURLs.removeAll { ImageAssetStore.canonicalFileURL($0) == canonicalWritten }
             if outcome.createdNewFile,
-               !ctx.newlyWrittenURLs.contains(where: { Self.canonicalFileURL($0) == canonicalWritten }) {
+               !ctx.newlyWrittenURLs.contains(where: { ImageAssetStore.canonicalFileURL($0) == canonicalWritten }) {
                 ctx.newlyWrittenURLs.append(outcome.writtenURL)
             }
             if let superseded = outcome.supersededManagedURL,
                let canonicalSuperseded,
                canonicalSuperseded != canonicalWritten,
-               !ctx.supersededManagedURLs.contains(where: { Self.canonicalFileURL($0) == canonicalSuperseded }) {
+               !ctx.supersededManagedURLs.contains(where: { ImageAssetStore.canonicalFileURL($0) == canonicalSuperseded }) {
                 ctx.supersededManagedURLs.append(superseded)
             }
             if let evictedPath, !evictedPath.isEmpty, !ctx.evictedThumbnailPaths.contains(evictedPath) {
@@ -1450,11 +1493,11 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     }
 
     private func recordSupersededAsset(supersededURL: URL?, evictedPath: String?) {
-        let canonicalSuperseded = supersededURL.map(Self.canonicalFileURL)
+        let canonicalSuperseded = supersededURL.map(ImageAssetStore.canonicalFileURL)
         writeAssetContext.withLock { ctx in
             if let supersededURL,
                let canonicalSuperseded,
-               !ctx.supersededManagedURLs.contains(where: { Self.canonicalFileURL($0) == canonicalSuperseded }) {
+               !ctx.supersededManagedURLs.contains(where: { ImageAssetStore.canonicalFileURL($0) == canonicalSuperseded }) {
                 ctx.supersededManagedURLs.append(supersededURL)
             }
             if let evictedPath, !evictedPath.isEmpty, !ctx.evictedThumbnailPaths.contains(evictedPath) {
@@ -1579,13 +1622,12 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         do {
-            // Phase 1: Purely structural read-only crash recovery BEFORE touching DatabaseKeyProvider.
-            recoverInterruptedPhaseBCutoverIfNeeded()
+            // Recover interrupted migration cutover before touching DatabaseKeyProvider.
+            recoverInterruptedMigrationCutoverIfNeeded()
 
-            // Phase 2: Read-only probe of History.sqlite (mutates zero bytes / mtime).
+            // Probe History.sqlite without mutating bytes or mtime.
             let probeState = try probeExistingDatabaseReadOnly()
 
-            // Phase 3: Master key load/create + verifier check -> StoreLockState transitions.
             let keys: ClipBookDerivedKeys
             switch probeState {
             case .fresh, .legacy:
@@ -1612,7 +1654,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 }
             }
 
-            // Phase 4: Initialize fresh DB or run clean-room v0-v4 -> v5 migration, then open DatabasePool.
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
             switch probeState {
@@ -1651,10 +1692,21 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
             sweepLeftoverScrubbingAndSupersededPlaintextAssets(in: writer, keys: keys)
 
+            let initialSVGIDs: Set<UUID> = (try? writer.unsafeReentrantRead { db in
+                Set(
+                    try String.fetchAll(db, sql: "SELECT id FROM clips WHERE isSVGText != 0")
+                        .compactMap(UUID.init(uuidString:))
+                )
+            }) ?? []
+            knownSVGClipIDs.withLock { $0 = initialSVGIDs }
+
             ImageAssetStore.registerKeys(keys, forSupportDirectory: directory, ownerID: instanceID)
             SVGImageRenderer.registerTextLoader(
                 { [weak self] clipID in
                     self?.loadDecryptedSVGText(for: clipID)
+                },
+                ownsClip: { [weak self] clipID in
+                    self?.ownsKnownSVGClip(id: clipID) ?? false
                 },
                 ownerID: instanceID
             )
@@ -1710,8 +1762,15 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    private func loadDecryptedSVGText(for clipID: UUID) -> String? {
+    private func ownsKnownSVGClip(id: UUID) -> Bool {
         guard isOpen else {
+            return false
+        }
+        return knownSVGClipIDs.withLock { $0.contains(id) }
+    }
+
+    private func loadDecryptedSVGText(for clipID: UUID) -> String? {
+        guard isOpen, knownSVGClipIDs.withLock({ $0.contains(clipID) }) else {
             return nil
         }
         return try? withRead { db, keys in
@@ -1741,7 +1800,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    private func recoverInterruptedPhaseBCutoverIfNeeded() {
+    private func recoverInterruptedMigrationCutoverIfNeeded() {
         let dbExists = Self.fileOrSymlinkExists(at: databaseURL)
         let scrubbingExists = Self.fileOrSymlinkExists(at: scrubbingDBURL)
         let migratingExists = Self.fileOrSymlinkExists(at: migratingURL)
@@ -1928,22 +1987,22 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         let tempDBURL = probeDir.appendingPathComponent(dbURL.lastPathComponent, isDirectory: false)
-        try copyProbeRegularFile0600(from: dbURL, to: tempDBURL)
+        try copyRegularFile0600(from: dbURL, to: tempDBURL)
 
         let tempWALURL = URL(fileURLWithPath: tempDBURL.path + "-wal", isDirectory: false)
         let tempJournalURL = URL(fileURLWithPath: tempDBURL.path + "-journal", isDirectory: false)
 
         if walSize > 0 {
-            let copiedWAL = try copyProbeRegularFile0600(from: walURL, to: tempWALURL, allowMissingSource: true)
+            let copiedWAL = try copyRegularFile0600(from: walURL, to: tempWALURL, allowMissingSource: true)
             if copiedWAL {
                 _ = Darwin.link(tempWALURL.path, tempWALURL.path + ".pin")
             } else {
-                try copyProbeRegularFile0600(from: dbURL, to: tempDBURL)
+                try copyRegularFile0600(from: dbURL, to: tempDBURL)
             }
         }
 
         if journalSize > 0 {
-            let copiedJournal = try copyProbeRegularFile0600(
+            let copiedJournal = try copyRegularFile0600(
                 from: journalURL,
                 to: tempJournalURL,
                 allowMissingSource: true
@@ -1951,7 +2010,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             if copiedJournal {
                 _ = Darwin.link(tempJournalURL.path, tempJournalURL.path + ".pin")
             } else {
-                try copyProbeRegularFile0600(from: dbURL, to: tempDBURL)
+                try copyRegularFile0600(from: dbURL, to: tempDBURL)
             }
         }
 
@@ -1994,17 +2053,19 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     }
 
     @discardableResult
-    private static func copyProbeRegularFile0600(
+    private static func copyRegularFile0600(
         from sourceURL: URL,
         to destinationURL: URL,
-        allowMissingSource: Bool = false
+        allowMissingSource: Bool = false,
+        fullFsync: Bool = false,
+        failureError: @autoclosure () -> any Error = HistoryStoreError.openFailed
     ) throws -> Bool {
         let inFD = Darwin.open(sourceURL.path, O_RDONLY | O_NOFOLLOW)
         guard inFD >= 0 else {
             if allowMissingSource && errno == ENOENT {
                 return false
             }
-            throw HistoryStoreError.openFailed
+            throw failureError()
         }
         defer {
             _ = Darwin.close(inFD)
@@ -2013,21 +2074,27 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         var inStat = stat()
         guard Darwin.fstat(inFD, &inStat) == 0,
               (inStat.st_mode & S_IFMT) == S_IFREG else {
-            throw HistoryStoreError.openFailed
+            throw failureError()
         }
 
         let outFD = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, mode_t(0o600))
         guard outFD >= 0 else {
-            throw HistoryStoreError.openFailed
+            throw failureError()
         }
-        _ = Darwin.fchmod(outFD, mode_t(0o600))
 
         let chunkSize = 64 * 1024
         var buffer = [UInt8](repeating: 0, count: chunkSize)
         defer {
-            buffer.resetBytes(in: 0..<buffer.count)
+            buffer.withUnsafeMutableBytes { rawBuffer in
+                if let base = rawBuffer.baseAddress, rawBuffer.count > 0 {
+                    _ = memset_s(base, rawBuffer.count, 0, rawBuffer.count)
+                }
+            }
         }
+
+        var outFDOpen = true
         do {
+            _ = Darwin.fchmod(outFD, mode_t(0o600))
             try buffer.withUnsafeMutableBytes { rawBuffer in
                 guard let base = rawBuffer.baseAddress else { return }
                 while true {
@@ -2041,7 +2108,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                             } else if written < 0 && errno == EINTR {
                                 continue
                             } else {
-                                throw HistoryStoreError.openFailed
+                                throw failureError()
                             }
                         }
                     } else if bytesRead == 0 {
@@ -2049,14 +2116,24 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                     } else if errno == EINTR {
                         continue
                     } else {
-                        throw HistoryStoreError.openFailed
+                        throw failureError()
                     }
                 }
             }
-            _ = Darwin.close(outFD)
+            if fullFsync {
+                if Darwin.fcntl(outFD, F_FULLFSYNC) != 0 {
+                    _ = Darwin.fsync(outFD)
+                }
+            }
+            outFDOpen = false
+            guard Darwin.close(outFD) == 0 else {
+                throw failureError()
+            }
             return true
         } catch {
-            _ = Darwin.close(outFD)
+            if outFDOpen {
+                _ = Darwin.close(outFD)
+            }
             ImageAssetStore.secureUnlink(at: destinationURL)
             throw error
         }
@@ -2180,10 +2257,54 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
         }
 
-        // Remove any leftover <stem>.png/.jpg/.ico/.gif/.webp in Images/ or LinkPreviews/
-        // whose <stem>.enc counterpart already exists and is not referenced by an unencrypted row,
-        // and scrub any leftover <stem>.enc whose plain <stem>.<ext> counterpart is referenced by
-        // an unencrypted row after a post-commit crash.
+        // Inspect managed asset directories on disk first, scrubbing any leftover .scrubbing files
+        // immediately and checking whether any stem has both .enc and plain files present before
+        // querying SQLite or decrypting rows.
+        var overlappingDirectories: [(files: [URL], encStems: Set<String>)] = []
+        for assetDir in [assetStore.imagesDirectory, assetStore.linkPreviewsDirectory] {
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: assetDir,
+                includingPropertiesForKeys: nil,
+                options: []
+            ) else {
+                continue
+            }
+
+            var visibleFiles: [URL] = []
+            visibleFiles.reserveCapacity(entries.count)
+            var encStems: Set<String> = []
+            var plainStems: Set<String> = []
+
+            for entry in entries {
+                let name = entry.lastPathComponent
+                if name.hasSuffix(".scrubbing") {
+                    ImageAssetStore.secureUnlink(at: entry)
+                    continue
+                }
+                if name.hasPrefix(".") {
+                    continue
+                }
+                visibleFiles.append(entry)
+                let ext = entry.pathExtension.lowercased()
+                let stem = entry.deletingPathExtension().lastPathComponent
+                if ext == "enc" {
+                    encStems.insert(stem)
+                } else {
+                    plainStems.insert(stem)
+                }
+            }
+
+            if !encStems.isDisjoint(with: plainStems) {
+                overlappingDirectories.append((files: visibleFiles, encStems: encStems))
+            }
+        }
+
+        guard !overlappingDirectories.isEmpty else {
+            return
+        }
+
+        // Resolve referenced plaintext and encrypted filenames from SQLite only when a stem has
+        // both .enc and plain files on disk after an interrupted post-commit cleanup.
         let (unencryptedAssetFileNames, encryptedAssetFileNames): (Set<String>, Set<String>) = (
             try? writer.unsafeReentrantRead { db -> (Set<String>, Set<String>) in
                 let decoder = Self.makeJSONDecoder()
@@ -2244,28 +2365,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
         ) ?? ([], [])
 
-        for assetDir in [assetStore.imagesDirectory, assetStore.linkPreviewsDirectory] {
-            guard let files = try? FileManager.default.contentsOfDirectory(
-                at: assetDir,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else {
-                continue
-            }
-
-            var encStems: Set<String> = []
+        for (files, encStems) in overlappingDirectories {
             var existingPlainStemsReferencedByUnencryptedRows: Set<String> = []
-            for file in files {
-                let ext = file.pathExtension.lowercased()
-                let stem = file.deletingPathExtension().lastPathComponent
-                if ext == "enc" {
-                    encStems.insert(stem)
-                } else if unencryptedAssetFileNames.contains(file.lastPathComponent) {
-                    existingPlainStemsReferencedByUnencryptedRows.insert(stem)
+            for file in files where file.pathExtension.lowercased() != "enc" {
+                if unencryptedAssetFileNames.contains(file.lastPathComponent) {
+                    existingPlainStemsReferencedByUnencryptedRows.insert(
+                        file.deletingPathExtension().lastPathComponent
+                    )
                 }
-            }
-            guard !encStems.isEmpty else {
-                continue
             }
 
             for file in files {
@@ -2386,7 +2493,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         let previousURL = URL(fileURLWithPath: previousPath, isDirectory: false)
         if let currentPath, !currentPath.isEmpty {
             let currentURL = URL(fileURLWithPath: currentPath, isDirectory: false)
-            if Self.canonicalFileURL(previousURL) == Self.canonicalFileURL(currentURL) {
+            if ImageAssetStore.canonicalFileURL(previousURL) == ImageAssetStore.canonicalFileURL(currentURL) {
                 return
             }
         }
@@ -2496,17 +2603,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             keys: keys,
             requiresEncryption: false
         )
-        let targetDir = role == .image ? assetStore.imagesDirectory : assetStore.linkPreviewsDirectory
-        let targetName: String
-        switch role {
-        case .image:
-            targetName = "\(clipID.uuidString).enc"
-        case .linkPreview:
-            targetName = "\(clipID.uuidString)-preview.enc"
-        case .linkFavicon:
-            targetName = "\(clipID.uuidString)-favicon.enc"
-        }
-        let expectedTargetURL = targetDir.appendingPathComponent(targetName, isDirectory: false)
+        let expectedTargetURL = assetStore.targetURL(for: role, clipID: clipID, fileExtension: "enc")
         let targetPreexisted = Self.fileOrSymlinkExists(at: expectedTargetURL)
         let stagedURL = try assetStore.writeAsset(
             pngData: plainData,
@@ -2515,7 +2612,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             encrypted: true,
             keys: keys
         )
-        let createdNew = !targetPreexisted && Self.canonicalFileURL(sourceURL) != Self.canonicalFileURL(stagedURL)
+        let createdNew = !targetPreexisted && ImageAssetStore.canonicalFileURL(sourceURL) != ImageAssetStore.canonicalFileURL(stagedURL)
         recordAssetOutcome(
             ImageAssetStore.AssetConversionOutcome(
                 writtenURL: stagedURL,
@@ -2526,6 +2623,95 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         )
         return stagedURL.path
     }
+
+    private static let selectExistingClipSQL = """
+        SELECT isEncrypted, sourceAppName, sourceBundleIdentifier, contentKey,
+               title, textPreview, htmlDigest, imageDigest, assetPath, filePathsData, linkPreviewData
+        FROM clips
+        WHERE id = ?
+        LIMIT 1
+        """
+
+    private static let selectExistingBodySQL =
+        "SELECT text, qrCodeText FROM clip_contents WHERE clipId = ? LIMIT 1"
+
+    private static let selectExistingFormattingSQL =
+        "SELECT rtf, html FROM clip_contents WHERE clipId = ? LIMIT 1"
+
+    private static let selectExistingBodyAndFormattingSQL =
+        "SELECT text, qrCodeText, rtf, html FROM clip_contents WHERE clipId = ? LIMIT 1"
+
+    private static let upsertClipSQL = """
+        INSERT INTO clips (
+            id, kind, copiedAt, firstCopiedAt, deletedAt, expiresAt,
+            copySequenceID, copySequenceOrder, byteSize, copyCount,
+            isFavorite, favoriteOrder, sourceAppName, sourceBundleIdentifier,
+            sensitivity, isEncrypted, title, textPreview, characterCount,
+            containsPreviewSecret, containsRestSecret, hasRecognizedText,
+            hasQRCodeText, isSVGText, hasFormatting, htmlDigest, imageDigest,
+            imageWidth, imageHeight, assetPath, filePathsData, linkPreviewData,
+            contentKey
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            kind = excluded.kind,
+            copiedAt = excluded.copiedAt,
+            firstCopiedAt = excluded.firstCopiedAt,
+            expiresAt = excluded.expiresAt,
+            copySequenceID = excluded.copySequenceID,
+            copySequenceOrder = excluded.copySequenceOrder,
+            byteSize = excluded.byteSize,
+            copyCount = excluded.copyCount,
+            isFavorite = excluded.isFavorite,
+            favoriteOrder = excluded.favoriteOrder,
+            sourceAppName = excluded.sourceAppName,
+            sourceBundleIdentifier = excluded.sourceBundleIdentifier,
+            sensitivity = excluded.sensitivity,
+            isEncrypted = excluded.isEncrypted,
+            title = excluded.title,
+            textPreview = excluded.textPreview,
+            characterCount = excluded.characterCount,
+            containsPreviewSecret = excluded.containsPreviewSecret,
+            containsRestSecret = excluded.containsRestSecret,
+            hasRecognizedText = excluded.hasRecognizedText,
+            hasQRCodeText = excluded.hasQRCodeText,
+            isSVGText = excluded.isSVGText,
+            hasFormatting = excluded.hasFormatting,
+            htmlDigest = excluded.htmlDigest,
+            imageDigest = excluded.imageDigest,
+            imageWidth = excluded.imageWidth,
+            imageHeight = excluded.imageHeight,
+            assetPath = excluded.assetPath,
+            filePathsData = excluded.filePathsData,
+            linkPreviewData = excluded.linkPreviewData,
+            contentKey = excluded.contentKey
+        """
+
+    private static let upsertClipContentsBodyAndFormattingSQL = """
+        INSERT INTO clip_contents (clipId, text, qrCodeText, rtf, html)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(clipId) DO UPDATE SET text = excluded.text, qrCodeText = excluded.qrCodeText, rtf = excluded.rtf, html = excluded.html
+        """
+
+    private static let upsertClipContentsBodyOnlySQL = """
+        INSERT INTO clip_contents (clipId, text, qrCodeText, rtf, html)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(clipId) DO UPDATE SET text = excluded.text, qrCodeText = excluded.qrCodeText
+        """
+
+    private static let upsertClipContentsFormattingOnlySQL = """
+        INSERT INTO clip_contents (clipId, text, qrCodeText, rtf, html)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(clipId) DO UPDATE SET rtf = excluded.rtf, html = excluded.html
+        """
 
     private func persistUpsert(
         in db: Database,
@@ -2541,37 +2727,58 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         let priorStoredContentKey = item.storedContentKey
         let idString = workingItem.id.uuidString
 
-        let existingClipRow = try Row.fetchOne(
-            db,
-            sql: "SELECT isEncrypted, sourceAppName, sourceBundleIdentifier, contentKey FROM clips WHERE id = ? LIMIT 1",
-            arguments: [idString]
-        )
+        let existingClipStmt = try db.cachedStatement(sql: Self.selectExistingClipSQL)
+        let existingClipRow = try Row.fetchOne(existingClipStmt, arguments: [idString])
         let existingIsEncrypted: Bool? = existingClipRow.map { (($0["isEncrypted"] as Int?) ?? 0) != 0 }
         let existingSourceAppName: String? = existingClipRow?["sourceAppName"]
         let existingSourceBundleID: String? = existingClipRow?["sourceBundleIdentifier"]
+        var existingAssetPath: String?
+        var existingLinkPreview: LinkPreviewDetails?
 
-        // Preserve unloaded body/formatting columns and re-seal/unseal if encryption state changed.
-        let writesBody = workingItem.isContentLoaded
-        let writesFormatting = workingItem.isFormattingLoaded || !workingItem.hasFormatting
-
-        if existingIsEncrypted == true && (!writesBody || !writesFormatting) {
-            if let protectedHeaderRow = try Row.fetchOne(
-                db,
-                sql: """
-                    SELECT title, textPreview, htmlDigest, imageDigest, assetPath, filePathsData, linkPreviewData
-                    FROM clips
-                    WHERE id = ?
-                    LIMIT 1
-                    """,
-                arguments: [idString]
-            ) {
+        if let existingClipRow, let wasEncrypted = existingIsEncrypted {
+            let decoder = Self.makeJSONDecoder()
+            if wasEncrypted {
                 try Self.authenticateEncryptedClipHeaderColumns(
-                    in: protectedHeaderRow,
+                    in: existingClipRow,
                     clipID: workingItem.id,
                     keys: keys
                 )
+                existingAssetPath = try Self.decodeProtectedAssetPath(
+                    from: existingClipRow,
+                    column: "assetPath",
+                    clipID: workingItem.id,
+                    isEncrypted: true,
+                    keys: keys
+                )
+                existingLinkPreview = try Self.decodeProtectedLinkPreview(
+                    from: existingClipRow,
+                    column: "linkPreviewData",
+                    clipID: workingItem.id,
+                    isEncrypted: true,
+                    keys: keys,
+                    decoder: decoder
+                )
+            } else {
+                existingAssetPath = try? Self.decodeProtectedAssetPath(
+                    from: existingClipRow,
+                    column: "assetPath",
+                    clipID: workingItem.id,
+                    isEncrypted: false,
+                    keys: keys
+                )
+                existingLinkPreview = try? Self.decodeProtectedLinkPreview(
+                    from: existingClipRow,
+                    column: "linkPreviewData",
+                    clipID: workingItem.id,
+                    isEncrypted: false,
+                    keys: keys,
+                    decoder: decoder
+                )
             }
         }
+
+        let writesBody = workingItem.isContentLoaded
+        let writesFormatting = workingItem.isFormattingLoaded || !workingItem.hasFormatting
 
         var shouldEncrypt = SensitiveContent.shouldEncryptAtRest(workingItem)
 
@@ -2581,6 +2788,18 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 &workingItem,
                 shouldEncrypt: shouldEncrypt,
                 keys: keys
+            )
+            scrubSupersededManagedAssetIfNeeded(
+                previousPath: existingAssetPath,
+                currentPath: workingItem.assetPath
+            )
+            scrubSupersededManagedAssetIfNeeded(
+                previousPath: existingLinkPreview?.imagePath,
+                currentPath: workingItem.linkPreviewDetails?.imagePath
+            )
+            scrubSupersededManagedAssetIfNeeded(
+                previousPath: existingLinkPreview?.faviconPath,
+                currentPath: workingItem.linkPreviewDetails?.faviconPath
             )
             shouldEncrypt = SensitiveContent.shouldEncryptAtRest(workingItem)
         case .nonDestructiveEncryptedStaging:
@@ -2646,20 +2865,17 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             let needsExistingBody = !writesBody && (wasEncrypted != shouldEncrypt || !canReuseContentKey)
             let needsExistingFormatting = !writesFormatting && (wasEncrypted != shouldEncrypt)
             if needsExistingBody || needsExistingFormatting {
-                let projectedColumns: String
+                let existingContentsSQL: String
                 switch (needsExistingBody, needsExistingFormatting) {
                 case (true, false):
-                    projectedColumns = "text, qrCodeText"
+                    existingContentsSQL = Self.selectExistingBodySQL
                 case (false, true):
-                    projectedColumns = "rtf, html"
+                    existingContentsSQL = Self.selectExistingFormattingSQL
                 default:
-                    projectedColumns = "text, qrCodeText, rtf, html"
+                    existingContentsSQL = Self.selectExistingBodyAndFormattingSQL
                 }
-                if let existingContentsRow = try Row.fetchOne(
-                    db,
-                    sql: "SELECT \(projectedColumns) FROM clip_contents WHERE clipId = ? LIMIT 1",
-                    arguments: [idString]
-                ) {
+                let existingContentsStmt = try db.cachedStatement(sql: existingContentsSQL)
+                if let existingContentsRow = try Row.fetchOne(existingContentsStmt, arguments: [idString]) {
                     if needsExistingBody {
                         existingPlainText = try Self.decodeStringColumn(
                             from: existingContentsRow,
@@ -2706,7 +2922,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
         }
 
-        // Compute contentKey (32-byte HMAC-SHA256 BLOB).
         let hmacKey: Data
         if workingItem.isContentLoaded {
             let parts = workingItem.contentKeyComponents
@@ -2743,8 +2958,13 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             keys: keys,
             encoder: encoder
         )
+        let upsertedClipID = workingItem.id
+        if workingItem.isSVGText {
+            recordSVGMembershipInsert(upsertedClipID)
+        } else {
+            recordSVGMembershipRemoval(upsertedClipID)
+        }
 
-        // Write or update clip_contents according to independent writesBody / writesFormatting flags.
         try Self.writeClipContentsRow(
             in: db,
             item: workingItem,
@@ -2761,15 +2981,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             keys: keys
         )
 
-        // Sync clip_tags (detaching removed tags and preserving sortOrder).
-        try db.execute(sql: "DELETE FROM clip_tags WHERE clipId = ?", arguments: [idString])
+        let deleteTagsStmt = try db.cachedStatement(sql: "DELETE FROM clip_tags WHERE clipId = ?")
+        try deleteTagsStmt.execute(arguments: [idString])
         if !workingItem.tags.isEmpty {
-            let validTagIDs = try Set(Int.fetchAll(db, sql: "SELECT id FROM tags"))
-            for tagID in workingItem.tags where validTagIDs.contains(tagID) {
-                try db.execute(
-                    sql: "INSERT OR IGNORE INTO clip_tags (clipId, tagId, sortOrder) VALUES (?, ?, ?)",
-                    arguments: [idString, tagID, workingItem.tagOrders[tagID]]
-                )
+            let insertTagStmt = try db.cachedStatement(
+                sql: "INSERT OR IGNORE INTO clip_tags (clipId, tagId, sortOrder) SELECT ?, id, ? FROM tags WHERE id = ?"
+            )
+            for tagID in workingItem.tags {
+                try insertTagStmt.execute(arguments: [idString, workingItem.tagOrders[tagID], tagID])
             }
         }
 
@@ -2777,6 +2996,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             (existingSourceAppName != nil && existingSourceAppName != workingItem.sourceAppName)
             || (existingSourceBundleID != nil && existingSourceBundleID != workingItem.sourceBundleIdentifier)
         )
+        if existingIsEncrypted == false && shouldEncrypt {
+            let evictedClipID = workingItem.id
+            writeAssetContext.withLock { $0.evictedSVGClipIDs.append(evictedClipID) }
+        }
         if (existingIsEncrypted == false && shouldEncrypt) || overwroteEncryptedUnsealedMetadata {
             markNeedsFreePageRelease()
         }
@@ -2857,60 +3080,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             keys: keys
         )
 
-        let sql = """
-            INSERT INTO clips (
-                id, kind, copiedAt, firstCopiedAt, deletedAt, expiresAt,
-                copySequenceID, copySequenceOrder, byteSize, copyCount,
-                isFavorite, favoriteOrder, sourceAppName, sourceBundleIdentifier,
-                sensitivity, isEncrypted, title, textPreview, characterCount,
-                containsPreviewSecret, containsRestSecret, hasRecognizedText,
-                hasQRCodeText, isSVGText, hasFormatting, htmlDigest, imageDigest,
-                imageWidth, imageHeight, assetPath, filePathsData, linkPreviewData,
-                contentKey
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                kind = excluded.kind,
-                copiedAt = excluded.copiedAt,
-                firstCopiedAt = excluded.firstCopiedAt,
-                expiresAt = excluded.expiresAt,
-                copySequenceID = excluded.copySequenceID,
-                copySequenceOrder = excluded.copySequenceOrder,
-                byteSize = excluded.byteSize,
-                copyCount = excluded.copyCount,
-                isFavorite = excluded.isFavorite,
-                favoriteOrder = excluded.favoriteOrder,
-                sourceAppName = excluded.sourceAppName,
-                sourceBundleIdentifier = excluded.sourceBundleIdentifier,
-                sensitivity = excluded.sensitivity,
-                isEncrypted = excluded.isEncrypted,
-                title = excluded.title,
-                textPreview = excluded.textPreview,
-                characterCount = excluded.characterCount,
-                containsPreviewSecret = excluded.containsPreviewSecret,
-                containsRestSecret = excluded.containsRestSecret,
-                hasRecognizedText = excluded.hasRecognizedText,
-                hasQRCodeText = excluded.hasQRCodeText,
-                isSVGText = excluded.isSVGText,
-                hasFormatting = excluded.hasFormatting,
-                htmlDigest = excluded.htmlDigest,
-                imageDigest = excluded.imageDigest,
-                imageWidth = excluded.imageWidth,
-                imageHeight = excluded.imageHeight,
-                assetPath = excluded.assetPath,
-                filePathsData = excluded.filePathsData,
-                linkPreviewData = excluded.linkPreviewData,
-                contentKey = excluded.contentKey
-            """
-
         let arguments: StatementArguments = [
             idString,
             item.kind.rawValue,
@@ -2947,7 +3116,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             contentKeyBlob,
         ]
 
-        try db.execute(sql: sql, arguments: arguments)
+        let stmt = try db.cachedStatement(sql: upsertClipSQL)
+        try stmt.execute(arguments: arguments)
     }
 
     private static func writeClipContentsRow(
@@ -3017,22 +3187,17 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             keys: keys
         ) : nil
 
-        var updateClauses: [String] = []
-        if effectiveWritesBody {
-            updateClauses.append("text = excluded.text")
-            updateClauses.append("qrCodeText = excluded.qrCodeText")
+        let sql: String
+        switch (effectiveWritesBody, effectiveWritesFormatting) {
+        case (true, true):
+            sql = upsertClipContentsBodyAndFormattingSQL
+        case (true, false):
+            sql = upsertClipContentsBodyOnlySQL
+        default:
+            sql = upsertClipContentsFormattingOnlySQL
         }
-        if effectiveWritesFormatting {
-            updateClauses.append("rtf = excluded.rtf")
-            updateClauses.append("html = excluded.html")
-        }
-
-        let sql = """
-            INSERT INTO clip_contents (clipId, text, qrCodeText, rtf, html)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(clipId) DO UPDATE SET \(updateClauses.joined(separator: ", "))
-            """
-        try db.execute(sql: sql, arguments: [idString, textBlob, qrBlob, rtfBlob, htmlBlob])
+        let stmt = try db.cachedStatement(sql: sql)
+        try stmt.execute(arguments: [idString, textBlob, qrBlob, rtfBlob, htmlBlob])
     }
 
     // MARK: - Column AEAD & Row Decoding Helpers
@@ -3677,17 +3842,15 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     private func fetchFullItemByID(
         in db: Database,
         id: UUID,
-        includeTrashed: Bool,
         keys: ClipBookDerivedKeys
     ) throws -> ClipboardItem? {
         let idString = id.uuidString
-        let deletedClause = includeTrashed ? "" : " AND c.deletedAt IS NULL"
         let sql = """
             SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText,
                    cc.rtf AS bodyRTF, cc.html AS bodyHTML
             FROM clips c
             LEFT JOIN clip_contents cc ON cc.clipId = c.id
-            WHERE c.id = ?\(deletedClause)
+            WHERE c.id = ?
             LIMIT 1
             """
         guard let row = try Row.fetchOne(db, sql: sql, arguments: [idString]) else {
@@ -3773,13 +3936,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         return tags
     }
 
-    private func fetchTagAttachments(in db: Database, trashedFilter: Bool?) throws -> [String: TagAttachment] {
-        let whereClause: String
-        if let trashedFilter {
-            whereClause = trashedFilter ? "WHERE c.deletedAt IS NOT NULL" : "WHERE c.deletedAt IS NULL"
-        } else {
-            whereClause = ""
-        }
+    private func fetchTagAttachments(in db: Database, trashedFilter: Bool) throws -> [String: TagAttachment] {
+        let whereClause = trashedFilter ? "WHERE c.deletedAt IS NOT NULL" : "WHERE c.deletedAt IS NULL"
 
         let sql = """
             SELECT ct.clipId, ct.tagId, ct.sortOrder, t.name
@@ -3893,7 +4051,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     }
 
     private func migrateLegacyDatabaseToV5(keys: ClipBookDerivedKeys) throws {
-        // Clean up any stale partial migration artifacts first.
         removeMigratingArtifacts()
 
         var legacyConfig = Configuration()
@@ -4078,7 +4235,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                                         requiresEncryption: false
                                     ) {
                                         item.imageDigest = HistoryCrypto.imageDigest(forPNGData: imageBytes, keys: keys)
-                                        if let dims = Self.pixelDimensions(ofImageData: imageBytes) {
+                                        if let dims = ClipboardItem.pixelDimensions(of: imageBytes) {
                                             item.imageWidth = dims.width
                                             item.imageHeight = dims.height
                                         }
@@ -4117,18 +4274,18 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                                 } else {
                                     if let assetPath = item.assetPath {
                                         nonSensitiveReferencedCanonicalURLs.insert(
-                                            Self.canonicalFileURL(URL(fileURLWithPath: assetPath, isDirectory: false))
+                                            ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: assetPath, isDirectory: false))
                                         )
                                     }
                                     if let details = item.linkPreviewDetails {
                                         if let imagePath = details.imagePath {
                                             nonSensitiveReferencedCanonicalURLs.insert(
-                                                Self.canonicalFileURL(URL(fileURLWithPath: imagePath, isDirectory: false))
+                                                ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: imagePath, isDirectory: false))
                                             )
                                         }
                                         if let faviconPath = details.faviconPath {
                                             nonSensitiveReferencedCanonicalURLs.insert(
-                                                Self.canonicalFileURL(URL(fileURLWithPath: faviconPath, isDirectory: false))
+                                                ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: faviconPath, isDirectory: false))
                                             )
                                         }
                                     }
@@ -4175,12 +4332,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                                     keys: keys
                                 )
 
-                                let idString = item.id.uuidString
-                                for tagID in validOrderedTags {
-                                    try migDB.execute(
-                                        sql: "INSERT OR IGNORE INTO clip_tags (clipId, tagId, sortOrder) VALUES (?, ?, ?)",
-                                        arguments: [idString, tagID, item.tagOrders[tagID]]
+                                if !validOrderedTags.isEmpty {
+                                    let insertTagStmt = try migDB.cachedStatement(
+                                        sql: "INSERT OR IGNORE INTO clip_tags (clipId, tagId, sortOrder) VALUES (?, ?, ?)"
                                     )
+                                    let idString = item.id.uuidString
+                                    for tagID in validOrderedTags {
+                                        try insertTagStmt.execute(arguments: [idString, tagID, item.tagOrders[tagID]])
+                                    }
                                 }
                             }
                             return .commit
@@ -4189,7 +4348,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 }
             }
 
-            // Final Phase A commit: write key_verifier_v1 + PRAGMA user_version = 5 ONLY after all rows succeed.
+            // Commit key_verifier_v1 and user_version = 5 only after all migrated rows succeed.
             try openedMigrating.inTransaction(.immediate) { migDB in
                 let verifier = HistoryCrypto.makeKeyVerifier(keys: keys)
                 try migDB.execute(
@@ -4216,7 +4375,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             throw error
         }
 
-        // Phase B: Zero-Gap Atomic Cutover & Zero-Fill Scrub.
+        // Atomically cut over History.sqlite and scrub legacy plaintext files.
         let unsharedSensitiveLegacyURLs = candidateLegacySensitiveSourceURLs.subtracting(nonSensitiveReferencedCanonicalURLs)
 
         if Self.fileOrSymlinkExists(at: scrubbingDBURL) {
@@ -4230,7 +4389,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         if Darwin.link(databaseURL.path, scrubbingDBURL.path) != 0 {
             let linkErr = errno
             if linkErr == ENOTSUP || linkErr == EXDEV || linkErr == EPERM {
-                try Self.copyRegularFile0600(from: databaseURL, to: scrubbingDBURL)
+                try Self.copyRegularFile0600(
+                    from: databaseURL,
+                    to: scrubbingDBURL,
+                    fullFsync: true,
+                    failureError: HistoryStoreError.migrationFailed(
+                        "Unable to copy legacy database for scrubbing (errno \(linkErr))"
+                    )
+                )
             } else if linkErr != ENOENT {
                 throw HistoryStoreError.migrationFailed("Unable to stage History.sqlite.scrubbing (errno \(linkErr))")
             }
@@ -4311,8 +4477,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         )
         stagedEncURLs.append(stagedURL)
 
-        let canonicalSource = Self.canonicalFileURL(sourceURL)
-        let canonicalStaged = Self.canonicalFileURL(stagedURL)
+        let canonicalSource = ImageAssetStore.canonicalFileURL(sourceURL)
+        let canonicalStaged = ImageAssetStore.canonicalFileURL(stagedURL)
         if canonicalSource != canonicalStaged && assetStore.isManagedAssetURL(sourceURL) {
             candidateLegacySensitiveSourceURLs.insert(canonicalSource)
         }
@@ -4344,16 +4510,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         return decoder
     }
 
-    private static func pixelDimensions(ofImageData data: Data) -> (width: Int, height: Int)? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = props[kCGImagePropertyPixelWidth] as? Int,
-              let height = props[kCGImagePropertyPixelHeight] as? Int else {
-            return nil
-        }
-        return (width, height)
-    }
-
     private static func fileOrSymlinkExists(at url: URL) -> Bool {
         var st = stat()
         return Darwin.lstat(url.path, &st) == 0
@@ -4369,27 +4525,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         return leftStat.st_dev == rightStat.st_dev && leftStat.st_ino == rightStat.st_ino
     }
 
-    private static func canonicalFileURL(_ fileURL: URL) -> URL {
-        canonicalDirectoryURL(fileURL.deletingLastPathComponent())
-            .appendingPathComponent(fileURL.lastPathComponent, isDirectory: false)
-            .standardizedFileURL
-    }
-
-    private static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
-        let standardized = directoryURL.standardizedFileURL
-        if standardized.path == "/" || standardized.path.isEmpty {
-            return standardized
-        }
-        var st = stat()
-        if stat(standardized.path, &st) == 0 {
-            return standardized.resolvingSymlinksInPath().standardizedFileURL
-        }
-        let parent = canonicalDirectoryURL(standardized.deletingLastPathComponent())
-        return parent
-            .appendingPathComponent(standardized.lastPathComponent, isDirectory: true)
-            .standardizedFileURL
-    }
-
     private static func fullFsyncFile(at url: URL) throws {
         let fd = Darwin.open(url.path, O_RDWR | O_NOFOLLOW)
         guard fd >= 0 else {
@@ -4400,60 +4535,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
         if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
             _ = Darwin.fsync(fd)
-        }
-    }
-
-    private static func copyRegularFile0600(from sourceURL: URL, to destinationURL: URL) throws {
-        let inFD = Darwin.open(sourceURL.path, O_RDONLY | O_NOFOLLOW)
-        guard inFD >= 0 else {
-            throw HistoryStoreError.migrationFailed("Unable to open legacy database for scrubbing copy (errno \(errno))")
-        }
-        defer {
-            _ = Darwin.close(inFD)
-        }
-
-        let outFD = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, mode_t(0o600))
-        guard outFD >= 0 else {
-            throw HistoryStoreError.migrationFailed("Unable to create scrubbing copy (errno \(errno))")
-        }
-        _ = Darwin.fchmod(outFD, mode_t(0o600))
-
-        let chunkSize = 64 * 1024
-        var buffer = [UInt8](repeating: 0, count: chunkSize)
-        do {
-            try buffer.withUnsafeMutableBytes { rawBuffer in
-                guard let base = rawBuffer.baseAddress else { return }
-                while true {
-                    let bytesRead = Darwin.read(inFD, base, chunkSize)
-                    if bytesRead > 0 {
-                        var writtenTotal = 0
-                        while writtenTotal < bytesRead {
-                            let written = Darwin.write(outFD, base.advanced(by: writtenTotal), bytesRead - writtenTotal)
-                            if written > 0 {
-                                writtenTotal += written
-                            } else if written < 0 && errno == EINTR {
-                                continue
-                            } else {
-                                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                            }
-                        }
-                    } else if bytesRead == 0 {
-                        break
-                    } else if errno == EINTR {
-                        continue
-                    } else {
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                }
-            }
-            if Darwin.fcntl(outFD, F_FULLFSYNC) != 0 {
-                _ = Darwin.fsync(outFD)
-            }
-            _ = Darwin.close(outFD)
-        } catch {
-            _ = Darwin.close(outFD)
-            ImageAssetStore.secureUnlink(at: destinationURL)
-            throw error
         }
     }
 }

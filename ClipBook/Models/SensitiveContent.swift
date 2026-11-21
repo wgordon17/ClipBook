@@ -505,7 +505,7 @@ nonisolated enum SensitiveContent {
 
     nonisolated(unsafe) private static let restVerdictCache: NSCache<NSString, CachedRestVerdict> = {
         let cache = NSCache<NSString, CachedRestVerdict>()
-        cache.countLimit = 4_000
+        cache.countLimit = 32_768
         return cache
     }()
 

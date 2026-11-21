@@ -7,10 +7,10 @@ import SwiftUI
 import Testing
 import UniformTypeIdentifiers
 
-/// Container suite for tests that mutate process-global state such as the `L10n` language.
-/// Suites nested in `SharedProcessStateTests` run one after the other, but other suites still
-/// run beside them, so a test that reads localized text compares it with text produced in the
-/// same language instead of with fixed English strings.
+/// Container suite for tests that mutate process-global state such as the `L10n` language,
+/// `ImageDragFiles`, `ImageAssetThumbnailLoader.shared`, and `SVGImageRenderer.shared`.
+/// Suites nested in `SharedProcessStateTests` run one after the other so process-wide caches,
+/// temporary drag directories, and window/localization state never interleave across suites.
 @Suite(.serialized)
 enum SharedProcessStateTests {}
 
@@ -43,6 +43,7 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
         var loadingContentCalls: [LoadingContentCall] = []
         var upsertCallIDs: [UUID] = []
         var fetchSearchTextsCalls: [FetchSearchTextsCall] = []
+        var fetchItemsWhereCalls: Int = 0
         var shouldThrowOnFetchSearchTexts = false
         var suppressBrowserURLOnLoadingContent = false
         var resolvedBrowserURLsOnLoadingContent: [URL] = []
@@ -67,6 +68,10 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
         state.withLock { $0.fetchSearchTextsCalls }
     }
 
+    var fetchItemsWhereCalls: Int {
+        state.withLock { $0.fetchItemsWhereCalls }
+    }
+
     var resolvedBrowserURLsOnLoadingContent: [URL] {
         state.withLock { $0.resolvedBrowserURLsOnLoadingContent }
     }
@@ -86,6 +91,7 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
             $0.loadingContentCalls.removeAll()
             $0.upsertCallIDs.removeAll()
             $0.fetchSearchTextsCalls.removeAll()
+            $0.fetchItemsWhereCalls = 0
             $0.resolvedBrowserURLsOnLoadingContent.removeAll()
         }
     }
@@ -212,7 +218,8 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
     }
 
     func fetchItems(where isIncluded: (ClipboardItem) -> Bool) throws -> [ClipboardItem] {
-        try base.fetchItems(where: isIncluded)
+        state.withLock { $0.fetchItemsWhereCalls += 1 }
+        return try base.fetchItems(where: isIncluded)
     }
 
     func fetchMostRecentItem(where isIncluded: (ClipboardItem) -> Bool) throws -> ClipboardItem? {

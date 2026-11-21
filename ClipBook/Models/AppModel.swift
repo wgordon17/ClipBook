@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import AppKit
-import Carbon
 import Combine
 
 enum HistorySortOption: String, CaseIterable, Equatable {
@@ -282,7 +280,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    struct SearchCorpusDescriptor: Sendable {
+    nonisolated struct SearchCorpusDescriptor: Sendable {
         let revision: Int
         let headers: [ClipboardItem]
         let isTrashed: Bool
@@ -331,79 +329,31 @@ final class AppModel: ObservableObject {
     }
 
     func makeSearchCorpus(using store: (any HistoryStore)? = nil) -> HistorySearchCorpus {
-        if let cachedSearchCorpus,
-           cachedSearchCorpus.revision == sortedListRevision,
-           cachedSearchCorpus.hasCompleteTexts {
-            return cachedSearchCorpus
+        let descriptor = prepareSearchCorpusDescriptor()
+        if let cached = descriptor.cachedCorpus {
+            return cached
         }
 
-        let items = listedItems
-        let sortedIndexes = sortedListedIndexes(for: items)
-        let count = sortedIndexes.count
-        let tagNamesByID = Dictionary(uniqueKeysWithValues: tags.map { ($0.id, $0.name) })
-        let donor = cachedSearchCorpus ?? searchResult?.corpus
-
-        var ids = [UUID](repeating: UUID(), count: count)
-        var revisions = [UInt64](repeating: 0, count: count)
-        var texts = [String](repeating: "", count: count)
-        var missingSlots: [(slotIndex: Int, id: UUID)] = []
-
-        items.withUnsafeBufferPointer { itemsBuffer in
-            sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
-                for i in 0..<count {
-                    let header = itemsBuffer[indexesBuffer[i]]
-                    ids[i] = header.id
-                    if header.isContentLoaded {
-                        texts[i] = header.searchText
-                        revisions[i] = header.searchRevision
-                    } else if let reused = donor?.reusableText(for: header, tagNamesByID: tagNamesByID) {
-                        texts[i] = reused
-                        revisions[i] = header.searchRevision
-                    } else {
-                        missingSlots.append((slotIndex: i, id: header.id))
-                    }
-                }
-            }
-        }
-
-        let didFetchSucceed: Bool
-        var usedFallback = false
-        if !missingSlots.isEmpty {
-            let fetchedTexts: [String?]? = store.flatMap {
-                try? $0.fetchSearchTexts(
-                    for: missingSlots.map(\.id),
-                    trashed: isShowingTrash,
+        let fetcher: ((_ ids: [UUID], _ trashed: Bool, _ tagNamesByID: [Tag.ID: String], _ isCancelled: () -> Bool) throws -> [String?]?)? = store.map { store in
+            { ids, trashed, tagNamesByID, isCancelled in
+                try store.fetchSearchTexts(
+                    for: ids,
+                    trashed: trashed,
                     tagNamesByID: tagNamesByID,
-                    isCancelled: { false }
+                    isCancelled: isCancelled
                 )
             }
-            didFetchSucceed = fetchedTexts != nil
-            items.withUnsafeBufferPointer { itemsBuffer in
-                sortedIndexes.withUnsafeBufferPointer { indexesBuffer in
-                    for (offset, slot) in missingSlots.enumerated() {
-                        let header = itemsBuffer[indexesBuffer[slot.slotIndex]]
-                        if let fetchedTexts, offset < fetchedTexts.count, let fetchedSlot = fetchedTexts[offset] {
-                            texts[slot.slotIndex] = fetchedSlot
-                            revisions[slot.slotIndex] = header.searchRevision
-                        } else {
-                            usedFallback = true
-                            texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
-                            revisions[slot.slotIndex] = 0
-                        }
-                    }
-                }
-            }
-        } else {
-            didFetchSucceed = true
         }
 
-        let corpus = HistorySearchCorpus(
-            revision: sortedListRevision,
-            ids: ids,
-            revisions: revisions,
-            texts: texts,
-            tagNamesByID: tagNamesByID,
-            hasCompleteTexts: didFetchSucceed && !usedFallback
+        let corpus = HistorySearchCorpus.resolve(
+            descriptor,
+            previousCorpus: nil,
+            fetchSearchTexts: fetcher
+        ) ?? HistorySearchCorpus(
+            revision: descriptor.revision,
+            ids: [],
+            texts: [],
+            hasCompleteTexts: false
         )
         if corpus.hasCompleteTexts {
             let oldCorpus = cachedSearchCorpus

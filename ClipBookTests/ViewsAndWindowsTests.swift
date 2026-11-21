@@ -204,181 +204,6 @@ enum ViewsAndWindowsTests {
         }
     }
 
-    /// A link row decodes the pictures of a stored preview in the background. Each test uses
-    /// files of its own, so the shared thumbnail loader has nothing cached for them.
-    @Suite
-    struct LinkRowImageLoadingTests {
-        private static let pageURL = URL(string: "https://site.example/page")!
-
-        private enum Picture: CaseIterable, Sendable {
-            case favicon
-            case preview
-        }
-
-        private enum Change: CaseIterable, Sendable {
-            case maskedWhileLoading
-            case reusedForAnotherItemWhileLoading
-            case previewsTurnedOffWhileLoading
-        }
-
-        private static var screenScale: CGFloat { NSScreen.main?.backingScaleFactor ?? 2 }
-
-        private static var faviconPixelSize: Int {
-            let side = HistoryRow.typeIconSize
-            return ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: CGSize(width: side, height: side), scale: screenScale)
-        }
-
-        private static var previewPixelSize: Int {
-            let size = CGSize(width: HistoryRow.linkPreviewImageWidth * 2, height: HistoryRow.linkPreviewImageHeight * 2)
-            return ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: size, scale: screenScale)
-        }
-
-        private static func writePNG(named name: String, width: Int, height: Int, in directory: URL) throws -> URL {
-            let rep = try TestSupport.makeBitmap(pixelsWide: width, pixelsHigh: height)
-            let url = directory.appendingPathComponent(name)
-            try #require(rep.representation(using: .png, properties: [:])).write(to: url)
-            return url
-        }
-
-        /// Returns once the row's request for `url` has delivered its result. The loader calls
-        /// the requests for one picture in the order they were made, so a request made after the
-        /// row's is answered after it.
-        @MainActor
-        private static func waitForDecode(of url: URL, maximumPixelSize: Int) async {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let cached = ImageAssetThumbnailLoader.shared.thumbnail(for: url, maximumPixelSize: maximumPixelSize) { _ in
-                    continuation.resume()
-                }
-                if cached != nil {
-                    // Decoded already: the row's callback is queued on the main queue ahead of this one.
-                    DispatchQueue.main.async { continuation.resume() }
-                }
-            }
-        }
-
-        @MainActor
-        private static func toolTips(in view: NSView) -> [String] {
-            ([view.toolTip].compactMap { $0 }) + view.subviews.flatMap { toolTips(in: $0) }
-        }
-
-        @MainActor
-        private static func previewImageViews(in view: NSView) -> [NSImageView] {
-            let own = (view as? NSImageView).map { String(describing: type(of: $0)).contains("AspectFill") ? [$0] : [] } ?? []
-            return own + view.subviews.flatMap { previewImageViews(in: $0) }
-        }
-
-        @MainActor
-        private static func makeRow() -> HistoryItemRowLinkView {
-            HistoryItemRowLinkView(frame: NSRect(x: 0, y: 0, width: 480, height: HistoryRow.height))
-        }
-
-        @Test(.timeLimit(.minutes(1)))
-        @MainActor
-        func faviconIsShownOnceDecoded() async throws {
-            TestSupport.ensureAppKitInitialized()
-            try await TestSupport.withTemporaryDirectory { directory in
-                let faviconURL = try Self.writePNG(named: "favicon.png", width: 32, height: 32, in: directory)
-                let preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, faviconURL: faviconURL)
-                let row = Self.makeRow()
-
-                row.configureForTest(item: .fixture(kind: .link, text: Self.pageURL.absoluteString), linkPreview: preview, showsLinkPreview: true)
-                #expect(!Self.toolTips(in: row).contains("site.example"))
-
-                await Self.waitForDecode(of: faviconURL, maximumPixelSize: Self.faviconPixelSize)
-                #expect(Self.toolTips(in: row).contains("site.example"))
-            }
-        }
-
-        @Test(.timeLimit(.minutes(1)))
-        @MainActor
-        func previewImageIsShownOnceDecoded() async throws {
-            TestSupport.ensureAppKitInitialized()
-            try await TestSupport.withTemporaryDirectory { directory in
-                let imageURL = try Self.writePNG(named: "preview.png", width: 96, height: 48, in: directory)
-                let preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, imageURL: imageURL)
-                let row = Self.makeRow()
-
-                row.configureForTest(item: .fixture(kind: .link, text: Self.pageURL.absoluteString), linkPreview: preview, showsLinkPreview: true)
-                let imageView = try #require(Self.previewImageViews(in: row).first)
-                #expect(imageView.image == nil)
-
-                await Self.waitForDecode(of: imageURL, maximumPixelSize: Self.previewPixelSize)
-                #expect(imageView.image != nil)
-            }
-        }
-
-        @Test(.timeLimit(.minutes(1)), arguments: Picture.allCases, Change.allCases)
-        @MainActor
-        private func aPictureThatArrivesAfterTheRowChangedIsNotShown(picture: Picture, change: Change) async throws {
-            TestSupport.ensureAppKitInitialized()
-            try await TestSupport.withTemporaryDirectory { directory in
-                let pictureURL = try Self.writePNG(named: "picture.png", width: 32, height: 32, in: directory)
-                let preview: LinkPreview
-                let pixelSize: Int
-                switch picture {
-                case .favicon:
-                    preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, faviconURL: pictureURL)
-                    pixelSize = Self.faviconPixelSize
-                case .preview:
-                    preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, imageURL: pictureURL)
-                    pixelSize = Self.previewPixelSize
-                }
-                let itemID = UUID()
-                let row = Self.makeRow()
-
-                row.configureForTest(
-                    item: .fixture(id: itemID, kind: .link, text: Self.pageURL.absoluteString),
-                    linkPreview: preview,
-                    showsLinkPreview: true
-                )
-                // The picture view stays with the row when it is no longer shown.
-                let previewImageView = Self.previewImageViews(in: row).first
-
-                // A row that stays as it is. The loader answers the requests for one picture in
-                // the order they were made, so once the wait below is over, this row has been
-                // answered too, which shows that the wait used the same request as the rows.
-                let controlRow = Self.makeRow()
-                controlRow.configureForTest(
-                    item: .fixture(kind: .link, text: Self.pageURL.absoluteString),
-                    linkPreview: preview,
-                    showsLinkPreview: true
-                )
-                let controlImageView = Self.previewImageViews(in: controlRow).first
-
-                switch change {
-                case .maskedWhileLoading:
-                    row.configureForTest(
-                        item: .fixture(id: itemID, kind: .link, text: Self.pageURL.absoluteString, sensitivity: .sensitive),
-                        linkPreview: preview,
-                        showsLinkPreview: true
-                    )
-                case .reusedForAnotherItemWhileLoading:
-                    row.prepareForReuse()
-                    row.configureForTest(
-                        item: .fixture(kind: .link, text: "https://other.example/page"),
-                        showsLinkPreview: true
-                    )
-                case .previewsTurnedOffWhileLoading:
-                    row.configureForTest(
-                        item: .fixture(id: itemID, kind: .link, text: Self.pageURL.absoluteString),
-                        linkPreview: preview,
-                        showsLinkPreview: false
-                    )
-                }
-
-                await Self.waitForDecode(of: pictureURL, maximumPixelSize: pixelSize)
-                switch picture {
-                case .favicon:
-                    #expect(Self.toolTips(in: controlRow).contains("site.example"), "The loader had not answered the control row")
-                    #expect(!Self.toolTips(in: row).contains("site.example"))
-                case .preview:
-                    #expect(try #require(controlImageView).image != nil, "The loader had not answered the control row")
-                    #expect(try #require(previewImageView).image == nil)
-                }
-            }
-        }
-    }
-
     @Suite
     struct ViewsDialogsAndWindowsTests {
         private static let rowFrame = NSRect(x: 0, y: 0, width: 480, height: HistoryRow.height)
@@ -1348,6 +1173,181 @@ enum ViewsAndWindowsTests {
 // Saving applies appearance and language, which are process-wide, and key-window
 // presentation mutates process-global NSApp focus state.
 extension SharedProcessStateTests {
+    /// A link row decodes the pictures of a stored preview in the background via
+    /// `ImageAssetThumbnailLoader.shared`.
+    @Suite(.serialized)
+    struct LinkRowImageLoadingTests {
+        private static let pageURL = URL(string: "https://site.example/page")!
+
+        private enum Picture: CaseIterable, Sendable {
+            case favicon
+            case preview
+        }
+
+        private enum Change: CaseIterable, Sendable {
+            case maskedWhileLoading
+            case reusedForAnotherItemWhileLoading
+            case previewsTurnedOffWhileLoading
+        }
+
+        private static var screenScale: CGFloat { NSScreen.main?.backingScaleFactor ?? 2 }
+
+        private static var faviconPixelSize: Int {
+            let side = HistoryRow.typeIconSize
+            return ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: CGSize(width: side, height: side), scale: screenScale)
+        }
+
+        private static var previewPixelSize: Int {
+            let size = CGSize(width: HistoryRow.linkPreviewImageWidth * 2, height: HistoryRow.linkPreviewImageHeight * 2)
+            return ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: size, scale: screenScale)
+        }
+
+        private static func writePNG(named name: String, width: Int, height: Int, in directory: URL) throws -> URL {
+            let rep = try TestSupport.makeBitmap(pixelsWide: width, pixelsHigh: height)
+            let url = directory.appendingPathComponent(name)
+            try #require(rep.representation(using: .png, properties: [:])).write(to: url)
+            return url
+        }
+
+        /// Returns once the row's request for `url` has delivered its result. The loader calls
+        /// the requests for one picture in the order they were made, so a request made after the
+        /// row's is answered after it.
+        @MainActor
+        private static func waitForDecode(of url: URL, maximumPixelSize: Int) async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let cached = ImageAssetThumbnailLoader.shared.thumbnail(for: url, maximumPixelSize: maximumPixelSize) { _ in
+                    continuation.resume()
+                }
+                if cached != nil {
+                    // Decoded already: the row's callback is queued on the main queue ahead of this one.
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+        }
+
+        @MainActor
+        private static func toolTips(in view: NSView) -> [String] {
+            ([view.toolTip].compactMap { $0 }) + view.subviews.flatMap { toolTips(in: $0) }
+        }
+
+        @MainActor
+        private static func previewImageViews(in view: NSView) -> [NSImageView] {
+            let own = (view as? NSImageView).map { String(describing: type(of: $0)).contains("AspectFill") ? [$0] : [] } ?? []
+            return own + view.subviews.flatMap { previewImageViews(in: $0) }
+        }
+
+        @MainActor
+        private static func makeRow() -> HistoryItemRowLinkView {
+            HistoryItemRowLinkView(frame: NSRect(x: 0, y: 0, width: 480, height: HistoryRow.height))
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func faviconIsShownOnceDecoded() async throws {
+            TestSupport.ensureAppKitInitialized()
+            try await TestSupport.withTemporaryDirectory { directory in
+                let faviconURL = try Self.writePNG(named: "favicon.png", width: 32, height: 32, in: directory)
+                let preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, faviconURL: faviconURL)
+                let row = Self.makeRow()
+
+                row.configureForTest(item: .fixture(kind: .link, text: Self.pageURL.absoluteString), linkPreview: preview, showsLinkPreview: true)
+                #expect(!Self.toolTips(in: row).contains("site.example"))
+
+                await Self.waitForDecode(of: faviconURL, maximumPixelSize: Self.faviconPixelSize)
+                #expect(Self.toolTips(in: row).contains("site.example"))
+            }
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func previewImageIsShownOnceDecoded() async throws {
+            TestSupport.ensureAppKitInitialized()
+            try await TestSupport.withTemporaryDirectory { directory in
+                let imageURL = try Self.writePNG(named: "preview.png", width: 96, height: 48, in: directory)
+                let preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, imageURL: imageURL)
+                let row = Self.makeRow()
+
+                row.configureForTest(item: .fixture(kind: .link, text: Self.pageURL.absoluteString), linkPreview: preview, showsLinkPreview: true)
+                let imageView = try #require(Self.previewImageViews(in: row).first)
+                #expect(imageView.image == nil)
+
+                await Self.waitForDecode(of: imageURL, maximumPixelSize: Self.previewPixelSize)
+                #expect(imageView.image != nil)
+            }
+        }
+
+        @Test(.timeLimit(.minutes(1)), arguments: Picture.allCases, Change.allCases)
+        @MainActor
+        private func aPictureThatArrivesAfterTheRowChangedIsNotShown(picture: Picture, change: Change) async throws {
+            TestSupport.ensureAppKitInitialized()
+            try await TestSupport.withTemporaryDirectory { directory in
+                let pictureURL = try Self.writePNG(named: "picture.png", width: 32, height: 32, in: directory)
+                let preview: LinkPreview
+                let pixelSize: Int
+                switch picture {
+                case .favicon:
+                    preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, faviconURL: pictureURL)
+                    pixelSize = Self.faviconPixelSize
+                case .preview:
+                    preview = LinkPreview(url: Self.pageURL, title: "Site", description: nil, image: nil, favicon: nil, imageURL: pictureURL)
+                    pixelSize = Self.previewPixelSize
+                }
+                let itemID = UUID()
+                let row = Self.makeRow()
+
+                row.configureForTest(
+                    item: .fixture(id: itemID, kind: .link, text: Self.pageURL.absoluteString),
+                    linkPreview: preview,
+                    showsLinkPreview: true
+                )
+                // The picture view stays with the row when it is no longer shown.
+                let previewImageView = Self.previewImageViews(in: row).first
+
+                // A row that stays as it is. The loader answers the requests for one picture in
+                // the order they were made, so once the wait below is over, this row has been
+                // answered too, which shows that the wait used the same request as the rows.
+                let controlRow = Self.makeRow()
+                controlRow.configureForTest(
+                    item: .fixture(kind: .link, text: Self.pageURL.absoluteString),
+                    linkPreview: preview,
+                    showsLinkPreview: true
+                )
+                let controlImageView = Self.previewImageViews(in: controlRow).first
+
+                switch change {
+                case .maskedWhileLoading:
+                    row.configureForTest(
+                        item: .fixture(id: itemID, kind: .link, text: Self.pageURL.absoluteString, sensitivity: .sensitive),
+                        linkPreview: preview,
+                        showsLinkPreview: true
+                    )
+                case .reusedForAnotherItemWhileLoading:
+                    row.prepareForReuse()
+                    row.configureForTest(
+                        item: .fixture(kind: .link, text: "https://other.example/page"),
+                        showsLinkPreview: true
+                    )
+                case .previewsTurnedOffWhileLoading:
+                    row.configureForTest(
+                        item: .fixture(id: itemID, kind: .link, text: Self.pageURL.absoluteString),
+                        linkPreview: preview,
+                        showsLinkPreview: false
+                    )
+                }
+
+                await Self.waitForDecode(of: pictureURL, maximumPixelSize: pixelSize)
+                switch picture {
+                case .favicon:
+                    #expect(Self.toolTips(in: controlRow).contains("site.example"), "The loader had not answered the control row")
+                    #expect(!Self.toolTips(in: row).contains("site.example"))
+                case .preview:
+                    #expect(try #require(controlImageView).image != nil, "The loader had not answered the control row")
+                    #expect(try #require(previewImageView).image == nil)
+                }
+            }
+        }
+    }
+
     @Suite(.serialized)
     struct HistoryWindowBehaviorTests {
         @Test
@@ -2715,6 +2715,421 @@ extension SharedProcessStateTests {
             let rehiddenTile = try #require(findTileView(in: contentRoot))
             #expect(!hasDecodedTileScreenshot(in: rehiddenTile), "Re-hiding concealed tile via Cmd+U must clear screenshot back to placeholder")
             #expect(harness.model.items.allSatisfy { !$0.isContentLoaded })
+        }
+
+        @Test
+        @MainActor
+        func activeSearchRefreshUpdatesListPaneForLongTailAndQRCodeCapturesAndStoreUnlock() async throws {
+            TestSupport.ensureAppKitInitialized()
+
+            let (harness, spyStore, _) = try TestSupport.makeSpiedTestCoordinator()
+            defer { harness.cleanup() }
+            let store = spyStore.base
+            harness.model.preferences.showPreviewPane = false
+
+            let baseTime = Date(timeIntervalSince1970: 1_705_000_000)
+            let initialItem = ClipboardItem.fixture(
+                kind: .text,
+                text: "Unrelated baseline clip",
+                copiedAt: baseTime
+            )
+            try harness.seedHistory([initialItem])
+
+            let hostWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            hostWindow.isReleasedWhenClosed = false
+            hostWindow.alphaValue = 0
+            let contentVC = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
+            hostWindow.contentViewController = contentVC
+            let toolbar = HistoryToolbar()
+            toolbar.delegate = contentVC
+            contentVC.attachToolbar(toolbar)
+            defer {
+                TestSupport.drainDelayedPerforms([hostWindow, contentVC] + contentVC.children)
+                hostWindow.orderOut(nil)
+                hostWindow.contentViewController = nil
+                TestSupport.drainDelayedPerforms([contentVC])
+            }
+            contentVC.view.layoutSubtreeIfNeeded()
+
+            let listPane = try #require(
+                Self.allDescendants(in: contentVC.view).compactMap { $0 as? History }.first
+            )
+            #expect(listPane.items.map(\.id) == [initialItem.id])
+
+            let query = "deep_refresh_needle_901"
+            contentVC.historyToolbar(toolbar, didChangeSearchQuery: query)
+            let initialSearchSettled = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                harness.model.searchQuery == query
+                    && harness.model.searchResult?.terms == HistorySearchTerms(query: query)
+                    && listPane.items.isEmpty
+            }
+            #expect(initialSearchSettled)
+
+            // 1. Insert unloaded >8,096-char text item whose matching token sits past textPreview.
+            let longTextBody = String(repeating: "a", count: 12_400) + " " + query
+            let savedLongText = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(
+                    kind: .text,
+                    text: longTextBody,
+                    copiedAt: baseTime.addingTimeInterval(10)
+                ),
+                convertingExternalAssets: true
+            )
+            let unloadedLongText = savedLongText.unloadingContent()
+            #expect(!unloadedLongText.isContentLoaded)
+            #expect(!(unloadedLongText.textPreview?.contains(query) ?? false))
+            harness.model.items.insert(unloadedLongText, at: 0)
+
+            let longTailMatchedInList = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                listPane.items.map(\.id) == [savedLongText.id]
+            }
+            #expect(longTailMatchedInList, "listPaneView must reload once searchRefreshJob hydrates >8,096-char body")
+
+            // 2. Insert unloaded image item whose matching token lives solely in qrCodeText.
+            let pngData = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemGreen)
+            let qrImgID = UUID()
+            let qrImgURL = try spyStore.writeManagedAsset(pngData: pngData, role: .image, clipID: qrImgID, encrypted: false)
+            let savedQRImg = try spyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(
+                    id: qrImgID,
+                    kind: .image,
+                    text: "Benign screenshot caption",
+                    qrCodeText: "https://qr.example/\(query)",
+                    assetPath: qrImgURL.path,
+                    imageDigest: spyStore.computeImageDigest(forPNGData: pngData),
+                    copiedAt: baseTime.addingTimeInterval(20)
+                ),
+                convertingExternalAssets: true
+            )
+            let unloadedQRImg = savedQRImg.unloadingContent()
+            #expect(!unloadedQRImg.isContentLoaded)
+            #expect(unloadedQRImg.qrCodeText == nil)
+            harness.model.items.insert(unloadedQRImg, at: 0)
+
+            let qrMatchedInList = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                listPane.items.map(\.id) == [savedQRImg.id, savedLongText.id]
+            }
+            #expect(qrMatchedInList, "listPaneView must reload once searchRefreshJob hydrates qrCodeText")
+
+            // 3. Simulate fetchSearchTexts failure (hasCompleteTexts == false): must NOT spin a refresh loop, and must recover on unlock!
+            spyStore.shouldThrowOnFetchSearchTexts = true
+            harness.model.storeLockState = .locked(.userCanceled)
+            spyStore.resetRecordedCalls()
+
+            let thirdLongBody = String(repeating: "b", count: 12_400) + " " + query
+            let savedThirdLong = try store.saveAndReconcileItem(
+                ClipboardItem.fixture(
+                    kind: .text,
+                    text: thirdLongBody,
+                    copiedAt: baseTime.addingTimeInterval(30)
+                ),
+                convertingExternalAssets: true
+            ).unloadingContent()
+            harness.model.items.insert(savedThirdLong, at: 0)
+
+            let degradedSettled = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                harness.model.searchResult?.revision == harness.model.sortedListRevision
+                    && harness.model.searchResult?.corpus.hasCompleteTexts == false
+            }
+            #expect(degradedSettled)
+            let callsAfterLockedDegraded = spyStore.fetchSearchTextsCalls.count
+            try await Task.sleep(for: .milliseconds(160))
+            #expect(
+                spyStore.fetchSearchTextsCalls.count == callsAfterLockedDegraded,
+                "Locked store with hasCompleteTexts == false must not spin background refresh retries"
+            )
+
+            // Even if unlocked while DB still throws, one refresh attempt runs without spinning an infinite loop.
+            harness.model.storeLockState = .unlocked
+            try await Task.sleep(for: .milliseconds(220))
+            let callsAfterUnlockedError = spyStore.fetchSearchTextsCalls.count
+            #expect(callsAfterUnlockedError <= callsAfterLockedDegraded + 2)
+            try await Task.sleep(for: .milliseconds(160))
+            #expect(
+                spyStore.fetchSearchTextsCalls.count == callsAfterUnlockedError,
+                "Persistent DB error while unlocked must not spin an infinite refresh loop"
+            )
+
+            // Once the store recovers and unlocks cleanly, hasCompleteTexts == false re-arms and updates listPaneView!
+            spyStore.shouldThrowOnFetchSearchTexts = false
+            harness.model.storeLockState = .locked(.userCanceled)
+            try await Task.sleep(for: .milliseconds(20))
+            harness.model.storeLockState = .unlocked
+
+            let recoveredAllThree = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                harness.model.searchResult?.corpus.hasCompleteTexts == true
+                    && listPane.items.map(\.id) == [savedThirdLong.id, savedQRImg.id, savedLongText.id]
+            }
+            #expect(recoveredAllThree, "Unlocking store must re-arm incomplete search corpus and reload listPaneView")
+        }
+
+        @Test
+        @MainActor
+        func hydratedSVGRenderingsEvictOnClearAndCloseAndRehidingSensitiveItemsEvictsMediaCaches() async throws {
+            TestSupport.ensureAppKitInitialized()
+
+            // (a) Hydrated SVG renderings (inlineText != nil) evict from SVGImageRenderer.shared on clear(), clear(keepingFavoritesAndTaggedItems: true), and close().
+            try TestSupport.withTemporaryDirectory { svgDir in
+                let makeSVG = { (fill: String, padChar: Character) in
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"48\" height=\"48\"><!-- "
+                        + String(repeating: String(padChar), count: 12_100)
+                        + " --><rect width=\"48\" height=\"48\" fill=\"\(fill)\"/></svg>"
+                }
+
+                let clearAllID = UUID()
+                let keptFavID = UUID()
+                let clearedRegularID = UUID()
+
+                do {
+                    let store = GRDBHistoryStore(directory: svgDir, keyProvider: InMemoryDatabaseKeyProvider())
+                    let savedClearAll = try store.saveAndReconcileItem(
+                        ClipboardItem.fixture(id: clearAllID, kind: .text, text: makeSVG("#1155AA", "c")),
+                        convertingExternalAssets: true
+                    )
+                    let unloadedClearAll = savedClearAll.unloadingContent()
+                    let hydratedClearAll = try store.loadingContent(of: unloadedClearAll, scope: .body)
+                    #expect(hydratedClearAll.isContentLoaded)
+
+                    _ = try #require(SVGImageRenderer.shared.rendering(for: hydratedClearAll))
+                    #expect(SVGImageRenderer.shared.hasCachedRendering(for: clearAllID))
+
+                    try store.clear()
+                    #expect(!SVGImageRenderer.shared.hasCachedRendering(for: clearAllID))
+                    #expect(SVGImageRenderer.shared.rendering(for: unloadedClearAll) == nil)
+
+                    let savedFav = try store.saveAndReconcileItem(
+                        ClipboardItem.fixture(id: keptFavID, kind: .text, text: makeSVG("#22AA55", "f"), isFavorite: true),
+                        convertingExternalAssets: true
+                    )
+                    let savedRegular = try store.saveAndReconcileItem(
+                        ClipboardItem.fixture(id: clearedRegularID, kind: .text, text: makeSVG("#DD4422", "r"), isFavorite: false),
+                        convertingExternalAssets: true
+                    )
+                    let unloadedFav = savedFav.unloadingContent()
+                    let unloadedRegular = savedRegular.unloadingContent()
+                    let hydratedFav = try store.loadingContent(of: unloadedFav, scope: .body)
+                    let hydratedRegular = try store.loadingContent(of: unloadedRegular, scope: .body)
+
+                    _ = try #require(SVGImageRenderer.shared.rendering(for: hydratedFav))
+                    _ = try #require(SVGImageRenderer.shared.rendering(for: hydratedRegular))
+                    #expect(SVGImageRenderer.shared.hasCachedRendering(for: keptFavID))
+                    #expect(SVGImageRenderer.shared.hasCachedRendering(for: clearedRegularID))
+
+                    try store.clear(keepingFavoritesAndTaggedItems: true)
+                    #expect(!SVGImageRenderer.shared.hasCachedRendering(for: clearedRegularID))
+                    #expect(SVGImageRenderer.shared.rendering(for: unloadedRegular) == nil)
+                    #expect(SVGImageRenderer.shared.hasCachedRendering(for: keptFavID))
+
+                    // A rolled-back performInTransaction must not remove deleted SVG IDs or retain inserted SVG IDs in knownSVGClipIDs.
+                    struct RollbackError: Error {}
+                    let rolledBackInsertID = UUID()
+                    let rolledBackInsertItem = ClipboardItem.fixture(
+                        id: rolledBackInsertID,
+                        kind: .text,
+                        text: makeSVG("#9933FF", "x")
+                    )
+                    #expect(throws: RollbackError.self) {
+                        try store.performInTransaction {
+                            try store.delete(keptFavID)
+                            _ = try store.saveAndReconcileItem(rolledBackInsertItem, convertingExternalAssets: true)
+                            throw RollbackError()
+                        }
+                    }
+                    let unloadedRolledBack = rolledBackInsertItem.unloadingContent()
+                    #expect(SVGImageRenderer.shared.rendering(for: unloadedRolledBack) == nil)
+                    SVGImageRenderer.shared.removeRendering(for: keptFavID)
+                    #expect(SVGImageRenderer.shared.rendering(for: unloadedFav) != nil)
+                    #expect(SVGImageRenderer.shared.hasCachedOwnerAssociation(for: keptFavID))
+
+                    // Deleting and re-upserting the same SVG UUID inside one committed performInTransaction preserves knownSVGClipIDs membership.
+                    try store.performInTransaction {
+                        try store.delete(keptFavID)
+                        _ = try store.saveAndReconcileItem(
+                            ClipboardItem.fixture(id: keptFavID, kind: .text, text: makeSVG("#22AA55", "f"), isFavorite: true),
+                            convertingExternalAssets: true
+                        )
+                    }
+                    #expect(!SVGImageRenderer.shared.hasCachedRendering(for: keptFavID))
+                    _ = try #require(SVGImageRenderer.shared.rendering(for: hydratedFav))
+                    #expect(SVGImageRenderer.shared.hasCachedRendering(for: keptFavID))
+                    #expect(SVGImageRenderer.shared.hasCachedOwnerAssociation(for: keptFavID))
+
+                    store.close()
+                    #expect(!SVGImageRenderer.shared.hasCachedRendering(for: keptFavID))
+                    #expect(SVGImageRenderer.shared.rendering(for: unloadedFav) == nil)
+                }
+            }
+
+            // (b) Re-hiding temporarily revealed sensitive image & SVG items (both via Cmd+U and hideRevealedSensitiveContent()) evicts decrypted NSImage / Rendering caches.
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            harness.model.preferences.hideOnFocusLoss = false
+            harness.model.preferences.showImagesAsTiles = false
+
+            let baseTime = Date(timeIntervalSince1970: 1_706_000_000)
+            let pngData = try TestSupport.makePNGData(pixelWidth: 64, pixelHeight: 48, color: .systemOrange)
+            let sensitiveImgID = UUID()
+            let sensitiveImgURL = try harness.historyStore.writeManagedAsset(
+                pngData: pngData,
+                role: .image,
+                clipID: sensitiveImgID,
+                encrypted: true
+            )
+            var sensitiveImg = ClipboardItem.fixture(
+                id: sensitiveImgID,
+                kind: .image,
+                text: "Sensitive badge screenshot",
+                assetPath: sensitiveImgURL.path,
+                copiedAt: baseTime.addingTimeInterval(20),
+                sensitivity: .sensitive
+            )
+            sensitiveImg.imageWidth = 64
+            sensitiveImg.imageHeight = 48
+
+            let sensitiveSVGID = UUID()
+            let sensitiveSVGMarkup = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"48\" height=\"48\"><!-- "
+                + String(repeating: "s", count: 12_000)
+                + " --><circle cx=\"24\" cy=\"24\" r=\"20\" fill=\"#AA2288\"/></svg>"
+            let sensitiveSVG = ClipboardItem.fixture(
+                id: sensitiveSVGID,
+                kind: .text,
+                text: sensitiveSVGMarkup,
+                copiedAt: baseTime.addingTimeInterval(10),
+                sensitivity: .sensitive
+            )
+
+            try harness.seedHistory([sensitiveSVG, sensitiveImg])
+            ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: sensitiveImgURL.path)
+            SVGImageRenderer.shared.removeRendering(for: sensitiveSVGID)
+
+            let historyWindow = HistoryWindow(model: harness.model, coordinator: harness.coordinator)
+            historyWindow.window.alphaValue = 0
+            historyWindow.show()
+            defer { TestSupport.tearDownHistoryWindow(historyWindow) }
+            historyWindow.window.contentView?.layoutSubtreeIfNeeded()
+
+            #expect(harness.model.selectedItemID == sensitiveImgID)
+            #expect(!ImageAssetThumbnailLoader.shared.hasCachedThumbnails(forPath: sensitiveImgURL.path))
+
+            // Reveal sensitive image via Cmd+U -> populates ImageAssetThumbnailLoader.shared.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let imgCachedOnReveal = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                ImageAssetThumbnailLoader.shared.hasCachedThumbnails(forPath: sensitiveImgURL.path)
+            }
+            #expect(imgCachedOnReveal)
+
+            // Second Cmd+U re-hides -> evicts ImageAssetThumbnailLoader.shared immediately.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            #expect(!ImageAssetThumbnailLoader.shared.hasCachedThumbnails(forPath: sensitiveImgURL.path))
+
+            // Reveal again via Cmd+U, then close/hide window -> hideRevealedSensitiveContent() evicts ImageAssetThumbnailLoader.shared.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let imgCachedSecondReveal = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                ImageAssetThumbnailLoader.shared.hasCachedThumbnails(forPath: sensitiveImgURL.path)
+            }
+            #expect(imgCachedSecondReveal)
+            historyWindow.hide()
+            #expect(!ImageAssetThumbnailLoader.shared.hasCachedThumbnails(forPath: sensitiveImgURL.path))
+
+            // Show window again, select the sensitive SVG row, and test both Cmd+U re-hide and hide() eviction on SVGImageRenderer.shared.
+            historyWindow.window.alphaValue = 0
+            historyWindow.show()
+            harness.model.selectedItemID = sensitiveSVGID
+            harness.model.selectedItemIDs = [sensitiveSVGID]
+            harness.model.selectedItemIDsInSelectionOrder = [sensitiveSVGID]
+            let svgSelectionSynced = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                !SVGImageRenderer.shared.hasCachedRendering(for: sensitiveSVGID)
+                    && harness.model.selectedItemID == sensitiveSVGID
+            }
+            #expect(svgSelectionSynced)
+            try await Task.sleep(for: .milliseconds(30))
+
+            // Reveal sensitive SVG via Cmd+U -> populates SVGImageRenderer.shared.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let svgCachedOnReveal = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                SVGImageRenderer.shared.hasCachedRendering(for: sensitiveSVGID)
+            }
+            #expect(svgCachedOnReveal)
+
+            // Second Cmd+U re-hides -> evicts SVGImageRenderer.shared immediately.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            #expect(!SVGImageRenderer.shared.hasCachedRendering(for: sensitiveSVGID))
+
+            // Reveal again via Cmd+U, then hide window -> hideRevealedSensitiveContent() evicts SVGImageRenderer.shared.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let svgCachedSecondReveal = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                SVGImageRenderer.shared.hasCachedRendering(for: sensitiveSVGID)
+            }
+            #expect(svgCachedSecondReveal)
+            historyWindow.hide()
+            #expect(!SVGImageRenderer.shared.hasCachedRendering(for: sensitiveSVGID))
+
+            // (c) Upgrading an existing plain > 8 KB SVG clip to Sensitive evicts its cached plaintext rendering
+            //     while preserving knownSVGClipIDs membership so Cmd+U reveal and hydrated preview renders still work and associate ownerID.
+            let plainUpgradeSVGID = UUID()
+            let plainUpgradeSVGMarkup = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"48\" height=\"48\"><!-- "
+                + String(repeating: "u", count: 12_200)
+                + " --><rect width=\"48\" height=\"48\" fill=\"#0088AA\"/></svg>"
+            let savedPlainUpgrade = try harness.historyStore.saveAndReconcileItem(
+                ClipboardItem.fixture(
+                    id: plainUpgradeSVGID,
+                    kind: .text,
+                    text: plainUpgradeSVGMarkup,
+                    copiedAt: baseTime.addingTimeInterval(30)
+                ),
+                convertingExternalAssets: true
+            ).unloadingContent()
+            #expect(!savedPlainUpgrade.isContentLoaded)
+            harness.model.items.insert(savedPlainUpgrade, at: 0)
+
+            historyWindow.window.alphaValue = 0
+            historyWindow.show()
+            harness.model.selectedItemID = plainUpgradeSVGID
+            harness.model.selectedItemIDs = [plainUpgradeSVGID]
+            harness.model.selectedItemIDsInSelectionOrder = [plainUpgradeSVGID]
+            let plainUpgradeCached = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                SVGImageRenderer.shared.hasCachedRendering(for: plainUpgradeSVGID)
+            }
+            #expect(plainUpgradeCached)
+
+            harness.coordinator.setSensitive(true, for: try #require(harness.currentItem(plainUpgradeSVGID)))
+            #expect(!SVGImageRenderer.shared.hasCachedRendering(for: plainUpgradeSVGID))
+
+            let upgradedItem = try #require(harness.currentItem(plainUpgradeSVGID))
+            #expect(upgradedItem.sensitivity == .sensitive)
+            #expect(!upgradedItem.isContentLoaded)
+
+            let selectionSettledOnUpgraded = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                harness.model.selectedItemID == plainUpgradeSVGID
+                    && !SVGImageRenderer.shared.hasCachedRendering(for: plainUpgradeSVGID)
+            }
+            #expect(selectionSettledOnUpgraded)
+            try await Task.sleep(for: .milliseconds(30))
+
+            // Cmd+U reveal on the unloaded upgraded SVG row loads decrypted SVG text from store and associates ownerID.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            let upgradedRevealedAndCached = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                SVGImageRenderer.shared.hasCachedRendering(for: plainUpgradeSVGID)
+            }
+            #expect(upgradedRevealedAndCached)
+            #expect(SVGImageRenderer.shared.hasCachedOwnerAssociation(for: plainUpgradeSVGID))
+
+            // Re-hide via Cmd+U evicts the revealed rendering, and a hydrated preview render also still associates ownerID.
+            historyWindow.window.sendEvent(try TestSupport.keyDownEvent(keyCode: 32, modifiers: [.command]))
+            #expect(!SVGImageRenderer.shared.hasCachedRendering(for: plainUpgradeSVGID))
+
+            let hydratedUpgraded = try harness.historyStore.loadingContent(of: upgradedItem, scope: .body)
+            #expect(hydratedUpgraded.isContentLoaded)
+            _ = try #require(SVGImageRenderer.shared.rendering(for: hydratedUpgraded))
+            #expect(SVGImageRenderer.shared.hasCachedRendering(for: plainUpgradeSVGID))
+            #expect(SVGImageRenderer.shared.hasCachedOwnerAssociation(for: plainUpgradeSVGID))
+            SVGImageRenderer.shared.removeRendering(for: plainUpgradeSVGID)
+            historyWindow.hide()
         }
     }
 }

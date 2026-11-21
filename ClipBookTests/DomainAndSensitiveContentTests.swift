@@ -414,6 +414,74 @@ enum DomainAndSensitiveContentTests {
         }
 
         @Test
+        func formattingLoadStateDistinguishesHydrationScopesInEquatableAndHashable() throws {
+            // (a) RTF-only .richText (rtfData != nil, html == nil): .preview vs .full differ only in formattingLoadState.
+            let rtfData = try TestSupport.makeRTFData(text: "RTF only content")
+            let rtfOnlyHeader = ClipboardItem.fixture(
+                kind: .richText,
+                text: "RTF only content",
+                rtfData: rtfData,
+                html: nil
+            ).unloadingContent()
+
+            let previewHydratedRTF = rtfOnlyHeader.withLoadedContent(
+                text: "RTF only content",
+                qrCodeText: nil,
+                html: nil,
+                rtfData: rtfData,
+                scope: .preview
+            )
+            let fullHydratedRTF = rtfOnlyHeader.withLoadedContent(
+                text: "RTF only content",
+                qrCodeText: nil,
+                html: nil,
+                rtfData: rtfData,
+                scope: .full
+            )
+            #expect(!previewHydratedRTF.isFormattingLoaded)
+            #expect(previewHydratedRTF.isPreviewFormattingLoaded)
+            #expect(fullHydratedRTF.isFormattingLoaded)
+            #expect(previewHydratedRTF != fullHydratedRTF)
+            #expect(Set([previewHydratedRTF, fullHydratedRTF]).count == 2)
+
+            // (b) HTML-only .richText (rtfData == nil, html != nil): .body vs .preview with nil formatting payloads.
+            let htmlOnlyHeader = ClipboardItem.fixture(
+                kind: .richText,
+                text: "HTML only content",
+                rtfData: nil,
+                html: "<b>HTML only content</b>"
+            ).unloadingContent()
+
+            let bodyHydratedHTML = htmlOnlyHeader.withLoadedContent(
+                text: "HTML only content",
+                qrCodeText: nil,
+                html: nil,
+                rtfData: nil,
+                scope: .body
+            )
+            let previewHydratedHTML = htmlOnlyHeader.withLoadedContent(
+                text: "HTML only content",
+                qrCodeText: nil,
+                html: nil,
+                rtfData: nil,
+                scope: .preview
+            )
+            #expect(!bodyHydratedHTML.isPreviewFormattingLoaded)
+            #expect(previewHydratedHTML.isPreviewFormattingLoaded)
+            #expect(bodyHydratedHTML != previewHydratedHTML)
+            #expect(Set([bodyHydratedHTML, previewHydratedHTML]).count == 2)
+
+            // (c) Unformatted .text (hasFormatting == false) round-trips through unloadingContent + .body hydration identically.
+            let original = ClipboardItem.fixture(kind: .text, text: "Unformatted plain note")
+            #expect(!original.hasFormatting)
+            let roundTripped = original
+                .unloadingContent()
+                .withLoadedContent(text: original.text, qrCodeText: nil, scope: .body, tagNames: [])
+            #expect(roundTripped == original)
+            #expect(roundTripped.hashValue == original.hashValue)
+        }
+
+        @Test
         func unloadedAccessorsGraphemeCapsAndHasSameContentCollisionResistance() throws {
             // Unloaded previewText, contentTitle, and hasCompleteTextPreview
             let headingBody = ClipboardItem.fixture(kind: .text, text: "Heading\nBody")

@@ -1,9 +1,5 @@
 import Foundation
 import Security
-import SwiftUI
-import AppKit
-import Carbon
-import Combine
 
 enum AppDirectories {
   nonisolated static let usesIsolatedDebugStorage: Bool = {

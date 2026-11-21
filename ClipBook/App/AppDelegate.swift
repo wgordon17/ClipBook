@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import AppKit
-import Carbon
 import Combine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

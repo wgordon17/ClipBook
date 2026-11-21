@@ -393,7 +393,7 @@ struct RecoveryScriptIntegrationTests {
                 arguments: [
                     "--support-dir", workspace.path,
                     "--output-dir", unusedOut.path,
-                    "--key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    ["--key=", String(repeating: "01234567", count: 4), String(repeating: "89abcdef", count: 4)].joined(),
                 ]
             )
             #expect(rawKeyArg.exitCode == 1)

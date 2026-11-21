@@ -556,7 +556,7 @@ nonisolated final class ImageAssetStore: Sendable {
         }
     }
 
-    private func targetURL(for role: AssetRole, clipID: UUID, fileExtension ext: String) -> URL {
+    func targetURL(for role: AssetRole, clipID: UUID, fileExtension ext: String) -> URL {
         let dir = directory(for: role)
         switch role {
         case .image:
@@ -620,13 +620,13 @@ nonisolated final class ImageAssetStore: Sendable {
         return canonicalFileURL(lhs) == canonicalFileURL(rhs)
     }
 
-    private static func canonicalFileURL(_ fileURL: URL) -> URL {
+    static func canonicalFileURL(_ fileURL: URL) -> URL {
         canonicalDirectoryURL(fileURL.deletingLastPathComponent())
             .appendingPathComponent(fileURL.lastPathComponent, isDirectory: false)
             .standardizedFileURL
     }
 
-    private static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
+    static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {
         let standardized = directoryURL.standardizedFileURL
         if standardized.path == "/" || standardized.path.isEmpty {
             return standardized

@@ -394,18 +394,21 @@ final class History: NSView {
     }
   }
 
-  func hideRevealedSensitiveContent() {
+  @discardableResult
+  func hideRevealedSensitiveContent() -> Set<UUID> {
     guard !sensitiveContentRevealedItemIDs.isEmpty else {
-      return
+      return []
     }
 
-    let rows = tableRowIndexes(forItemIDs: sensitiveContentRevealedItemIDs)
+    let hiddenIDs = sensitiveContentRevealedItemIDs
+    let rows = tableRowIndexes(forItemIDs: hiddenIDs)
     sensitiveContentRevealedItemIDs = []
     if showsTiles {
       tileGrid.reloadVisibleRows()
     } else {
       reloadRows(rows)
     }
+    return hiddenIDs
   }
 
   private func reloadRows(_ rows: IndexSet) {

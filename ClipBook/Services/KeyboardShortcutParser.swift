@@ -1,8 +1,6 @@
 import Foundation
-import SwiftUI
 import AppKit
 import Carbon
-import Combine
 
 struct KeyboardShortcutParser {
     struct Parsed: Equatable {
