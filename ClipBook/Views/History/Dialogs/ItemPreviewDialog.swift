@@ -153,6 +153,7 @@ final class ItemPreviewDialogController: NSViewController {
   var onSaveAsFile: ((ClipboardItem) -> Void)?
   var onOpenInApplication: ((ClipboardItem) -> Void)?
   var onShowInFinder: ((ClipboardItem) -> Void)?
+  var openExternalURL: @MainActor (URL) -> Void
   // Called with the edited text when the in-place editor is saved. Saving
   // may change the kind of the item; the preview follows the model update.
   var onSave: ((ClipboardItem, String) -> Void)?
@@ -267,13 +268,15 @@ final class ItemPreviewDialogController: NSViewController {
     isReadOnly: Bool = false,
     presentation: Presentation = .sheet,
     showsPreview: Bool = true,
-    loadContent: @escaping (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem = { item, _ in item }
+    loadContent: @escaping (ClipboardItem, ClipboardContentScope) throws -> ClipboardItem = { item, _ in item },
+    openExternalURL: @escaping @MainActor (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
   ) {
     self.item = item
     self.isReadOnly = isReadOnly
     self.presentation = presentation
     self.showsPreview = showsPreview
     self.loadContent = loadContent
+    self.openExternalURL = openExternalURL
     self.detectsSensitiveContent = detectsSensitiveContent
     self.revealsSensitiveContent = revealsSensitiveContent
     self.maximumContentSize = maximumContentSize
@@ -1039,6 +1042,10 @@ final class ItemPreviewDialogController: NSViewController {
     return scheme == "http" || scheme == "https"
   }
 
+  private static func isAllowedWebPageNavigationURL(_ url: URL) -> Bool {
+    isWebPageURL(url) || url.absoluteString.caseInsensitiveCompare("about:blank") == .orderedSame
+  }
+
   private static func fileContent(for item: ClipboardItem) -> PreviewContent {
     guard item.filePaths.count == 1, let filePath = item.filePaths.first else {
       return .fileList(item.filePaths)
@@ -1512,6 +1519,8 @@ final class ItemPreviewDialogController: NSViewController {
     let containerView = TextBackgroundView(frame: frame)
 
     let configuration = WKWebViewConfiguration()
+    // Link previews use an ephemeral data store so cookies and site storage do not persist across previews.
+    configuration.websiteDataStore = .nonPersistent()
     // A preview is not a browser: it never starts playing media on its own.
     configuration.mediaTypesRequiringUserActionForPlayback = .all
 
@@ -1713,6 +1722,20 @@ final class ItemPreviewDialogController: NSViewController {
 }
 
 extension ItemPreviewDialogController: WKNavigationDelegate, WKUIDelegate {
+  func webView(
+    _ webView: WKWebView,
+    decidePolicyFor navigationAction: WKNavigationAction,
+    decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+  ) {
+    guard let url = navigationAction.request.url,
+          Self.isAllowedWebPageNavigationURL(url) else {
+      decisionHandler(.cancel)
+      return
+    }
+
+    decisionHandler(.allow)
+  }
+
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     finishWebPageLoading(errorMessage: nil)
   }
@@ -1730,16 +1753,18 @@ extension ItemPreviewDialogController: WKNavigationDelegate, WKUIDelegate {
   }
 
   // A page that asks for a new window, such as a target="_blank" link, is handed
-  // to the default browser rather than opened inside the preview.
+  // to the default browser when its address is an HTTP(S) page rather than opened inside the preview.
   func webView(
     _ webView: WKWebView,
     createWebViewWith configuration: WKWebViewConfiguration,
     for navigationAction: WKNavigationAction,
     windowFeatures: WKWindowFeatures
   ) -> WKWebView? {
-    if let url = navigationAction.request.url {
-      NSWorkspace.shared.open(url)
+    guard let url = navigationAction.request.url, Self.isWebPageURL(url) else {
+      return nil
     }
+
+    openExternalURL(url)
     return nil
   }
 

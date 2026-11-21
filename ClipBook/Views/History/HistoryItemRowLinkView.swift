@@ -252,14 +252,16 @@ final class LinkPreviewFetcher {
     request.setValue("ClipBook/1.0", forHTTPHeaderField: "User-Agent")
 
     do {
-      let (data, response) = try await URLSession.shared.data(for: request)
-      guard Task.isCancelled == false,
-            let httpResponse = response as? HTTPURLResponse,
-            (200..<400).contains(httpResponse.statusCode) else {
+      guard let (data, _) = try await Self.fetchBoundedData(
+        for: request,
+        maximumByteCount: Self.maximumHTMLBytes,
+        truncateAtLimit: true
+      ),
+      Task.isCancelled == false else {
         return nil
       }
 
-      return String(decoding: data.prefix(Self.maximumHTMLBytes), as: UTF8.self)
+      return String(decoding: data, as: UTF8.self)
     } catch {
       return nil
     }
@@ -289,11 +291,12 @@ final class LinkPreviewFetcher {
     request.setValue("ClipBook/1.0", forHTTPHeaderField: "User-Agent")
 
     do {
-      let (data, response) = try await URLSession.shared.data(for: request)
-      guard Task.isCancelled == false,
-            data.count <= maximumByteCount,
-            let httpResponse = response as? HTTPURLResponse,
-            (200..<400).contains(httpResponse.statusCode) else {
+      guard let (data, _) = try await fetchBoundedData(
+        for: request,
+        maximumByteCount: maximumByteCount,
+        truncateAtLimit: false
+      ),
+      Task.isCancelled == false else {
         return nil
       }
 
@@ -301,6 +304,71 @@ final class LinkPreviewFetcher {
     } catch {
       return nil
     }
+  }
+
+  // Streams response bytes off the main actor so oversized or unending responses
+  // are cancelled at the byte limit instead of buffered whole into memory.
+  @concurrent
+  private nonisolated static func fetchBoundedData(
+    for request: URLRequest,
+    session: URLSession = .shared,
+    maximumByteCount: Int,
+    truncateAtLimit: Bool
+  ) async throws -> (Data, HTTPURLResponse)? {
+    guard maximumByteCount >= 0 else {
+      return nil
+    }
+
+    let (bytes, response) = try await session.bytes(for: request)
+    defer {
+      bytes.task.cancel()
+    }
+
+    guard let httpResponse = response as? HTTPURLResponse,
+          (200..<400).contains(httpResponse.statusCode) else {
+      return nil
+    }
+
+    if !truncateAtLimit,
+       httpResponse.expectedContentLength > Int64(maximumByteCount) {
+      return nil
+    }
+
+    if truncateAtLimit, maximumByteCount == 0 {
+      return (Data(), httpResponse)
+    }
+
+    let initialCapacity: Int
+    if httpResponse.expectedContentLength > 0 {
+      initialCapacity = min(Int(clamping: httpResponse.expectedContentLength), maximumByteCount)
+    } else {
+      initialCapacity = min(maximumByteCount, 16 * 1024)
+    }
+    var data = Data()
+    data.reserveCapacity(initialCapacity)
+
+    for try await byte in bytes {
+      if data.count >= maximumByteCount {
+        bytes.task.cancel()
+        if truncateAtLimit {
+          break
+        }
+        return nil
+      }
+
+      data.append(byte)
+
+      if truncateAtLimit, data.count >= maximumByteCount {
+        bytes.task.cancel()
+        break
+      }
+    }
+
+    guard Task.isCancelled == false else {
+      return nil
+    }
+
+    return (data, httpResponse)
   }
 }
 

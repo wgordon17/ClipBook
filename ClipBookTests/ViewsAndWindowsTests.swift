@@ -5,6 +5,7 @@ import Foundation
 import os
 import SwiftUI
 import Testing
+import WebKit
 
 @Suite(.serialized)
 enum ViewsAndWindowsTests {
@@ -3131,6 +3132,336 @@ extension SharedProcessStateTests {
             SVGImageRenderer.shared.removeRendering(for: plainUpgradeSVGID)
             historyWindow.hide()
         }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func linkPreviewFetcherTruncatesOversizedHTMLStreamsAndRejectsOversizedImages() async throws {
+            BoundedLinkPreviewTestURLProtocol.reset()
+            URLProtocol.registerClass(BoundedLinkPreviewTestURLProtocol.self)
+            defer {
+                URLProtocol.unregisterClass(BoundedLinkPreviewTestURLProtocol.self)
+                BoundedLinkPreviewTestURLProtocol.reset()
+            }
+
+            let validPNG = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemTeal)
+            let host = BoundedLinkPreviewTestURLProtocol.host
+
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/valid-og.png",
+                route: .complete(
+                    statusCode: 200,
+                    headers: ["Content-Type": "image/png", "Content-Length": "\(validPNG.count)"],
+                    body: validPNG
+                )
+            )
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/valid-icon.png",
+                route: .complete(
+                    statusCode: 200,
+                    headers: ["Content-Type": "image/png", "Content-Length": "\(validPNG.count)"],
+                    body: validPNG
+                )
+            )
+
+            // 1. Streaming > 512 KB HTML (up to 4 MB if uncanceled) cancels early once 512 KB is reached and parses prefix metadata.
+            let streamingHTMLHeader = """
+            <!doctype html>
+            <html>
+            <head>
+              <title>Bounded Stream Title</title>
+              <meta property="og:description" content="Within 512KB Limit">
+              <meta property="og:image" content="https://\(host)/valid-og.png">
+              <link rel="icon" href="https://\(host)/valid-icon.png">
+            </head>
+            <body>
+            """
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/streaming-page",
+                route: .chunkedStream(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/html; charset=utf-8"],
+                    initialChunk: Data(streamingHTMLHeader.utf8),
+                    repeatingChunk: Data(repeating: UInt8(ascii: "a"), count: 32 * 1024),
+                    maxAdditionalChunks: 128,
+                    interChunkDelay: 0.002
+                )
+            )
+
+            let fetcher = LinkPreviewFetcher()
+            let streamingURL = try #require(URL(string: "https://\(host)/streaming-page"))
+            let streamedPreview = try #require(await fetcher.fetchPreview(for: streamingURL))
+            #expect(streamedPreview.title == "Bounded Stream Title")
+            #expect(streamedPreview.description == "Within 512KB Limit")
+            #expect(streamedPreview.image != nil)
+            #expect(streamedPreview.favicon != nil)
+
+            #expect(await TestSupport.waitUntil {
+                BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/streaming-page").didStopLoading
+            }, "LinkPreviewFetcher must cancel HTML stream once 512 KB limit is reached")
+            let htmlStreamMetrics = BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/streaming-page")
+            #expect(htmlStreamMetrics.emittedBytes >= 512 * 1024)
+            #expect(htmlStreamMetrics.emittedBytes < 2 * 1024 * 1024, "Cancelled HTML stream must stop well before 4 MB payload completes")
+
+            // 2. Burst > 512 KB HTML ignoring Range header strictly truncates at 512 KB so tags past 512 KB are ignored.
+            let prefixHTML = "<html><head><title>Prefix Title</title>"
+            let paddingCount = (512 * 1024) - prefixHTML.utf8.count + 4096
+            let burstOversizedHTML = prefixHTML
+                + String(repeating: " ", count: paddingCount)
+                + #"<meta property="og:description" content="Past512KBBoundary"></head></html>"#
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/burst-oversized",
+                route: .complete(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/html; charset=utf-8"],
+                    body: Data(burstOversizedHTML.utf8)
+                )
+            )
+            let burstURL = try #require(URL(string: "https://\(host)/burst-oversized"))
+            let burstPreview = try #require(await fetcher.fetchPreview(for: burstURL))
+            #expect(burstPreview.title == "Prefix Title")
+            #expect(burstPreview.description == nil)
+
+            // 3. Oversized > 5 MB Content-Length image header is rejected immediately without reading the 6 MB body.
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/oversized-header.png",
+                route: .chunkedStream(
+                    statusCode: 200,
+                    headers: [
+                        "Content-Type": "image/png",
+                        "Content-Length": "\(6 * 1024 * 1024)"
+                    ],
+                    initialChunk: Data(),
+                    repeatingChunk: Data(repeating: 0xAB, count: 64 * 1024),
+                    maxAdditionalChunks: 96,
+                    interChunkDelay: 0.005
+                )
+            )
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/page-oversized-header-image",
+                route: .complete(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/html; charset=utf-8"],
+                    body: Data("""
+                    <html><head>
+                      <title>Header Guard Page</title>
+                      <meta property="og:image" content="https://\(host)/oversized-header.png">
+                    </head></html>
+                    """.utf8)
+                )
+            )
+            let headerGuardURL = try #require(URL(string: "https://\(host)/page-oversized-header-image"))
+            let headerRejectedPreview = try #require(await fetcher.fetchPreview(for: headerGuardURL))
+            #expect(headerRejectedPreview.title == "Header Guard Page")
+            #expect(headerRejectedPreview.image == nil)
+            #expect(await TestSupport.waitUntil {
+                BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/oversized-header.png").didStopLoading
+            })
+            let headerImageMetrics = BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/oversized-header.png")
+            #expect(headerImageMetrics.emittedBytes < 512 * 1024, "Oversized Content-Length image must cancel before streaming 6 MB")
+
+            // 4. Chunked/unknown-length > 5 MB image stream and > 512 KB favicon stream are rejected cleanly at their byte limits.
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/oversized-stream.png",
+                route: .chunkedStream(
+                    statusCode: 200,
+                    headers: ["Content-Type": "image/png"],
+                    initialChunk: Data(),
+                    repeatingChunk: Data(repeating: 0xCD, count: 256 * 1024),
+                    maxAdditionalChunks: 32,
+                    interChunkDelay: 0.001
+                )
+            )
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/oversized-favicon.png",
+                route: .chunkedStream(
+                    statusCode: 200,
+                    headers: ["Content-Type": "image/png"],
+                    initialChunk: Data(),
+                    repeatingChunk: Data(repeating: 0xEF, count: 64 * 1024),
+                    maxAdditionalChunks: 16,
+                    interChunkDelay: 0.001
+                )
+            )
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/page-oversized-stream-image",
+                route: .complete(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/html; charset=utf-8"],
+                    body: Data("""
+                    <html><head>
+                      <title>Stream Guard Page</title>
+                      <meta property="og:image" content="https://\(host)/oversized-stream.png">
+                      <link rel="apple-touch-icon" href="https://\(host)/oversized-favicon.png">
+                      <link rel="icon" href="https://\(host)/valid-icon.png">
+                    </head></html>
+                    """.utf8)
+                )
+            )
+            let streamGuardURL = try #require(URL(string: "https://\(host)/page-oversized-stream-image"))
+            let streamRejectedPreview = try #require(await fetcher.fetchPreview(for: streamGuardURL))
+            #expect(streamRejectedPreview.title == "Stream Guard Page")
+            #expect(streamRejectedPreview.image == nil, "Chunked image exceeding 5 MB must be rejected")
+            #expect(streamRejectedPreview.favicon != nil, "Rejected > 512 KB favicon must fall back to subsequent valid favicon")
+            #expect(await TestSupport.waitUntil {
+                BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/oversized-stream.png").didStopLoading
+                    && BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/oversized-favicon.png").didStopLoading
+            })
+
+            // 5. Non-2xx/3xx HTTP response is rejected cleanly.
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/error-page",
+                route: .complete(statusCode: 500, headers: ["Content-Type": "text/html"], body: Data("<title>Err</title>".utf8))
+            )
+            let errorURL = try #require(URL(string: "https://\(host)/error-page"))
+            let failedPreview = await fetcher.fetchPreview(for: errorURL)
+            #expect(failedPreview == nil)
+        }
+
+        @Test
+        @MainActor
+        func itemPreviewDialogWebViewBlocksUnsafeSchemesAndUsesNonPersistentDataStore() throws {
+            TestSupport.ensureAppKitInitialized()
+
+            var openedURLs: [URL] = []
+            let linkItem = ClipboardItem.fixture(
+                kind: .link,
+                text: "https://preview-test.clipbook.invalid/article"
+            )
+            let controller = ItemPreviewDialogController(
+                item: linkItem,
+                maximumContentSize: NSSize(width: 900, height: 640),
+                detectsSensitiveContent: true,
+                revealsSensitiveContent: false,
+                presentation: .sheet,
+                showsPreview: true,
+                loadContent: { item, _ in item },
+                openExternalURL: { url in
+                    openedURLs.append(url)
+                }
+            )
+            defer {
+                controller.tearDownContent()
+                TestSupport.drainDelayedPerforms([controller])
+            }
+
+            _ = controller.view
+
+            func findWebView(in root: NSView) -> WKWebView? {
+                if let webView = root as? WKWebView {
+                    return webView
+                }
+                for subview in root.subviews {
+                    if let found = findWebView(in: subview) {
+                        return found
+                    }
+                }
+                return nil
+            }
+
+            let webView = try #require(findWebView(in: controller.view))
+            #expect(webView.configuration.websiteDataStore.isPersistent == false)
+            #expect(webView.navigationDelegate === controller)
+            #expect(webView.uiDelegate === controller)
+            #expect(
+                controller.responds(
+                    to: #selector(
+                        WKNavigationDelegate.webView(
+                            _:decidePolicyFor:decisionHandler:
+                        ) as (WKNavigationDelegate) -> ((WKWebView, WKNavigationAction, @escaping (WKNavigationActionPolicy) -> Void) -> Void)?
+                    )
+                )
+            )
+
+            let navigationDelegate = try #require(webView.navigationDelegate)
+            let uiDelegate = try #require(webView.uiDelegate)
+
+            func decidePolicy(for request: URLRequest) throws -> WKNavigationActionPolicy {
+                var recordedPolicy: WKNavigationActionPolicy?
+                navigationDelegate.webView?(
+                    webView,
+                    decidePolicyFor: StubWebNavigationAction(request: request),
+                    decisionHandler: { policy in
+                        recordedPolicy = policy
+                    }
+                )
+                return try #require(recordedPolicy)
+            }
+
+            let blockedURLStrings = [
+                "file:///etc/passwd",
+                "smb://fileserver.local/share",
+                "ssh://git@example.com/repo",
+                "custom-app://open?action=launch",
+                "javascript:alert(1)",
+                "mailto:user@example.com"
+            ]
+
+            for rawURL in blockedURLStrings {
+                let url = try #require(URL(string: rawURL))
+                let request = URLRequest(url: url)
+                #expect(try decidePolicy(for: request) == .cancel, "decidePolicyFor must cancel \(rawURL)")
+                let childWebView = uiDelegate.webView?(
+                    webView,
+                    createWebViewWith: webView.configuration,
+                    for: StubWebNavigationAction(request: request),
+                    windowFeatures: WKWindowFeatures()
+                )
+                #expect(childWebView == nil)
+            }
+            #expect(openedURLs.isEmpty, "Blocked non-http(s) schemes must never invoke openExternalURL")
+
+            var nilURLRequest = URLRequest(url: try #require(URL(string: "https://example.com")))
+            nilURLRequest.url = nil
+            #expect(try decidePolicy(for: nilURLRequest) == .cancel)
+            #expect(
+                uiDelegate.webView?(
+                    webView,
+                    createWebViewWith: webView.configuration,
+                    for: StubWebNavigationAction(request: nilURLRequest),
+                    windowFeatures: WKWindowFeatures()
+                ) == nil
+            )
+            #expect(openedURLs.isEmpty)
+
+            // about:blank is allowed inside the preview web view, but never dispatched to an external opener.
+            for blankString in ["about:blank", "ABOUT:BLANK"] {
+                let blankURL = try #require(URL(string: blankString))
+                let blankRequest = URLRequest(url: blankURL)
+                #expect(try decidePolicy(for: blankRequest) == .allow)
+                let blankChild = uiDelegate.webView?(
+                    webView,
+                    createWebViewWith: webView.configuration,
+                    for: StubWebNavigationAction(request: blankRequest),
+                    windowFeatures: WKWindowFeatures()
+                )
+                #expect(blankChild == nil)
+            }
+            #expect(openedURLs.isEmpty)
+
+            // Standard http(s) navigations are allowed in-place and forwarded to the injected opener for target="_blank".
+            let httpsURL = try #require(URL(string: "https://example.com/docs"))
+            let httpURL = try #require(URL(string: "http://example.com/docs"))
+            #expect(try decidePolicy(for: URLRequest(url: httpsURL)) == .allow)
+            #expect(try decidePolicy(for: URLRequest(url: httpURL)) == .allow)
+
+            #expect(
+                uiDelegate.webView?(
+                    webView,
+                    createWebViewWith: webView.configuration,
+                    for: StubWebNavigationAction(request: URLRequest(url: httpsURL)),
+                    windowFeatures: WKWindowFeatures()
+                ) == nil
+            )
+            #expect(
+                uiDelegate.webView?(
+                    webView,
+                    createWebViewWith: webView.configuration,
+                    for: StubWebNavigationAction(request: URLRequest(url: httpURL)),
+                    windowFeatures: WKWindowFeatures()
+                ) == nil
+            )
+            #expect(openedURLs == [httpsURL, httpURL])
+        }
     }
 }
 
@@ -3195,4 +3526,210 @@ private func findEditableTextField(in root: NSView) -> NSTextField? {
         }
     }
     return nil
+}
+
+@MainActor
+private final class StubWebNavigationAction: WKNavigationAction {
+    private let stubbedRequest: URLRequest
+
+    init(request: URLRequest) {
+        self.stubbedRequest = request
+        super.init()
+    }
+
+    override var request: URLRequest {
+        stubbedRequest
+    }
+}
+
+private nonisolated final class BoundedLinkPreviewTestURLProtocol: URLProtocol {
+    nonisolated static let host = "linkpreview-bounds-test.clipbook.invalid"
+
+    nonisolated enum Route: Sendable {
+        case complete(statusCode: Int, headers: [String: String], body: Data)
+        case chunkedStream(
+            statusCode: Int,
+            headers: [String: String],
+            initialChunk: Data,
+            repeatingChunk: Data,
+            maxAdditionalChunks: Int,
+            interChunkDelay: TimeInterval
+        )
+    }
+
+    nonisolated struct RouteMetrics: Sendable {
+        var emittedBytes = 0
+        var didStopLoading = false
+    }
+
+    private nonisolated struct RegistryState: Sendable {
+        var routes: [String: Route] = [:]
+        var metricsByPath: [String: RouteMetrics] = [:]
+    }
+
+    private nonisolated static let registry = OSAllocatedUnfairLock(initialState: RegistryState())
+    private nonisolated static let streamQueue = DispatchQueue(
+        label: "com.ikryanov.clipbook.tests.bounded-link-preview-stream",
+        attributes: .concurrent
+    )
+
+    private nonisolated let instanceLock = NSLock()
+    private nonisolated var isStopped = false
+
+    nonisolated static func reset() {
+        registry.withLock { state in
+            state.routes.removeAll()
+            state.metricsByPath.removeAll()
+        }
+    }
+
+    nonisolated static func setRoute(path: String, route: Route) {
+        registry.withLock { state in
+            state.routes[path] = route
+            state.metricsByPath[path] = RouteMetrics()
+        }
+    }
+
+    nonisolated static func metrics(forPath path: String) -> RouteMetrics {
+        registry.withLock { state in
+            state.metricsByPath[path] ?? RouteMetrics()
+        }
+    }
+
+    override nonisolated class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == host
+    }
+
+    override nonisolated class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override nonisolated func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let path = url.path.isEmpty ? "/" : url.path
+        let route = Self.registry.withLock { $0.routes[path] }
+
+        guard let route else {
+            if let notFound = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil) {
+                client?.urlProtocol(self, didReceive: notFound, cacheStoragePolicy: .notAllowed)
+            }
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
+
+        switch route {
+        case let .complete(statusCode, headers, body):
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            ) else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if !body.isEmpty {
+                Self.registry.withLock { $0.metricsByPath[path, default: RouteMetrics()].emittedBytes += body.count }
+                client?.urlProtocol(self, didLoad: body)
+            }
+            client?.urlProtocolDidFinishLoading(self)
+
+        case let .chunkedStream(statusCode, headers, initialChunk, repeatingChunk, maxAdditionalChunks, interChunkDelay):
+            guard let response = HTTPURLResponse(
+                url: url,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            ) else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if !initialChunk.isEmpty {
+                let delivered = deliverIfActive(initialChunk, forPath: path)
+                if !delivered {
+                    return
+                }
+            }
+            emitRemainingChunks(
+                index: 0,
+                maxCount: maxAdditionalChunks,
+                chunk: repeatingChunk,
+                delay: interChunkDelay,
+                path: path
+            )
+        }
+    }
+
+    private nonisolated func emitRemainingChunks(
+        index: Int,
+        maxCount: Int,
+        chunk: Data,
+        delay: TimeInterval,
+        path: String
+    ) {
+        instanceLock.lock()
+        let alreadyStopped = isStopped
+        instanceLock.unlock()
+        if alreadyStopped {
+            return
+        }
+        guard index < maxCount else {
+            instanceLock.lock()
+            let canFinish = !isStopped
+            if canFinish {
+                client?.urlProtocolDidFinishLoading(self)
+            }
+            instanceLock.unlock()
+            return
+        }
+
+        nonisolated(unsafe) weak let weakSelf = self
+        let work: @Sendable () -> Void = {
+            guard let strongSelf = weakSelf else { return }
+            guard strongSelf.deliverIfActive(chunk, forPath: path) else { return }
+            strongSelf.emitRemainingChunks(
+                index: index + 1,
+                maxCount: maxCount,
+                chunk: chunk,
+                delay: delay,
+                path: path
+            )
+        }
+
+        if delay > 0 {
+            Self.streamQueue.asyncAfter(deadline: .now() + delay, execute: work)
+        } else {
+            Self.streamQueue.async(execute: work)
+        }
+    }
+
+    private nonisolated func deliverIfActive(_ chunk: Data, forPath path: String) -> Bool {
+        instanceLock.lock()
+        let canSend = !isStopped
+        if canSend {
+            client?.urlProtocol(self, didLoad: chunk)
+        }
+        instanceLock.unlock()
+        if canSend {
+            Self.registry.withLock {
+                $0.metricsByPath[path, default: RouteMetrics()].emittedBytes += chunk.count
+            }
+        }
+        return canSend
+    }
+
+    override nonisolated func stopLoading() {
+        let path = request.url.map { $0.path.isEmpty ? "/" : $0.path } ?? "/"
+        instanceLock.lock()
+        isStopped = true
+        instanceLock.unlock()
+        Self.registry.withLock {
+            $0.metricsByPath[path, default: RouteMetrics()].didStopLoading = true
+        }
+    }
 }
