@@ -10,7 +10,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     let fileSize: Int64
   }
 
-  private struct Metadata: Codable {
+  private struct Metadata: Codable, Sendable {
     let sourcePath: String
     let modificationTime: TimeInterval
     let fileSize: Int64
@@ -31,11 +31,17 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     let size: CGSize
   }
 
-  private struct InFlightEntry {
+  private struct InFlightEntry: Sendable {
     let id: UInt64
     let canonicalPath: String
     let startGlobalEpoch: UInt64
     let startPathEpoch: UInt64
+  }
+
+  private enum StagedCommitOutcome {
+    case committed
+    case abortedKeepBothStaged
+    case metadataRenameFailed(scrubbedImageURL: URL)
   }
 
   private let directory: URL
@@ -347,135 +353,144 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     key: String,
     completion: @escaping @MainActor (NSImage) -> Void
   ) {
-    let startState = beginGeneration(forKey: key, canonicalFilePath: canonicalFilePath)
-    guard startState.started else {
+    guard let entry = registerInFlightGeneration(forKey: key, canonicalFilePath: canonicalFilePath) else {
       return
     }
 
     let fileURL = URL(fileURLWithPath: canonicalFilePath)
     let maximumPixelSize = max(Int(max(targetSize.width, targetSize.height).rounded()), 1) * 2
-    let generationID = startState.id
-    let startGlobalEpoch = startState.globalEpoch
-    let startPathEpoch = startState.pathEpoch
+    let metadata = Metadata(
+      sourcePath: canonicalFilePath,
+      modificationTime: signature.modificationTime,
+      fileSize: signature.fileSize,
+      targetWidth: Int(targetSize.width.rounded()),
+      targetHeight: Int(targetSize.height.rounded())
+    )
 
     generationQueue.async { [weak self] in
       guard let self else {
         return
       }
+      defer { self.endGeneration(forKey: key, id: entry.id) }
 
-      defer { self.endGeneration(forKey: key, id: generationID) }
-
-      guard self.isGenerationValid(
-        canonicalFilePath: canonicalFilePath,
-        startGlobalEpoch: startGlobalEpoch,
-        startPathEpoch: startPathEpoch
-      ) else {
+      guard self.isGenerationValid(entry),
+            let pngData = Self.renderThumbnailPNGData(from: fileURL, maximumPixelSize: maximumPixelSize),
+            let image = NSImage(data: pngData),
+            self.isGenerationValid(entry),
+            self.commitStagedThumbnailAtomically(
+              pngData: pngData,
+              metadata: metadata,
+              image: image,
+              key: key,
+              entry: entry
+            ) else {
         return
       }
 
-      guard let data = Self.thumbnailPNGData(from: fileURL, maximumPixelSize: maximumPixelSize),
-            let image = NSImage(data: data) else {
-        return
-      }
+      self.deliverGeneratedThumbnail(image, for: entry, completion: completion)
+    }
+  }
 
-      guard self.isGenerationValid(
-        canonicalFilePath: canonicalFilePath,
-        startGlobalEpoch: startGlobalEpoch,
-        startPathEpoch: startPathEpoch
-      ) else {
-        return
-      }
+  private func commitStagedThumbnailAtomically(
+    pngData: Data,
+    metadata: Metadata,
+    image: NSImage,
+    key: String,
+    entry: InFlightEntry
+  ) -> Bool {
+    var stagedImageURL: URL?
+    var stagedMetadataURL: URL?
+    do {
+      try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+      let tempImageURL = try Self.stageTempFile0600(pngData, for: imageURL(forKey: key), in: directory)
+      stagedImageURL = tempImageURL
+      let metadataData = try encoder.encode(metadata)
+      let tempMetadataURL = try Self.stageTempFile0600(metadataData, for: metadataURL(forKey: key), in: directory)
+      stagedMetadataURL = tempMetadataURL
 
-      let targetImageURL = self.imageURL(forKey: key)
-      let targetMetadataURL = self.metadataURL(forKey: key)
-      var stagedImageURL: URL? = nil
-      var stagedMetadataURL: URL? = nil
-      let cleanupStagedFiles = {
-        if let stagedImageURL {
-          ImageAssetStore.secureUnlink(at: stagedImageURL)
-        }
-        if let stagedMetadataURL {
-          ImageAssetStore.secureUnlink(at: stagedMetadataURL)
-        }
-        _ = Darwin.rmdir(self.directory.path)
-      }
-      do {
-        try self.fileManager.createDirectory(at: self.directory, withIntermediateDirectories: true)
-        let tempImage = try Self.stageTempFile0600(data, for: targetImageURL, in: self.directory)
-        stagedImageURL = tempImage
-        let metadata = Metadata(
-          sourcePath: canonicalFilePath,
-          modificationTime: signature.modificationTime,
-          fileSize: signature.fileSize,
-          targetWidth: Int(targetSize.width.rounded()),
-          targetHeight: Int(targetSize.height.rounded())
+      let outcome = pendingLock.withLock {
+        publishStagedThumbnailLocked(
+          stagedImageURL: tempImageURL,
+          stagedMetadataURL: tempMetadataURL,
+          image: image,
+          key: key,
+          entry: entry
         )
-        let metadataData = try self.encoder.encode(metadata)
-        let tempMetadata = try Self.stageTempFile0600(metadataData, for: targetMetadataURL, in: self.directory)
-        stagedMetadataURL = tempMetadata
+      }
+      switch outcome {
+      case .committed:
+        return true
+      case .abortedKeepBothStaged:
+        cleanupUncommittedStagedFiles(imageURL: tempImageURL, metadataURL: tempMetadataURL)
+        return false
+      case .metadataRenameFailed(let scrubbedImageURL):
+        ImageAssetStore.secureUnlink(at: scrubbedImageURL)
+        cleanupUncommittedStagedFiles(imageURL: nil, metadataURL: tempMetadataURL)
+        return false
+      }
+    } catch {
+      cleanupUncommittedStagedFiles(imageURL: stagedImageURL, metadataURL: stagedMetadataURL)
+      return false
+    }
+  }
 
-        var failedPersistImageURL: URL? = nil
-        let didPersist: Bool = self.pendingLock.withLock {
-          guard self.globalEpoch == startGlobalEpoch,
-                (self.pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
-            return false
-          }
-          guard Darwin.rename(tempImage.path, targetImageURL.path) == 0 else {
-            return false
-          }
-          stagedImageURL = nil
-          guard Darwin.rename(tempMetadata.path, targetMetadataURL.path) == 0 else {
-            let scrubURL = self.directory.appendingPathComponent(".scrubbing-\(UUID().uuidString)", isDirectory: false)
-            if Darwin.rename(targetImageURL.path, scrubURL.path) == 0 {
-              failedPersistImageURL = scrubURL
-            } else {
-              failedPersistImageURL = targetImageURL
-            }
-            return false
-          }
-          stagedMetadataURL = nil
-          self.imageCache.setObject(image, forKey: key as NSString)
-          return true
-        }
+  private func publishStagedThumbnailLocked(
+    stagedImageURL: URL,
+    stagedMetadataURL: URL,
+    image: NSImage,
+    key: String,
+    entry: InFlightEntry
+  ) -> StagedCommitOutcome {
+    guard isGenerationValidLocked(entry) else {
+      return .abortedKeepBothStaged
+    }
+    let targetImageURL = imageURL(forKey: key)
+    let targetMetadataURL = metadataURL(forKey: key)
+    guard Darwin.rename(stagedImageURL.path, targetImageURL.path) == 0 else {
+      return .abortedKeepBothStaged
+    }
+    guard Darwin.rename(stagedMetadataURL.path, targetMetadataURL.path) == 0 else {
+      let scrubURL = directory.appendingPathComponent(".scrubbing-\(UUID().uuidString)", isDirectory: false)
+      let failedImageURL = Darwin.rename(targetImageURL.path, scrubURL.path) == 0 ? scrubURL : targetImageURL
+      return .metadataRenameFailed(scrubbedImageURL: failedImageURL)
+    }
+    imageCache.setObject(image, forKey: key as NSString)
+    return .committed
+  }
 
-        if let failedPersistImageURL {
-          ImageAssetStore.secureUnlink(at: failedPersistImageURL)
-        }
-        if !didPersist {
-          cleanupStagedFiles()
+  private func cleanupUncommittedStagedFiles(imageURL: URL?, metadataURL: URL?) {
+    if let imageURL {
+      ImageAssetStore.secureUnlink(at: imageURL)
+    }
+    if let metadataURL {
+      ImageAssetStore.secureUnlink(at: metadataURL)
+    }
+    _ = Darwin.rmdir(directory.path)
+  }
+
+  private func deliverGeneratedThumbnail(
+    _ image: NSImage,
+    for entry: InFlightEntry,
+    completion: @escaping @MainActor (NSImage) -> Void
+  ) {
+    DispatchQueue.main.async { [weak self] in
+      MainActor.assumeIsolated {
+        guard let self, self.isGenerationValid(entry) else {
           return
         }
-      } catch {
-        cleanupStagedFiles()
-        return
-      }
-
-      DispatchQueue.main.async { [weak self] in
-        MainActor.assumeIsolated {
-          guard let self else {
-            return
-          }
-          let isStillValid = self.isGenerationValid(
-            canonicalFilePath: canonicalFilePath,
-            startGlobalEpoch: startGlobalEpoch,
-            startPathEpoch: startPathEpoch
-          )
-          if isStillValid {
-            completion(image)
-          }
-        }
+        completion(image)
       }
     }
   }
 
-  private func isGenerationValid(
-    canonicalFilePath: String,
-    startGlobalEpoch: UInt64,
-    startPathEpoch: UInt64
-  ) -> Bool {
+  private func isGenerationValid(_ entry: InFlightEntry) -> Bool {
     pendingLock.withLock {
-      globalEpoch == startGlobalEpoch && (pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch
+      isGenerationValidLocked(entry)
     }
+  }
+
+  private func isGenerationValidLocked(_ entry: InFlightEntry) -> Bool {
+    globalEpoch == entry.startGlobalEpoch && (pathEpochs[entry.canonicalPath] ?? 0) == entry.startPathEpoch
   }
 
   private func fallbackImage(forFileAt filePath: String) -> NSImage {
@@ -491,7 +506,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     return tempURL
   }
 
-  private static func thumbnailPNGData(from fileURL: URL, maximumPixelSize: Int) -> Data? {
+  private static func renderThumbnailPNGData(from fileURL: URL, maximumPixelSize: Int) -> Data? {
     guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil) else {
       return nil
     }
@@ -644,26 +659,26 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     }
   }
 
-  private func beginGeneration(
+  private func registerInFlightGeneration(
     forKey key: String,
     canonicalFilePath: String
-  ) -> (started: Bool, id: UInt64, globalEpoch: UInt64, pathEpoch: UInt64) {
+  ) -> InFlightEntry? {
     pendingLock.withLock {
       let currentPathEpoch = pathEpochs[canonicalFilePath] ?? 0
       if let existing = inFlightByKey[key],
          existing.startGlobalEpoch == globalEpoch,
          existing.startPathEpoch == currentPathEpoch {
-        return (false, 0, 0, 0)
+        return nil
       }
       nextGenerationID &+= 1
-      let id = nextGenerationID
-      inFlightByKey[key] = InFlightEntry(
-        id: id,
+      let entry = InFlightEntry(
+        id: nextGenerationID,
         canonicalPath: canonicalFilePath,
         startGlobalEpoch: globalEpoch,
         startPathEpoch: currentPathEpoch
       )
-      return (true, id, globalEpoch, currentPathEpoch)
+      inFlightByKey[key] = entry
+      return entry
     }
   }
 

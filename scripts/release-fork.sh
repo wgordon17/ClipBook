@@ -321,6 +321,7 @@ if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
   fi
 
   require_tool xcrun
+  require_tool otool
   require_tool ditto
 
   if [[ "$APP_ARCHS_EXPLICIT" -eq 0 ]]; then
@@ -426,6 +427,7 @@ fi
 
 require_tool xcodebuild
 require_tool xcrun
+require_tool otool
 require_tool hdiutil
 require_tool ditto
 require_tool shasum
@@ -804,65 +806,87 @@ verify_app_rpaths() {
   fi
 
   local otool_out
-  otool_out="$(xcrun otool -arch all -l "$target_bin")"
+  otool_out="$(otool -arch all -l "$target_bin")"
+  if [[ -z "$otool_out" ]]; then
+    printf 'Error: Empty otool load-command output for %s\n' "$target_bin" >&2
+    exit 1
+  fi
 
-  local in_rpath=0
-  local saw_path_in_rpath=0
-  local saw_any_load_cmd=0
-  local slice_rpath_count=0
-  local total_rpath_count=0
-  local line rpath_val
-
+  local slice_count=0 single_slice=0 rpath_state="none" has_frameworks=0 has_swift=0 line
   while IFS= read -r line; do
-    if [[ "$line" =~ \(architecture\ [A-Za-z0-9_]+\):$ ]]; then
-      if [[ "$in_rpath" -eq 1 && "$saw_path_in_rpath" -eq 0 ]]; then
-        printf 'Error: Malformed LC_RPATH load command without path entry in %s\n' "$target_bin" >&2
-        exit 1
-      fi
-      if [[ "$saw_any_load_cmd" -eq 1 && "$slice_rpath_count" -le 0 ]]; then
-        printf 'Error: Expected at least one LC_RPATH entry in architecture slice of %s\n' "$target_bin" >&2
-        exit 1
-      fi
-      in_rpath=0
-      saw_path_in_rpath=0
-      saw_any_load_cmd=0
-      slice_rpath_count=0
+    if [[ -z "$line" ]]; then
       continue
-    fi
-    if [[ "$line" =~ ^[[:space:]]*Load[[:space:]]+command[[:space:]]+[0-9]+ ]]; then
-      if [[ "$in_rpath" -eq 1 && "$saw_path_in_rpath" -eq 0 ]]; then
-        printf 'Error: Malformed LC_RPATH load command without path entry in %s\n' "$target_bin" >&2
+    elif is_otool_slice_header "$line" "$target_bin" "$slice_count"; then
+      if [[ "$single_slice" -eq 1 ]]; then
+        printf 'Error: Unexpected multi-arch slice header after single-slice header in %s\n' "$target_bin" >&2
         exit 1
       fi
-      in_rpath=0
-      saw_path_in_rpath=0
-      saw_any_load_cmd=1
-      continue
-    fi
-    if [[ "$line" =~ ^[[:space:]]*cmd[[:space:]]+LC_RPATH[[:space:]]*$ ]]; then
-      in_rpath=1
-      saw_path_in_rpath=0
-      continue
-    fi
-    if [[ "$in_rpath" -eq 1 && "$line" =~ ^[[:space:]]*path\ (.*)\ \(offset\ [0-9]+\)$ ]]; then
-      rpath_val="${BASH_REMATCH[1]}"
-      saw_path_in_rpath=1
-      slice_rpath_count="$((slice_rpath_count + 1))"
-      total_rpath_count="$((total_rpath_count + 1))"
-      if [[ "$rpath_val" != "@executable_path/../Frameworks" && "$rpath_val" != "/usr/lib/swift" ]]; then
-        printf 'Error: Disallowed LC_RPATH entry "%s" in %s (allowed: @executable_path/../Frameworks, /usr/lib/swift)\n' \
-          "$rpath_val" "$target_bin" >&2
-        exit 1
+      if [[ "$slice_count" -gt 0 ]]; then
+        assert_slice_rpaths "$target_bin" "$rpath_state" "$has_frameworks" "$has_swift"
+      elif [[ "$line" == "${target_bin}:" ]]; then
+        single_slice=1
       fi
+      slice_count="$((slice_count + 1))"
+      rpath_state="none"
+      has_frameworks=0
+      has_swift=0
+    elif [[ "$slice_count" -eq 0 ]]; then
+      printf 'Error: Missing Mach-O slice header in otool output for %s\n' "$target_bin" >&2
+      exit 1
+    elif [[ "$line" =~ ^[[:space:]]*Load[[:space:]]+command[[:space:]]+[0-9]+[[:space:]]*$ ]]; then
+      assert_rpath_command_complete "$target_bin" "$rpath_state"
+      rpath_state="none"
+    elif [[ "$line" =~ ^[[:space:]]*cmd[[:space:]]+LC_RPATH[[:space:]]*$ ]]; then
+      assert_rpath_command_complete "$target_bin" "$rpath_state"
+      rpath_state="awaiting_path"
+    elif [[ "$rpath_state" != "none" && "$line" =~ ^[[:space:]]*path\ (.*)\ \(offset\ [0-9]+\)$ ]]; then
+      rpath_state="in_rpath"
+      assert_allowed_rpath "$target_bin" "${BASH_REMATCH[1]}"
+      case "${BASH_REMATCH[1]}" in
+        "@executable_path/../Frameworks") has_frameworks=1 ;;
+        "/usr/lib/swift") has_swift=1 ;;
+      esac
     fi
   done <<< "$otool_out"
 
-  if [[ "$in_rpath" -eq 1 && "$saw_path_in_rpath" -eq 0 ]]; then
-    printf 'Error: Malformed trailing LC_RPATH load command without path entry in %s\n' "$target_bin" >&2
+  if [[ "$slice_count" -eq 0 ]]; then
+    printf 'Error: Missing Mach-O slice header in otool output for %s\n' "$target_bin" >&2
     exit 1
   fi
-  if [[ "$slice_rpath_count" -le 0 || "$total_rpath_count" -le 0 ]]; then
-    printf 'Error: Expected at least one LC_RPATH entry in %s, found %d\n' "$target_bin" "$total_rpath_count" >&2
+  assert_slice_rpaths "$target_bin" "$rpath_state" "$has_frameworks" "$has_swift"
+  if [[ -n "${REQUIRED_APP_ARCHS+x}" && "$slice_count" -ne "${#REQUIRED_APP_ARCHS[@]}" ]]; then
+    printf 'Error: Expected %d Mach-O slice(s) in %s, found %d\n' "${#REQUIRED_APP_ARCHS[@]}" "$target_bin" "$slice_count" >&2
+    exit 1
+  fi
+}
+
+is_otool_slice_header() {
+  local line="$1" target_bin="$2" slice_count="$3"
+  [[ "$line" =~ \(architecture\ [A-Za-z0-9_.]+\):$ ]] || [[ "$slice_count" -eq 0 && "$line" == "${target_bin}:" ]]
+}
+
+assert_allowed_rpath() {
+  local target_bin="$1" rpath_val="$2"
+  if [[ "$rpath_val" != "@executable_path/../Frameworks" && "$rpath_val" != "/usr/lib/swift" ]]; then
+    printf 'Error: Disallowed LC_RPATH entry "%s" in %s (allowed: @executable_path/../Frameworks, /usr/lib/swift)\n' \
+      "$rpath_val" "$target_bin" >&2
+    exit 1
+  fi
+}
+
+assert_rpath_command_complete() {
+  if [[ "$2" == "awaiting_path" ]]; then
+    printf 'Error: Malformed LC_RPATH load command without path entry in %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+assert_slice_rpaths() {
+  local target_bin="$1" rpath_state="$2" has_frameworks="$3" has_swift="$4"
+  assert_rpath_command_complete "$target_bin" "$rpath_state"
+  if [[ "$has_frameworks" -ne 1 || "$has_swift" -ne 1 ]]; then
+    printf 'Error: Slice in %s must declare both @executable_path/../Frameworks and /usr/lib/swift LC_RPATH entries\n' \
+      "$target_bin" >&2
     exit 1
   fi
 }

@@ -84,7 +84,7 @@ private struct DerivedArchiveKeys {
     let verifierHMACKey: SymmetricKey
 }
 
-// MARK: - Wire Codable Types (matching ClipBookArchiveService.swift)
+// MARK: - Wire Codable Types (matching ClipBookArchiveModels.swift)
 
 private struct ClipBookArchiveEncryptionMetadata: Codable {
     var archiveID: UUID
@@ -1057,11 +1057,8 @@ private enum CLIParser {
           3  Master key or archive passphrase mismatch
         """
 
-    static func parse(arguments: [String]) throws -> RecoveryCommand {
-        if arguments.isEmpty {
-            throw RecoveryFailure.usage("Missing required arguments.")
-        }
-
+    private struct ParsedOptions {
+        var helpRequested = false
         var supportDirPath: String?
         var archivePath: String?
         var outputDirPath: String?
@@ -1072,119 +1069,189 @@ private enum CLIParser {
         var passphraseFilePath: String?
         var passphraseStdin = false
         var allowTestIterations = false
+    }
 
-        var index = 0
-        while index < arguments.count {
-            let arg = arguments[index]
-            let flagName: String
-            let inlineValue: String?
-            if arg.hasPrefix("--"), let eqIndex = arg.firstIndex(of: "=") {
-                flagName = String(arg[..<eqIndex])
-                inlineValue = String(arg[arg.index(after: eqIndex)...])
-            } else {
-                flagName = arg
-                inlineValue = nil
-            }
-
-            switch flagName {
-            case "-h", "--help":
-                try rejectInlineValue(inlineValue, for: flagName)
-                return .help
-            case "--support-dir":
-                supportDirPath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
-            case "--archive":
-                archivePath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
-            case "--output-dir":
-                outputDirPath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
-            case "--key-file":
-                keyFilePath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
-            case "--key-hex-stdin":
-                try rejectInlineValue(inlineValue, for: flagName)
-                keyHexStdin = true
-            case "--include-trashed":
-                try rejectInlineValue(inlineValue, for: flagName)
-                includeTrashed = true
-            case "--strict":
-                try rejectInlineValue(inlineValue, for: flagName)
-                strict = true
-            case "--passphrase-file":
-                passphraseFilePath = try resolveOptionValue(for: flagName, inlineValue: inlineValue, arguments: arguments, index: &index)
-            case "--passphrase-stdin":
-                try rejectInlineValue(inlineValue, for: flagName)
-                passphraseStdin = true
-            case "--allow-test-iterations":
-                try rejectInlineValue(inlineValue, for: flagName)
-                allowTestIterations = true
-            default:
-                if flagName.hasPrefix("--key") || flagName.hasPrefix("--pass") {
-                    throw RecoveryFailure.usage(
-                        "Raw secrets are never accepted as CLI arguments (\(flagName)); use file or stdin flags."
-                    )
-                }
-                if arg.hasPrefix("-") {
-                    throw RecoveryFailure.usage("Unknown option: \(flagName)")
-                } else {
-                    throw RecoveryFailure.usage("Unexpected positional argument.")
-                }
-            }
-            index += 1
+    static func parse(arguments: [String]) throws -> RecoveryCommand {
+        if arguments.isEmpty {
+            throw RecoveryFailure.usage("Missing required arguments.")
         }
 
-        if supportDirPath != nil && archivePath != nil {
+        let options = try parseOptions(arguments: arguments)
+        if options.helpRequested {
+            return .help
+        }
+
+        if options.supportDirPath != nil && options.archivePath != nil {
             throw RecoveryFailure.usage("Specify either --support-dir or --archive, not both.")
         }
-        guard supportDirPath != nil || archivePath != nil else {
+        guard options.supportDirPath != nil || options.archivePath != nil else {
             throw RecoveryFailure.usage("Either --support-dir or --archive is required.")
         }
-        guard let outputDirPath, !outputDirPath.isEmpty else {
+        guard let outputDirPath = options.outputDirPath, !outputDirPath.isEmpty else {
             throw RecoveryFailure.usage("--output-dir <path> is required.")
         }
 
         let outputURL = URL(fileURLWithPath: outputDirPath, isDirectory: true)
-
-        if let supportDirPath {
-            guard !supportDirPath.isEmpty else {
-                throw RecoveryFailure.usage("--support-dir requires a non-empty path.")
-            }
-            if passphraseFilePath != nil || passphraseStdin || allowTestIterations {
-                throw RecoveryFailure.usage("Archive passphrase flags cannot be combined with --support-dir.")
-            }
-            if keyFilePath != nil && keyHexStdin {
-                throw RecoveryFailure.usage("Specify at most one of --key-file and --key-hex-stdin.")
-            }
-
-            let keySource: KeyInputSource
-            if let keyFilePath {
-                keySource = .file(keyFilePath)
-            } else if keyHexStdin {
-                keySource = .stdinHex
-            } else {
-                keySource = .auto
-            }
-
-            return .supportDirectory(
-                supportDir: URL(fileURLWithPath: supportDirPath, isDirectory: true),
-                outputDir: outputURL,
-                keySource: keySource,
-                includeTrashed: includeTrashed,
-                strict: strict
+        if let supportDirPath = options.supportDirPath {
+            return try validateSupportDirCommand(
+                options,
+                supportDirPath: supportDirPath,
+                outputURL: outputURL
             )
         }
+        return try validateArchiveCommand(options, outputURL: outputURL)
+    }
 
-        guard let archivePath, !archivePath.isEmpty else {
+    private static func parseOptions(arguments: [String]) throws -> ParsedOptions {
+        var options = ParsedOptions()
+        var index = 0
+        while index < arguments.count {
+            try applyOption(arguments: arguments, index: &index, into: &options)
+            if options.helpRequested {
+                return options
+            }
+            index += 1
+        }
+        return options
+    }
+
+    private static func applyOption(
+        arguments: [String],
+        index: inout Int,
+        into options: inout ParsedOptions
+    ) throws {
+        let rawArg = arguments[index]
+        let (flagName, inlineValue) = splitArgument(rawArg)
+
+        switch flagName {
+        case "-h", "--help":
+            try rejectInlineValue(inlineValue, for: flagName)
+            options.helpRequested = true
+        case "--support-dir":
+            options.supportDirPath = try resolveOptionValue(
+                for: flagName,
+                inlineValue: inlineValue,
+                arguments: arguments,
+                index: &index
+            )
+        case "--archive":
+            options.archivePath = try resolveOptionValue(
+                for: flagName,
+                inlineValue: inlineValue,
+                arguments: arguments,
+                index: &index
+            )
+        case "--output-dir":
+            options.outputDirPath = try resolveOptionValue(
+                for: flagName,
+                inlineValue: inlineValue,
+                arguments: arguments,
+                index: &index
+            )
+        case "--key-file":
+            options.keyFilePath = try resolveOptionValue(
+                for: flagName,
+                inlineValue: inlineValue,
+                arguments: arguments,
+                index: &index
+            )
+        case "--key-hex-stdin":
+            try rejectInlineValue(inlineValue, for: flagName)
+            options.keyHexStdin = true
+        case "--include-trashed":
+            try rejectInlineValue(inlineValue, for: flagName)
+            options.includeTrashed = true
+        case "--strict":
+            try rejectInlineValue(inlineValue, for: flagName)
+            options.strict = true
+        case "--passphrase-file":
+            options.passphraseFilePath = try resolveOptionValue(
+                for: flagName,
+                inlineValue: inlineValue,
+                arguments: arguments,
+                index: &index
+            )
+        case "--passphrase-stdin":
+            try rejectInlineValue(inlineValue, for: flagName)
+            options.passphraseStdin = true
+        case "--allow-test-iterations":
+            try rejectInlineValue(inlineValue, for: flagName)
+            options.allowTestIterations = true
+        default:
+            try throwUnrecognizedArgument(rawArg: rawArg, flagName: flagName)
+        }
+    }
+
+    private static func splitArgument(_ arg: String) -> (flagName: String, inlineValue: String?) {
+        if arg.hasPrefix("--"), let eqIndex = arg.firstIndex(of: "=") {
+            return (String(arg[..<eqIndex]), String(arg[arg.index(after: eqIndex)...]))
+        }
+        return (arg, nil)
+    }
+
+    private static func throwUnrecognizedArgument(rawArg: String, flagName: String) throws -> Never {
+        if flagName.hasPrefix("--key") || flagName.hasPrefix("--pass") {
+            throw RecoveryFailure.usage(
+                "Raw secrets are never accepted as CLI arguments (\(flagName)); use file or stdin flags."
+            )
+        }
+        if rawArg.hasPrefix("-") {
+            throw RecoveryFailure.usage("Unknown option: \(flagName)")
+        }
+        throw RecoveryFailure.usage("Unexpected positional argument.")
+    }
+
+    private static func validateSupportDirCommand(
+        _ options: ParsedOptions,
+        supportDirPath: String,
+        outputURL: URL
+    ) throws -> RecoveryCommand {
+        guard !supportDirPath.isEmpty else {
+            throw RecoveryFailure.usage("--support-dir requires a non-empty path.")
+        }
+        if options.passphraseFilePath != nil || options.passphraseStdin || options.allowTestIterations {
+            throw RecoveryFailure.usage("Archive passphrase flags cannot be combined with --support-dir.")
+        }
+        if options.keyFilePath != nil && options.keyHexStdin {
+            throw RecoveryFailure.usage("Specify at most one of --key-file and --key-hex-stdin.")
+        }
+
+        let keySource: KeyInputSource
+        if let keyFilePath = options.keyFilePath {
+            keySource = .file(keyFilePath)
+        } else if options.keyHexStdin {
+            keySource = .stdinHex
+        } else {
+            keySource = .auto
+        }
+
+        return .supportDirectory(
+            supportDir: URL(fileURLWithPath: supportDirPath, isDirectory: true),
+            outputDir: outputURL,
+            keySource: keySource,
+            includeTrashed: options.includeTrashed,
+            strict: options.strict
+        )
+    }
+
+    private static func validateArchiveCommand(
+        _ options: ParsedOptions,
+        outputURL: URL
+    ) throws -> RecoveryCommand {
+        guard let archivePath = options.archivePath, !archivePath.isEmpty else {
             throw RecoveryFailure.usage("--archive requires a non-empty path.")
         }
-        if keyFilePath != nil || keyHexStdin || includeTrashed || strict {
+        if options.keyFilePath != nil || options.keyHexStdin || options.includeTrashed || options.strict {
             throw RecoveryFailure.usage("Mode A --support-dir flags cannot be combined with --archive.")
         }
-        if passphraseFilePath != nil && passphraseStdin {
+        if options.passphraseFilePath != nil && options.passphraseStdin {
             throw RecoveryFailure.usage("Specify at most one of --passphrase-file and --passphrase-stdin.")
         }
 
         let passphraseSource: PassphraseInputSource
-        if let passphraseFilePath {
+        if let passphraseFilePath = options.passphraseFilePath {
             passphraseSource = .file(passphraseFilePath)
-        } else if passphraseStdin {
+        } else if options.passphraseStdin {
             passphraseSource = .stdin
         } else {
             passphraseSource = .interactiveTTY
@@ -1194,7 +1261,7 @@ private enum CLIParser {
             archiveURL: URL(fileURLWithPath: archivePath, isDirectory: true),
             outputDir: outputURL,
             passphraseSource: passphraseSource,
-            allowTestIterations: allowTestIterations
+            allowTestIterations: options.allowTestIterations
         )
     }
 
@@ -1244,6 +1311,95 @@ private enum LocalStoreRecovery {
 
     private typealias ResolvedRowAsset = RecoveryCryptoAndIO.DisambiguatedPlainAsset
 
+    private struct ModeARecoveryContext {
+        let supportDir: URL
+        let stagedImagesDir: URL
+        let stagedPreviewsDir: URL
+        let keys: DerivedStoreKeys
+        let decoder: JSONDecoder
+        var usedPlainFileNames: Set<String> = []
+        var currentRowWrittenAssets: [ResolvedRowAsset] = []
+
+        func destinationDirectory(for role: AssetRole) -> URL {
+            switch role {
+            case .image:
+                return stagedImagesDir
+            case .linkPreview, .linkFavicon:
+                return stagedPreviewsDir
+            }
+        }
+
+        static func defaultAssetStem(for role: AssetRole, clipID: UUID) -> String {
+            switch role {
+            case .image:
+                return clipID.uuidString
+            case .linkPreview:
+                return "\(clipID.uuidString)-preview"
+            case .linkFavicon:
+                return "\(clipID.uuidString)-favicon"
+            }
+        }
+
+        mutating func resetRowTracking() {
+            currentRowWrittenAssets.removeAll(keepingCapacity: true)
+        }
+
+        mutating func rollbackCurrentRowAssets() {
+            for written in currentRowWrittenAssets {
+                RecoveryCryptoAndIO.secureUnlink(at: written.writtenURL)
+                usedPlainFileNames.remove(written.usedNameKey)
+            }
+            currentRowWrittenAssets.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private struct DecodedClipHeader {
+        let kind: String
+        let copiedAt: Date
+        let firstCopiedAt: Date
+        let deletedAt: Date?
+        let copySequenceID: Date?
+        let copySequenceOrder: Int?
+        let byteSize: Int
+        let copyCount: Int
+        let isFavorite: Bool
+        let favoriteOrder: Int?
+        let sourceAppName: String?
+        let sourceBundleIdentifier: String?
+        let sensitivity: String?
+        let isEncrypted: Bool
+        let title: String?
+        let rawAssetPath: String?
+        let filePaths: [String]
+        let storedLinkPreview: StoredLinkPreviewDetails?
+    }
+
+    private struct DecodedClipContents {
+        let text: String?
+        let qrCodeText: String?
+        let rtfData: Data?
+        let html: String?
+    }
+
+    private struct StagedClipAssets {
+        let assetPath: String?
+        let linkPreviewDetails: ClipBookArchiveLinkPreviewDetails?
+    }
+
+    private struct ValidatedSupportStoreFiles {
+        let dbURL: URL
+        let walURL: URL
+        let walSize: Int64
+        let journalURL: URL
+        let journalSize: Int64
+    }
+
+    private struct ModeARecoveredRows {
+        var activeItems: [ClipBookArchiveItem] = []
+        var trashedItems: [ClipBookArchiveItem] = []
+        var corruptedItemIDs: [String] = []
+    }
+
     static func run(
         supportDir: URL,
         outputDir: URL,
@@ -1251,6 +1407,74 @@ private enum LocalStoreRecovery {
         includeTrashed: Bool,
         strict: Bool
     ) throws -> Int32 {
+        let storeFiles = try validateSupportDirectorySources(at: supportDir)
+        let masterKey = try resolveMasterKey(supportDir: supportDir, keySource: keySource)
+        let keys = DerivedStoreKeys(masterKey: masterKey)
+
+        let (probeDir, copiedDBURL) = try prepareEphemeralProbeDirectory(for: storeFiles)
+        var db: OpaquePointer?
+        defer {
+            if let openDB = db {
+                _ = sqlite3_close_v2(openDB)
+                db = nil
+            }
+            RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: probeDir)
+        }
+
+        let sqliteDB = try openVerifiedDatabase(at: copiedDBURL, keys: keys)
+        db = sqliteDB
+
+        let archiveTags = try loadTags(sqliteDB)
+        let tagAttachmentsByClipID = try loadTagAttachments(sqliteDB)
+
+        let layout = try RecoveryCryptoAndIO.prepareStagedV1ArchiveLayout(for: outputDir)
+        defer {
+            RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: layout.stagingRoot)
+        }
+
+        var context = ModeARecoveryContext(
+            supportDir: supportDir,
+            stagedImagesDir: layout.stagedImagesDir,
+            stagedPreviewsDir: layout.stagedPreviewsDir,
+            keys: keys,
+            decoder: RecoveryCryptoAndIO.makeDecoder()
+        )
+        let recovered = try streamRecoveredClips(
+            from: sqliteDB,
+            tagAttachmentsByClipID: tagAttachmentsByClipID,
+            includeTrashed: includeTrashed,
+            strict: strict,
+            context: &context
+        )
+
+        try writeModeAArchiveFiles(
+            stagedArchiveURL: layout.stagedArchiveURL,
+            tags: archiveTags,
+            recovered: recovered,
+            includeTrashed: includeTrashed
+        )
+
+        // Close SQLite before swapping output so WAL replay directory cleanup runs with zero open handles.
+        if let openDB = db {
+            _ = sqlite3_close_v2(openDB)
+            db = nil
+        }
+
+        try RecoveryCryptoAndIO.swapStagedOutput(at: layout.stagedArchiveURL, into: outputDir)
+
+        if !recovered.corruptedItemIDs.isEmpty {
+            writeStderr(
+                "Warning: Recovered \(recovered.activeItems.count) active item(s), omitted \(recovered.corruptedItemIDs.count) corrupted item(s) (see corrupted-items.json).\n"
+            )
+            return ExitStatus.partialRecovery
+        }
+
+        return ExitStatus.success
+    }
+
+    // MARK: - Mode A Pipeline Stage Helpers
+
+    private static func validateSupportDirectorySources(at supportDir: URL) throws -> ValidatedSupportStoreFiles {
         var supportStat = stat()
         guard Darwin.lstat(supportDir.path, &supportStat) == 0 else {
             throw RecoveryFailure.fatal("Support directory does not exist or is not a directory: \(supportDir.path)")
@@ -1274,9 +1498,18 @@ private enum LocalStoreRecovery {
         let walSize = try validateRegularSidecarOrDatabase(at: sourceWALURL, required: false, label: "History.sqlite-wal") ?? 0
         let journalSize = try validateRegularSidecarOrDatabase(at: sourceJournalURL, required: false, label: "History.sqlite-journal") ?? 0
 
-        let masterKey = try resolveMasterKey(supportDir: supportDir, keySource: keySource)
-        let keys = DerivedStoreKeys(masterKey: masterKey)
+        return ValidatedSupportStoreFiles(
+            dbURL: sourceDBURL,
+            walURL: sourceWALURL,
+            walSize: walSize,
+            journalURL: sourceJournalURL,
+            journalSize: journalSize
+        )
+    }
 
+    private static func prepareEphemeralProbeDirectory(
+        for sources: ValidatedSupportStoreFiles
+    ) throws -> (probeDir: URL, copiedDBURL: URL) {
         // Copy History.sqlite (+ any non-empty -wal / -journal) into an ephemeral 0o700 directory
         // under FileManager.default.temporaryDirectory so <support-dir> files and mtime stay 100% untouched.
         let baseTempDir = FileManager.default.temporaryDirectory
@@ -1288,155 +1521,148 @@ private enum LocalStoreRecovery {
         }
         _ = Darwin.chmod(probeDir.path, mode_t(0o700))
 
-        var db: OpaquePointer?
-        defer {
-            if let openDB = db {
-                _ = sqlite3_close_v2(openDB)
-                db = nil
+        do {
+            let copiedDBURL = probeDir.appendingPathComponent("History.sqlite", isDirectory: false)
+            try copyRegularFile0600(from: sources.dbURL, to: copiedDBURL, allowMissingSource: false)
+
+            if sources.walSize > 0 {
+                let copiedWALURL = probeDir.appendingPathComponent("History.sqlite-wal", isDirectory: false)
+                let didCopyWAL = try copyRegularFile0600(from: sources.walURL, to: copiedWALURL, allowMissingSource: true)
+                if didCopyWAL {
+                    // Pre-pin BEFORE sqlite3_open_v2 so SQLite closing/checkpointing cannot drop the inode prior to zero-fill scrub.
+                    _ = Darwin.link(copiedWALURL.path, copiedWALURL.path + ".pin")
+                } else {
+                    try copyRegularFile0600(from: sources.dbURL, to: copiedDBURL, allowMissingSource: false)
+                }
             }
+
+            if sources.journalSize > 0 {
+                let copiedJournalURL = probeDir.appendingPathComponent("History.sqlite-journal", isDirectory: false)
+                let didCopyJournal = try copyRegularFile0600(from: sources.journalURL, to: copiedJournalURL, allowMissingSource: true)
+                if didCopyJournal {
+                    _ = Darwin.link(copiedJournalURL.path, copiedJournalURL.path + ".pin")
+                } else {
+                    try copyRegularFile0600(from: sources.dbURL, to: copiedDBURL, allowMissingSource: false)
+                }
+            }
+
+            return (probeDir, copiedDBURL)
+        } catch {
             RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: probeDir)
+            throw error
         }
+    }
 
-        let copiedDBURL = probeDir.appendingPathComponent("History.sqlite", isDirectory: false)
-        try copyRegularFile0600(from: sourceDBURL, to: copiedDBURL, allowMissingSource: false)
-
-        if walSize > 0 {
-            let copiedWALURL = probeDir.appendingPathComponent("History.sqlite-wal", isDirectory: false)
-            let didCopyWAL = try copyRegularFile0600(from: sourceWALURL, to: copiedWALURL, allowMissingSource: true)
-            if didCopyWAL {
-                // Pre-pin BEFORE sqlite3_open_v2 so SQLite closing/checkpointing cannot drop the inode prior to zero-fill scrub.
-                _ = Darwin.link(copiedWALURL.path, copiedWALURL.path + ".pin")
-            } else {
-                try copyRegularFile0600(from: sourceDBURL, to: copiedDBURL, allowMissingSource: false)
-            }
-        }
-
-        if journalSize > 0 {
-            let copiedJournalURL = probeDir.appendingPathComponent("History.sqlite-journal", isDirectory: false)
-            let didCopyJournal = try copyRegularFile0600(from: sourceJournalURL, to: copiedJournalURL, allowMissingSource: true)
-            if didCopyJournal {
-                _ = Darwin.link(copiedJournalURL.path, copiedJournalURL.path + ".pin")
-            } else {
-                try copyRegularFile0600(from: sourceDBURL, to: copiedDBURL, allowMissingSource: false)
-            }
-        }
-
+    private static func openVerifiedDatabase(at copiedDBURL: URL, keys: DerivedStoreKeys) throws -> OpaquePointer {
+        var db: OpaquePointer?
         let openRC = sqlite3_open_v2(copiedDBURL.path, &db, SQLITE_OPEN_READWRITE, nil)
         guard openRC == SQLITE_OK, let sqliteDB = db else {
             let msg = db.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "code \(openRC)"
+            if let openDB = db {
+                _ = sqlite3_close_v2(openDB)
+            }
             throw RecoveryFailure.fatal("Failed opening copied History.sqlite: \(msg)")
         }
 
-        try execSQL(
-            sqliteDB,
-            sql: """
-                PRAGMA foreign_keys = ON;
-                PRAGMA busy_timeout = 5000;
-                PRAGMA trusted_schema = OFF;
-                PRAGMA cell_size_check = ON;
-                PRAGMA temp_store = MEMORY;
-                PRAGMA secure_delete = ON;
-                """
-        )
-
-        let userVersion = try querySingleInt(sqliteDB, sql: "PRAGMA user_version;")
-        guard userVersion == 5 else {
-            throw RecoveryFailure.fatal(
-                "Unsupported History.sqlite schema version \(userVersion) (expected PRAGMA user_version = 5)."
+        do {
+            try execSQL(
+                sqliteDB,
+                sql: """
+                    PRAGMA foreign_keys = ON;
+                    PRAGMA busy_timeout = 5000;
+                    PRAGMA trusted_schema = OFF;
+                    PRAGMA cell_size_check = ON;
+                    PRAGMA temp_store = MEMORY;
+                    PRAGMA secure_delete = ON;
+                    """
             )
+
+            let userVersion = try querySingleInt(sqliteDB, sql: "PRAGMA user_version;")
+            guard userVersion == 5 else {
+                throw RecoveryFailure.fatal(
+                    "Unsupported History.sqlite schema version \(userVersion) (expected PRAGMA user_version = 5)."
+                )
+            }
+
+            guard try tableExists(sqliteDB, name: "store_metadata") else {
+                throw RecoveryFailure.fatal("History.sqlite is missing required v5 store_metadata table.")
+            }
+
+            guard let verifier = try queryKeyVerifier(sqliteDB),
+                  RecoveryCryptoAndIO.verifyStoreKeyVerifier(verifier, keys: keys) else {
+                throw RecoveryFailure.keyOrPassphraseMismatch(
+                    "Encryption key mismatch: master key does not match store_metadata 'key_verifier_v1'."
+                )
+            }
+
+            return sqliteDB
+        } catch {
+            _ = sqlite3_close_v2(sqliteDB)
+            throw error
         }
+    }
 
-        guard try tableExists(sqliteDB, name: "store_metadata") else {
-            throw RecoveryFailure.fatal("History.sqlite is missing required v5 store_metadata table.")
-        }
-
-        guard let verifier = try queryKeyVerifier(sqliteDB),
-              RecoveryCryptoAndIO.verifyStoreKeyVerifier(verifier, keys: keys) else {
-            throw RecoveryFailure.keyOrPassphraseMismatch(
-                "Encryption key mismatch: master key does not match store_metadata 'key_verifier_v1'."
-            )
-        }
-
-        let archiveTags = try loadTags(sqliteDB)
-        let tagAttachmentsByClipID = try loadTagAttachments(sqliteDB)
-
-        let layout = try RecoveryCryptoAndIO.prepareStagedV1ArchiveLayout(for: outputDir)
-        let stagingRoot = layout.stagingRoot
-        let stagedArchiveURL = layout.stagedArchiveURL
-        let stagedImagesDir = layout.stagedImagesDir
-        let stagedPreviewsDir = layout.stagedPreviewsDir
-        defer {
-            RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: stagingRoot)
-        }
-
+    private static func prepareClipStatements(
+        sqliteDB: OpaquePointer,
+        includeTrashed: Bool
+    ) throws -> (clipsStmt: OpaquePointer, contentsLookupStmt: OpaquePointer) {
         let whereClause = includeTrashed ? "" : "WHERE c.deletedAt IS NULL"
         let clipsSQL = """
             SELECT
-                c.id,
-                c.kind,
-                c.copiedAt,
-                c.firstCopiedAt,
-                c.deletedAt,
-                c.copySequenceID,
-                c.copySequenceOrder,
-                c.byteSize,
-                c.copyCount,
-                c.isFavorite,
-                c.favoriteOrder,
-                c.sourceAppName,
-                c.sourceBundleIdentifier,
-                c.sensitivity,
-                c.isEncrypted,
-                c.title,
-                c.textPreview,
-                c.htmlDigest,
-                c.imageDigest,
-                c.assetPath,
-                c.filePathsData,
-                c.linkPreviewData,
-                cc.text,
-                cc.qrCodeText,
-                cc.rtf,
-                cc.html,
-                cc.clipId
+                c.id, c.kind, c.copiedAt, c.firstCopiedAt, c.deletedAt,
+                c.copySequenceID, c.copySequenceOrder, c.byteSize, c.copyCount,
+                c.isFavorite, c.favoriteOrder, c.sourceAppName, c.sourceBundleIdentifier,
+                c.sensitivity, c.isEncrypted, c.title, c.textPreview, c.htmlDigest,
+                c.imageDigest, c.assetPath, c.filePathsData, c.linkPreviewData,
+                cc.text, cc.qrCodeText, cc.rtf, cc.html, cc.clipId
             FROM clips c
             LEFT JOIN clip_contents cc ON cc.clipId = c.id
             \(whereClause)
             ORDER BY c.copiedAt DESC
             """
 
-        var clipsStmt: OpaquePointer?
-        guard sqlite3_prepare_v2(sqliteDB, clipsSQL, -1, &clipsStmt, nil) == SQLITE_OK,
-              let stmt = clipsStmt else {
+        var rawClipsStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(sqliteDB, clipsSQL, -1, &rawClipsStmt, nil) == SQLITE_OK,
+              let clipsStmt = rawClipsStmt else {
             let msg = String(cString: sqlite3_errmsg(sqliteDB))
             throw RecoveryFailure.fatal("Failed preparing clips query: \(msg)")
         }
-        defer {
-            sqlite3_finalize(stmt)
-        }
 
-        var fallbackContentsStmt: OpaquePointer?
         let fallbackSQL = """
             SELECT text, qrCodeText, rtf, html
             FROM clip_contents
             WHERE clipId = ?1 OR clipId = ?2 OR clipId = ?3
             LIMIT 1
             """
-        guard sqlite3_prepare_v2(sqliteDB, fallbackSQL, -1, &fallbackContentsStmt, nil) == SQLITE_OK,
-              let contentsLookupStmt = fallbackContentsStmt else {
+        var rawFallbackStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(sqliteDB, fallbackSQL, -1, &rawFallbackStmt, nil) == SQLITE_OK,
+              let contentsLookupStmt = rawFallbackStmt else {
             let msg = String(cString: sqlite3_errmsg(sqliteDB))
+            sqlite3_finalize(clipsStmt)
             throw RecoveryFailure.fatal("Failed preparing clip_contents lookup query: \(msg)")
         }
+
+        return (clipsStmt, contentsLookupStmt)
+    }
+
+    private static func streamRecoveredClips(
+        from sqliteDB: OpaquePointer,
+        tagAttachmentsByClipID: [UUID: TagAttachment],
+        includeTrashed: Bool,
+        strict: Bool,
+        context: inout ModeARecoveryContext
+    ) throws -> ModeARecoveredRows {
+        let (stmt, contentsLookupStmt) = try prepareClipStatements(
+            sqliteDB: sqliteDB,
+            includeTrashed: includeTrashed
+        )
         defer {
             sqlite3_finalize(contentsLookupStmt)
+            sqlite3_finalize(stmt)
         }
 
-        let jsonDecoder = RecoveryCryptoAndIO.makeDecoder()
-        var activeItems: [ClipBookArchiveItem] = []
-        var trashedItems: [ClipBookArchiveItem] = []
-        var corruptedItemIDs: [String] = []
+        var recovered = ModeARecoveredRows()
         var corruptedItemIDSet: Set<String> = []
-        var usedPlainFileNames: Set<String> = []
 
         while true {
             let stepRC = sqlite3_step(stmt)
@@ -1453,31 +1679,22 @@ private enum LocalStoreRecovery {
                     throw RecoveryFailure.fatal("Encountered malformed primary key in clips.id.")
                 }
 
-                var rowWrittenAssets: [ResolvedRowAsset] = []
+                context.resetRowTracking()
                 do {
                     let (archiveItem, isTrashed) = try recoverClipRow(
                         stmt: stmt,
                         contentsLookupStmt: contentsLookupStmt,
                         clipID: clipID,
                         attachment: tagAttachmentsByClipID[clipID] ?? TagAttachment(),
-                        supportDir: supportDir,
-                        stagedImagesDir: stagedImagesDir,
-                        stagedPreviewsDir: stagedPreviewsDir,
-                        keys: keys,
-                        decoder: jsonDecoder,
-                        usedPlainFileNames: &usedPlainFileNames,
-                        rowWrittenAssets: &rowWrittenAssets
+                        context: &context
                     )
                     if isTrashed {
-                        trashedItems.append(archiveItem)
+                        recovered.trashedItems.append(archiveItem)
                     } else {
-                        activeItems.append(archiveItem)
+                        recovered.activeItems.append(archiveItem)
                     }
                 } catch let rowError as RowCorruptionError {
-                    for written in rowWrittenAssets {
-                        RecoveryCryptoAndIO.secureUnlink(at: written.writtenURL)
-                        usedPlainFileNames.remove(written.usedNameKey)
-                    }
+                    context.rollbackCurrentRowAssets()
                     if strict {
                         throw RecoveryFailure.fatal(
                             "Strict mode aborted on corrupt item \(clipID.uuidString.lowercased()): \(describeRowError(rowError))"
@@ -1485,12 +1702,21 @@ private enum LocalStoreRecovery {
                     }
                     let lowerID = clipID.uuidString.lowercased()
                     if corruptedItemIDSet.insert(lowerID).inserted {
-                        corruptedItemIDs.append(lowerID)
+                        recovered.corruptedItemIDs.append(lowerID)
                     }
                 }
             }
         }
 
+        return recovered
+    }
+
+    private static func writeModeAArchiveFiles(
+        stagedArchiveURL: URL,
+        tags: [ClipBookArchiveTag],
+        recovered: ModeARecoveredRows,
+        includeTrashed: Bool
+    ) throws {
         let encoder = RecoveryCryptoAndIO.makeEncoder()
         let manifest = ClipBookArchiveManifest(
             formatVersion: 1,
@@ -1500,24 +1726,24 @@ private enum LocalStoreRecovery {
             encryption: nil
         )
 
-        let hasCorruptedItems = !corruptedItemIDs.isEmpty
+        let hasCorruptedItems = !recovered.corruptedItemIDs.isEmpty
         try RecoveryCryptoAndIO.writePrivateFile(
             try encoder.encode(manifest),
             to: stagedArchiveURL.appendingPathComponent("manifest.json", isDirectory: false)
         )
         try RecoveryCryptoAndIO.writePrivateFile(
-            try encoder.encode(archiveTags),
+            try encoder.encode(tags),
             to: stagedArchiveURL.appendingPathComponent("tags.json", isDirectory: false)
         )
         try RecoveryCryptoAndIO.writePrivateFile(
-            try encoder.encode(activeItems),
+            try encoder.encode(recovered.activeItems),
             to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false),
             sync: !includeTrashed && !hasCorruptedItems
         )
 
         if includeTrashed {
             try RecoveryCryptoAndIO.writePrivateFile(
-                try encoder.encode(trashedItems),
+                try encoder.encode(recovered.trashedItems),
                 to: stagedArchiveURL.appendingPathComponent("trashed-history.json", isDirectory: false),
                 sync: !hasCorruptedItems
             )
@@ -1525,28 +1751,11 @@ private enum LocalStoreRecovery {
 
         if hasCorruptedItems {
             try RecoveryCryptoAndIO.writePrivateFile(
-                try encoder.encode(corruptedItemIDs),
+                try encoder.encode(recovered.corruptedItemIDs),
                 to: stagedArchiveURL.appendingPathComponent("corrupted-items.json", isDirectory: false),
                 sync: true
             )
         }
-
-        // Close SQLite before swapping output so WAL replay directory cleanup runs with zero open handles.
-        if let openDB = db {
-            _ = sqlite3_close_v2(openDB)
-            db = nil
-        }
-
-        try RecoveryCryptoAndIO.swapStagedOutput(at: stagedArchiveURL, into: outputDir)
-
-        if !corruptedItemIDs.isEmpty {
-            writeStderr(
-                "Warning: Recovered \(activeItems.count) active item(s), omitted \(corruptedItemIDs.count) corrupted item(s) (see corrupted-items.json).\n"
-            )
-            return ExitStatus.partialRecovery
-        }
-
-        return ExitStatus.success
     }
 
     // MARK: - Mode A Row & Asset Helpers
@@ -1556,14 +1765,59 @@ private enum LocalStoreRecovery {
         contentsLookupStmt: OpaquePointer,
         clipID: UUID,
         attachment: TagAttachment,
-        supportDir: URL,
-        stagedImagesDir: URL,
-        stagedPreviewsDir: URL,
-        keys: DerivedStoreKeys,
-        decoder: JSONDecoder,
-        usedPlainFileNames: inout Set<String>,
-        rowWrittenAssets: inout [ResolvedRowAsset]
+        context: inout ModeARecoveryContext
     ) throws -> (item: ClipBookArchiveItem, isTrashed: Bool) {
+        let header = try decodeClipRowHeader(stmt: stmt, clipID: clipID, context: context)
+        let contents = try decodeRowClipContents(
+            stmt: stmt,
+            contentsLookupStmt: contentsLookupStmt,
+            clipID: clipID,
+            isEncrypted: header.isEncrypted,
+            keys: context.keys
+        )
+        let stagedAssets = try stageClipRowAssets(header: header, clipID: clipID, context: &context)
+
+        let tagIDs = attachment.tagIDs.map(String.init)
+        let tagOrders: [String: Int]? = attachment.tagOrders.isEmpty
+            ? nil
+            : Dictionary(uniqueKeysWithValues: attachment.tagOrders.map { (String($0.key), $0.value) })
+
+        let archiveItem = ClipBookArchiveItem(
+            id: clipID,
+            kind: header.kind,
+            title: header.title,
+            text: contents.text,
+            qrCodeText: contents.qrCodeText,
+            rtfBase64: contents.rtfData?.base64EncodedString(),
+            html: contents.html,
+            assetPath: stagedAssets.assetPath,
+            assetExtension: nil,
+            filePaths: header.filePaths,
+            sourceAppName: header.sourceAppName,
+            sourceBundleIdentifier: header.sourceBundleIdentifier,
+            copiedAt: header.copiedAt,
+            firstCopiedAt: header.firstCopiedAt,
+            byteSize: header.byteSize,
+            isFavorite: header.isFavorite,
+            tagIDs: tagIDs,
+            tagNames: attachment.tagNames,
+            copyCount: header.copyCount,
+            linkPreviewDetails: stagedAssets.linkPreviewDetails,
+            copySequenceID: header.copySequenceID,
+            copySequenceOrder: header.copySequenceOrder,
+            favoriteOrder: header.favoriteOrder,
+            tagOrders: tagOrders,
+            sensitivity: header.sensitivity
+        )
+
+        return (archiveItem, header.deletedAt != nil)
+    }
+
+    private static func decodeClipRowHeader(
+        stmt: OpaquePointer,
+        clipID: UUID,
+        context: ModeARecoveryContext
+    ) throws -> DecodedClipHeader {
         let kind = try decodePlainTextColumn(stmt, index: 1, columnName: "clips.kind") ?? "text"
         guard let copiedAt = try decodeTimestampColumn(stmt, index: 2, columnName: "clips.copiedAt") else {
             throw RowCorruptionError.columnMalformed("clips.copiedAt")
@@ -1585,7 +1839,54 @@ private enum LocalStoreRecovery {
         }
         let isEncrypted = sqlite3_column_int64(stmt, 14) != 0
 
-        // Decrypt / decode all 7 protected clips columns (enforcing non-downgrade SQLITE_BLOB + 0x01 AEAD).
+        let (title, rawAssetPath) = try authenticateProtectedClipScalars(
+            stmt: stmt,
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            keys: context.keys
+        )
+        let filePaths = try decodeProtectedFilePaths(
+            stmt: stmt,
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            context: context
+        )
+        let storedLinkPreview = try decodeProtectedLinkPreview(
+            stmt: stmt,
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            context: context
+        )
+
+        return DecodedClipHeader(
+            kind: kind,
+            copiedAt: copiedAt,
+            firstCopiedAt: firstCopiedAt,
+            deletedAt: deletedAt,
+            copySequenceID: copySequenceID,
+            copySequenceOrder: copySequenceOrder,
+            byteSize: byteSize,
+            copyCount: copyCount,
+            isFavorite: isFavorite,
+            favoriteOrder: favoriteOrder,
+            sourceAppName: sourceAppName,
+            sourceBundleIdentifier: sourceBundleIdentifier,
+            sensitivity: sensitivity,
+            isEncrypted: isEncrypted,
+            title: title,
+            rawAssetPath: rawAssetPath,
+            filePaths: filePaths,
+            storedLinkPreview: storedLinkPreview
+        )
+    }
+
+    private static func authenticateProtectedClipScalars(
+        stmt: OpaquePointer,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: DerivedStoreKeys
+    ) throws -> (title: String?, rawAssetPath: String?) {
+        // Authenticate all protected scalar clips columns (enforcing non-downgrade SQLITE_BLOB + 0x01 AEAD).
         let title = try decodeProtectedStringColumn(
             stmt: stmt,
             index: 15,
@@ -1595,33 +1896,17 @@ private enum LocalStoreRecovery {
             isEncrypted: isEncrypted,
             keys: keys
         )
-        _ = try decodeProtectedStringColumn(
-            stmt: stmt,
-            index: 16,
-            table: "clips",
-            column: "textPreview",
-            clipID: clipID,
-            isEncrypted: isEncrypted,
-            keys: keys
-        )
-        _ = try decodeProtectedStringColumn(
-            stmt: stmt,
-            index: 17,
-            table: "clips",
-            column: "htmlDigest",
-            clipID: clipID,
-            isEncrypted: isEncrypted,
-            keys: keys
-        )
-        _ = try decodeProtectedStringColumn(
-            stmt: stmt,
-            index: 18,
-            table: "clips",
-            column: "imageDigest",
-            clipID: clipID,
-            isEncrypted: isEncrypted,
-            keys: keys
-        )
+        for (colIndex, colName) in [(Int32(16), "textPreview"), (Int32(17), "htmlDigest"), (Int32(18), "imageDigest")] {
+            _ = try decodeProtectedStringColumn(
+                stmt: stmt,
+                index: colIndex,
+                table: "clips",
+                column: colName,
+                clipID: clipID,
+                isEncrypted: isEncrypted,
+                keys: keys
+            )
+        }
         let rawAssetPath = try decodeProtectedStringColumn(
             stmt: stmt,
             index: 19,
@@ -1634,7 +1919,15 @@ private enum LocalStoreRecovery {
         if isEncrypted, let rawAssetPath, !hasEncryptedExtension(rawAssetPath) {
             throw RowCorruptionError.columnAuthenticationFailed("clips.assetPath downgrade")
         }
+        return (title, rawAssetPath)
+    }
 
+    private static func decodeProtectedFilePaths(
+        stmt: OpaquePointer,
+        clipID: UUID,
+        isEncrypted: Bool,
+        context: ModeARecoveryContext
+    ) throws -> [String] {
         guard let filePathsJSON = try decodeProtectedDataColumn(
             stmt: stmt,
             index: 20,
@@ -1642,154 +1935,123 @@ private enum LocalStoreRecovery {
             column: "filePathsData",
             clipID: clipID,
             isEncrypted: isEncrypted,
-            keys: keys
+            keys: context.keys
         ) else {
             throw RowCorruptionError.columnMalformed("clips.filePathsData")
         }
-        let filePaths: [String]
         do {
-            filePaths = try decoder.decode([String].self, from: filePathsJSON)
+            return try context.decoder.decode([String].self, from: filePathsJSON)
         } catch {
             throw RowCorruptionError.columnMalformed("clips.filePathsData JSON")
         }
+    }
 
-        let storedLinkPreview: StoredLinkPreviewDetails?
-        if let linkPreviewJSON = try decodeProtectedDataColumn(
+    private static func decodeProtectedLinkPreview(
+        stmt: OpaquePointer,
+        clipID: UUID,
+        isEncrypted: Bool,
+        context: ModeARecoveryContext
+    ) throws -> StoredLinkPreviewDetails? {
+        guard let linkPreviewJSON = try decodeProtectedDataColumn(
             stmt: stmt,
             index: 21,
             table: "clips",
             column: "linkPreviewData",
             clipID: clipID,
             isEncrypted: isEncrypted,
-            keys: keys
-        ) {
-            do {
-                storedLinkPreview = try decoder.decode(StoredLinkPreviewDetails.self, from: linkPreviewJSON)
-            } catch {
-                throw RowCorruptionError.columnMalformed("clips.linkPreviewData JSON")
-            }
-            if isEncrypted, let storedLinkPreview {
-                if let imgPath = storedLinkPreview.imagePath, !hasEncryptedExtension(imgPath) {
-                    throw RowCorruptionError.columnAuthenticationFailed("clips.linkPreviewData.imagePath downgrade")
-                }
-                if let favPath = storedLinkPreview.faviconPath, !hasEncryptedExtension(favPath) {
-                    throw RowCorruptionError.columnAuthenticationFailed("clips.linkPreviewData.faviconPath downgrade")
-                }
-            }
-        } else {
-            storedLinkPreview = nil
+            keys: context.keys
+        ) else {
+            return nil
         }
 
-        let text: String?
-        let qrCodeText: String?
-        let rtfData: Data?
-        let html: String?
+        let storedLinkPreview: StoredLinkPreviewDetails
+        do {
+            storedLinkPreview = try context.decoder.decode(StoredLinkPreviewDetails.self, from: linkPreviewJSON)
+        } catch {
+            throw RowCorruptionError.columnMalformed("clips.linkPreviewData JSON")
+        }
 
+        if isEncrypted {
+            if let imgPath = storedLinkPreview.imagePath, !hasEncryptedExtension(imgPath) {
+                throw RowCorruptionError.columnAuthenticationFailed("clips.linkPreviewData.imagePath downgrade")
+            }
+            if let favPath = storedLinkPreview.faviconPath, !hasEncryptedExtension(favPath) {
+                throw RowCorruptionError.columnAuthenticationFailed("clips.linkPreviewData.faviconPath downgrade")
+            }
+        }
+        return storedLinkPreview
+    }
+
+    private static func decodeRowClipContents(
+        stmt: OpaquePointer,
+        contentsLookupStmt: OpaquePointer,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: DerivedStoreKeys
+    ) throws -> DecodedClipContents {
         if sqlite3_column_type(stmt, 26) != SQLITE_NULL {
-            (text, qrCodeText, rtfData, html) = try decodeClipContentsColumns(
+            return try decodeClipContentsColumns(
                 stmt: stmt,
                 baseIndex: 22,
                 clipID: clipID,
                 isEncrypted: isEncrypted,
                 keys: keys
             )
-        } else {
-            (text, qrCodeText, rtfData, html) = try lookupFallbackClipContents(
-                stmt: contentsLookupStmt,
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
         }
+        return try lookupFallbackClipContents(
+            stmt: contentsLookupStmt,
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            keys: keys
+        )
+    }
 
+    private static func stageClipRowAssets(
+        header: DecodedClipHeader,
+        clipID: UUID,
+        context: inout ModeARecoveryContext
+    ) throws -> StagedClipAssets {
         // Resolve and authenticate referenced external assets by lastPathComponent under Images/ & LinkPreviews/.
         let resolvedMainAsset = try resolveAndStageModeAAsset(
-            rawPath: rawAssetPath,
+            rawPath: header.rawAssetPath,
             role: .image,
             clipID: clipID,
-            isEncryptedRow: isEncrypted,
-            defaultStem: clipID.uuidString,
-            supportDir: supportDir,
-            destinationDir: stagedImagesDir,
-            keys: keys,
-            usedPlainFileNames: &usedPlainFileNames,
-            rowWrittenAssets: &rowWrittenAssets
+            isEncryptedRow: header.isEncrypted,
+            context: &context
         )
 
-        let archiveLinkPreview: ClipBookArchiveLinkPreviewDetails?
-        if let storedLinkPreview {
-            let resolvedPreviewImage = try resolveAndStageModeAAsset(
-                rawPath: storedLinkPreview.imagePath,
-                role: .linkPreview,
-                clipID: clipID,
-                isEncryptedRow: isEncrypted,
-                defaultStem: "\(clipID.uuidString)-preview",
-                supportDir: supportDir,
-                destinationDir: stagedPreviewsDir,
-                keys: keys,
-                usedPlainFileNames: &usedPlainFileNames,
-                rowWrittenAssets: &rowWrittenAssets
-            )
-            let resolvedFavicon = try resolveAndStageModeAAsset(
-                rawPath: storedLinkPreview.faviconPath,
-                role: .linkFavicon,
-                clipID: clipID,
-                isEncryptedRow: isEncrypted,
-                defaultStem: "\(clipID.uuidString)-favicon",
-                supportDir: supportDir,
-                destinationDir: stagedPreviewsDir,
-                keys: keys,
-                usedPlainFileNames: &usedPlainFileNames,
-                rowWrittenAssets: &rowWrittenAssets
-            )
-            archiveLinkPreview = ClipBookArchiveLinkPreviewDetails(
-                url: storedLinkPreview.url,
-                title: storedLinkPreview.title,
-                description: storedLinkPreview.description,
-                imagePath: resolvedPreviewImage?.relativeArchivePath,
-                faviconPath: resolvedFavicon?.relativeArchivePath,
-                fetchedAt: storedLinkPreview.fetchedAt,
-                imageExtension: nil,
-                faviconExtension: nil
-            )
-        } else {
-            archiveLinkPreview = nil
+        guard let storedLinkPreview = header.storedLinkPreview else {
+            return StagedClipAssets(assetPath: resolvedMainAsset?.relativeArchivePath, linkPreviewDetails: nil)
         }
 
-        let tagIDs = attachment.tagIDs.map(String.init)
-        let tagOrders: [String: Int]? = attachment.tagOrders.isEmpty
-            ? nil
-            : Dictionary(uniqueKeysWithValues: attachment.tagOrders.map { (String($0.key), $0.value) })
-
-        let archiveItem = ClipBookArchiveItem(
-            id: clipID,
-            kind: kind,
-            title: title,
-            text: text,
-            qrCodeText: qrCodeText,
-            rtfBase64: rtfData?.base64EncodedString(),
-            html: html,
-            assetPath: resolvedMainAsset?.relativeArchivePath,
-            assetExtension: nil,
-            filePaths: filePaths,
-            sourceAppName: sourceAppName,
-            sourceBundleIdentifier: sourceBundleIdentifier,
-            copiedAt: copiedAt,
-            firstCopiedAt: firstCopiedAt,
-            byteSize: byteSize,
-            isFavorite: isFavorite,
-            tagIDs: tagIDs,
-            tagNames: attachment.tagNames,
-            copyCount: copyCount,
-            linkPreviewDetails: archiveLinkPreview,
-            copySequenceID: copySequenceID,
-            copySequenceOrder: copySequenceOrder,
-            favoriteOrder: favoriteOrder,
-            tagOrders: tagOrders,
-            sensitivity: sensitivity
+        let resolvedPreviewImage = try resolveAndStageModeAAsset(
+            rawPath: storedLinkPreview.imagePath,
+            role: .linkPreview,
+            clipID: clipID,
+            isEncryptedRow: header.isEncrypted,
+            context: &context
         )
-
-        return (archiveItem, deletedAt != nil)
+        let resolvedFavicon = try resolveAndStageModeAAsset(
+            rawPath: storedLinkPreview.faviconPath,
+            role: .linkFavicon,
+            clipID: clipID,
+            isEncryptedRow: header.isEncrypted,
+            context: &context
+        )
+        let archiveLinkPreview = ClipBookArchiveLinkPreviewDetails(
+            url: storedLinkPreview.url,
+            title: storedLinkPreview.title,
+            description: storedLinkPreview.description,
+            imagePath: resolvedPreviewImage?.relativeArchivePath,
+            faviconPath: resolvedFavicon?.relativeArchivePath,
+            fetchedAt: storedLinkPreview.fetchedAt,
+            imageExtension: nil,
+            faviconExtension: nil
+        )
+        return StagedClipAssets(
+            assetPath: resolvedMainAsset?.relativeArchivePath,
+            linkPreviewDetails: archiveLinkPreview
+        )
     }
 
     private static func lookupFallbackClipContents(
@@ -1797,7 +2059,7 @@ private enum LocalStoreRecovery {
         clipID: UUID,
         isEncrypted: Bool,
         keys: DerivedStoreKeys
-    ) throws -> (String?, String?, Data?, String?) {
+    ) throws -> DecodedClipContents {
         sqlite3_reset(stmt)
         sqlite3_clear_bindings(stmt)
         defer {
@@ -1817,7 +2079,7 @@ private enum LocalStoreRecovery {
 
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE {
-            return (nil, nil, nil, nil)
+            return DecodedClipContents(text: nil, qrCodeText: nil, rtfData: nil, html: nil)
         }
         guard rc == SQLITE_ROW else {
             throw RowCorruptionError.columnMalformed("clip_contents lookup")
@@ -1838,7 +2100,7 @@ private enum LocalStoreRecovery {
         clipID: UUID,
         isEncrypted: Bool,
         keys: DerivedStoreKeys
-    ) throws -> (String?, String?, Data?, String?) {
+    ) throws -> DecodedClipContents {
         let text = try decodeProtectedStringColumn(
             stmt: stmt,
             index: baseIndex,
@@ -1875,7 +2137,7 @@ private enum LocalStoreRecovery {
             isEncrypted: isEncrypted,
             keys: keys
         )
-        return (text, qrCodeText, rtfData, html)
+        return DecodedClipContents(text: text, qrCodeText: qrCodeText, rtfData: rtfData, html: html)
     }
 
     private static func resolveAndStageModeAAsset(
@@ -1883,13 +2145,44 @@ private enum LocalStoreRecovery {
         role: AssetRole,
         clipID: UUID,
         isEncryptedRow: Bool,
-        defaultStem: String,
-        supportDir: URL,
-        destinationDir: URL,
-        keys: DerivedStoreKeys,
-        usedPlainFileNames: inout Set<String>,
-        rowWrittenAssets: inout [ResolvedRowAsset]
+        context: inout ModeARecoveryContext
     ) throws -> ResolvedRowAsset? {
+        guard let sourceURL = try locateValidatedManagedAsset(
+            rawPath: rawPath,
+            role: role,
+            isEncryptedRow: isEncryptedRow,
+            supportDir: context.supportDir
+        ) else {
+            return nil
+        }
+
+        let (plainData, sanitizedExtension) = try readAndOpenModeAAsset(
+            at: sourceURL,
+            role: role,
+            clipID: clipID,
+            isEncryptedRow: isEncryptedRow,
+            keys: context.keys
+        )
+
+        let resolved = try RecoveryCryptoAndIO.writeDisambiguatedPlainAsset(
+            plainData,
+            archiveSubdirectory: role.archiveSubdirectory,
+            rawStem: sourceURL.deletingPathExtension().lastPathComponent,
+            defaultStem: ModeARecoveryContext.defaultAssetStem(for: role, clipID: clipID),
+            fileExtension: sanitizedExtension,
+            destinationDir: context.destinationDirectory(for: role),
+            usedPlainFileNames: &context.usedPlainFileNames
+        )
+        context.currentRowWrittenAssets.append(resolved)
+        return resolved
+    }
+
+    private static func locateValidatedManagedAsset(
+        rawPath: String?,
+        role: AssetRole,
+        isEncryptedRow: Bool,
+        supportDir: URL
+    ) throws -> URL? {
         guard let rawPath, !rawPath.isEmpty else {
             return nil
         }
@@ -1909,8 +2202,8 @@ private enum LocalStoreRecovery {
         }
 
         let requiresEncryptedAsset = isEncryptedRow || hasEncryptedExtension(rawPath)
-
         let managedSubdirURL = supportDir.appendingPathComponent(role.managedSubdirectory, isDirectory: true)
+
         var dirStat = stat()
         if Darwin.lstat(managedSubdirURL.path, &dirStat) != 0 {
             if errno == ENOENT,
@@ -1944,9 +2237,22 @@ private enum LocalStoreRecovery {
             throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
         }
 
+        return sourceURL
+    }
+
+    private static func readAndOpenModeAAsset(
+        at sourceURL: URL,
+        role: AssetRole,
+        clipID: UUID,
+        isEncryptedRow: Bool,
+        keys: DerivedStoreKeys
+    ) throws -> (data: Data, fileExtension: String) {
         let rawFileData: Data
         do {
-            rawFileData = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: sourceURL, label: sourceURL.lastPathComponent)
+            rawFileData = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(
+                at: sourceURL,
+                label: sourceURL.lastPathComponent
+            )
         } catch {
             throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
         }
@@ -1956,35 +2262,22 @@ private enum LocalStoreRecovery {
             && rawFileData.prefix(magicCount) == RecoveryCryptoAndIO.assetEncryptedMagic
         let hasEncExt = sourceURL.pathExtension.lowercased() == "enc"
 
-        let plainData: Data
-        let sanitizedExtension: String
         if isEncryptedRow || hasEncExt || hasEncMagic {
-            plainData = try RecoveryCryptoAndIO.openEncryptedAsset(
+            let plainData = try RecoveryCryptoAndIO.openEncryptedAsset(
                 rawFileData,
                 role: role,
                 clipID: clipID,
                 keys: keys
             )
-            sanitizedExtension = RecoveryCryptoAndIO.plainAssetExtension(preferred: nil, magicBytes: plainData)
-        } else {
-            plainData = rawFileData
-            sanitizedExtension = RecoveryCryptoAndIO.plainAssetExtension(
-                preferred: sourceURL.pathExtension,
-                magicBytes: plainData
-            )
+            let sanitizedExt = RecoveryCryptoAndIO.plainAssetExtension(preferred: nil, magicBytes: plainData)
+            return (plainData, sanitizedExt)
         }
 
-        let resolved = try RecoveryCryptoAndIO.writeDisambiguatedPlainAsset(
-            plainData,
-            archiveSubdirectory: role.archiveSubdirectory,
-            rawStem: sourceURL.deletingPathExtension().lastPathComponent,
-            defaultStem: defaultStem,
-            fileExtension: sanitizedExtension,
-            destinationDir: destinationDir,
-            usedPlainFileNames: &usedPlainFileNames
+        let sanitizedExt = RecoveryCryptoAndIO.plainAssetExtension(
+            preferred: sourceURL.pathExtension,
+            magicBytes: rawFileData
         )
-        rowWrittenAssets.append(resolved)
-        return resolved
+        return (rawFileData, sanitizedExt)
     }
 
     private static func hasEncryptedExtension(_ path: String) -> Bool {
@@ -2485,12 +2778,111 @@ private enum LocalStoreRecovery {
 // MARK: - Mode B: Passphrase-Encrypted v2 .clipbookarchive Recovery
 
 private enum EncryptedArchiveRecovery {
+    private struct AuthenticatedArchiveSession {
+        let archiveURL: URL
+        let manifest: ClipBookArchiveManifest
+        let archiveID: UUID
+        let aeadKey: SymmetricKey
+        let manifestDigest: Data
+    }
+
+    private struct VerifiedEncryptedArchive {
+        let session: AuthenticatedArchiveSession
+        let tags: [ClipBookArchiveTag]
+        let payload: ClipBookEncryptedHistoryPayload
+    }
+
+    private struct ModeBRecoveryContext {
+        let archiveURL: URL
+        let stagedImagesDir: URL
+        let stagedPreviewsDir: URL
+        let archiveID: UUID
+        let aeadKey: SymmetricKey
+        let manifestDigest: Data
+        var usedPlainFileNames: Set<String> = []
+    }
+
     static func run(
         archiveURL: URL,
         outputDir: URL,
         passphraseSource: PassphraseInputSource,
         allowTestIterations: Bool
     ) throws -> Int32 {
+        let decoder = RecoveryCryptoAndIO.makeDecoder()
+        let encoder = RecoveryCryptoAndIO.makeEncoder()
+
+        let verified = try loadVerifiedEncryptedArchive(
+            at: archiveURL,
+            passphraseSource: passphraseSource,
+            allowTestIterations: allowTestIterations,
+            decoder: decoder
+        )
+
+        let layout = try RecoveryCryptoAndIO.prepareStagedV1ArchiveLayout(for: outputDir)
+        defer {
+            RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: layout.stagingRoot)
+        }
+
+        var context = ModeBRecoveryContext(
+            archiveURL: archiveURL,
+            stagedImagesDir: layout.stagedImagesDir,
+            stagedPreviewsDir: layout.stagedPreviewsDir,
+            archiveID: verified.session.archiveID,
+            aeadKey: verified.session.aeadKey,
+            manifestDigest: verified.session.manifestDigest
+        )
+        let recoveredItems = try recoverModeBItems(verified.payload.items, context: &context)
+
+        try writeModeBArchiveFiles(
+            stagedArchiveURL: layout.stagedArchiveURL,
+            manifest: verified.session.manifest,
+            tags: verified.tags,
+            items: recoveredItems,
+            encoder: encoder
+        )
+
+        try RecoveryCryptoAndIO.swapStagedOutput(at: layout.stagedArchiveURL, into: outputDir)
+        return ExitStatus.success
+    }
+
+    // MARK: - Mode B Pipeline & Asset Helpers
+
+    private static func loadVerifiedEncryptedArchive(
+        at archiveURL: URL,
+        passphraseSource: PassphraseInputSource,
+        allowTestIterations: Bool,
+        decoder: JSONDecoder
+    ) throws -> VerifiedEncryptedArchive {
+        try validateArchiveDirectory(at: archiveURL)
+        let session = try authenticateArchiveManifest(
+            at: archiveURL,
+            passphraseSource: passphraseSource,
+            allowTestIterations: allowTestIterations,
+            decoder: decoder
+        )
+
+        let archiveTags = try openAndDecodeEncryptedJSON(
+            [ClipBookArchiveTag].self,
+            relativePath: "tags.json.enc",
+            session: session,
+            decoder: decoder
+        )
+        let encryptedPayload = try openAndDecodeEncryptedJSON(
+            ClipBookEncryptedHistoryPayload.self,
+            relativePath: "history.json.enc",
+            session: session,
+            decoder: decoder
+        )
+        try verifyExpectedAssetsInventory(
+            expectedAssets: encryptedPayload.expectedAssets,
+            items: encryptedPayload.items,
+            in: archiveURL
+        )
+
+        return VerifiedEncryptedArchive(session: session, tags: archiveTags, payload: encryptedPayload)
+    }
+
+    private static func validateArchiveDirectory(at archiveURL: URL) throws {
         var archiveStat = stat()
         guard Darwin.lstat(archiveURL.path, &archiveStat) == 0 else {
             throw RecoveryFailure.fatal("Archive bundle does not exist or is not a directory: \(archiveURL.path)")
@@ -2502,10 +2894,14 @@ private enum EncryptedArchiveRecovery {
         guard archiveMode == S_IFDIR else {
             throw RecoveryFailure.fatal("Archive bundle does not exist or is not a directory: \(archiveURL.path)")
         }
+    }
 
-        let decoder = RecoveryCryptoAndIO.makeDecoder()
-        let encoder = RecoveryCryptoAndIO.makeEncoder()
-
+    private static func authenticateArchiveManifest(
+        at archiveURL: URL,
+        passphraseSource: PassphraseInputSource,
+        allowTestIterations: Bool,
+        decoder: JSONDecoder
+    ) throws -> AuthenticatedArchiveSession {
         let manifestURL = try validateContainedArchiveFile(in: archiveURL, relativePath: "manifest.json")
         let rawManifestBytes = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: manifestURL, label: "manifest.json")
         let manifest: ClipBookArchiveManifest
@@ -2554,92 +2950,39 @@ private enum EncryptedArchiveRecovery {
             throw RecoveryFailure.keyOrPassphraseMismatch("Incorrect archive passphrase.")
         }
 
-        let manifestDigest = Data(SHA256.hash(data: rawManifestBytes))
-
-        let archiveTags = try openAndDecodeEncryptedJSON(
-            [ClipBookArchiveTag].self,
-            relativePath: "tags.json.enc",
-            in: archiveURL,
-            key: derivedKeys.aeadKey,
+        return AuthenticatedArchiveSession(
+            archiveURL: archiveURL,
+            manifest: manifest,
             archiveID: encryption.archiveID,
-            manifestDigest: manifestDigest,
-            decoder: decoder
+            aeadKey: derivedKeys.aeadKey,
+            manifestDigest: Data(SHA256.hash(data: rawManifestBytes))
         )
+    }
 
-        let encryptedPayload = try openAndDecodeEncryptedJSON(
-            ClipBookEncryptedHistoryPayload.self,
-            relativePath: "history.json.enc",
-            in: archiveURL,
-            key: derivedKeys.aeadKey,
-            archiveID: encryption.archiveID,
-            manifestDigest: manifestDigest,
-            decoder: decoder
-        )
-
-        try verifyExpectedAssetsInventory(
-            expectedAssets: encryptedPayload.expectedAssets,
-            items: encryptedPayload.items,
-            in: archiveURL
-        )
-
-        let layout = try RecoveryCryptoAndIO.prepareStagedV1ArchiveLayout(for: outputDir)
-        let stagingRoot = layout.stagingRoot
-        let stagedArchiveURL = layout.stagedArchiveURL
-        let stagedImagesDir = layout.stagedImagesDir
-        let stagedPreviewsDir = layout.stagedPreviewsDir
-        defer {
-            RecoveryCryptoAndIO.scrubAndRemoveDirectory(at: stagingRoot)
-        }
-
-        var usedPlainFileNames: Set<String> = []
+    private static func recoverModeBItems(
+        _ items: [ClipBookArchiveItem],
+        context: inout ModeBRecoveryContext
+    ) throws -> [ClipBookArchiveItem] {
         var recoveredItems: [ClipBookArchiveItem] = []
-        recoveredItems.reserveCapacity(encryptedPayload.items.count)
+        recoveredItems.reserveCapacity(items.count)
 
-        for item in encryptedPayload.items {
+        for item in items {
             let recoveredItem = try autoreleasepool { () throws -> ClipBookArchiveItem in
                 var rewritten = item
                 rewritten.assetPath = try decryptAndStageV2Asset(
                     relativePath: item.assetPath,
                     preferredExtension: item.assetExtension,
                     defaultStem: item.id.uuidString,
-                    in: archiveURL,
-                    archiveID: encryption.archiveID,
-                    manifestDigest: manifestDigest,
-                    aeadKey: derivedKeys.aeadKey,
-                    stagedImagesDir: stagedImagesDir,
-                    stagedPreviewsDir: stagedPreviewsDir,
-                    usedPlainFileNames: &usedPlainFileNames
+                    context: &context
                 )
                 rewritten.assetExtension = nil
 
-                if var details = item.linkPreviewDetails {
-                    details.imagePath = try decryptAndStageV2Asset(
-                        relativePath: details.imagePath,
-                        preferredExtension: details.imageExtension,
-                        defaultStem: "\(item.id.uuidString)-preview",
-                        in: archiveURL,
-                        archiveID: encryption.archiveID,
-                        manifestDigest: manifestDigest,
-                        aeadKey: derivedKeys.aeadKey,
-                        stagedImagesDir: stagedImagesDir,
-                        stagedPreviewsDir: stagedPreviewsDir,
-                        usedPlainFileNames: &usedPlainFileNames
+                if let details = item.linkPreviewDetails {
+                    rewritten.linkPreviewDetails = try rewriteModeBLinkPreviewDetails(
+                        details,
+                        itemID: item.id,
+                        context: &context
                     )
-                    details.faviconPath = try decryptAndStageV2Asset(
-                        relativePath: details.faviconPath,
-                        preferredExtension: details.faviconExtension,
-                        defaultStem: "\(item.id.uuidString)-favicon",
-                        in: archiveURL,
-                        archiveID: encryption.archiveID,
-                        manifestDigest: manifestDigest,
-                        aeadKey: derivedKeys.aeadKey,
-                        stagedImagesDir: stagedImagesDir,
-                        stagedPreviewsDir: stagedPreviewsDir,
-                        usedPlainFileNames: &usedPlainFileNames
-                    )
-                    details.imageExtension = nil
-                    details.faviconExtension = nil
-                    rewritten.linkPreviewDetails = details
                 }
 
                 return rewritten
@@ -2647,6 +2990,39 @@ private enum EncryptedArchiveRecovery {
             recoveredItems.append(recoveredItem)
         }
 
+        return recoveredItems
+    }
+
+    private static func rewriteModeBLinkPreviewDetails(
+        _ details: ClipBookArchiveLinkPreviewDetails,
+        itemID: UUID,
+        context: inout ModeBRecoveryContext
+    ) throws -> ClipBookArchiveLinkPreviewDetails {
+        var rewritten = details
+        rewritten.imagePath = try decryptAndStageV2Asset(
+            relativePath: details.imagePath,
+            preferredExtension: details.imageExtension,
+            defaultStem: "\(itemID.uuidString)-preview",
+            context: &context
+        )
+        rewritten.faviconPath = try decryptAndStageV2Asset(
+            relativePath: details.faviconPath,
+            preferredExtension: details.faviconExtension,
+            defaultStem: "\(itemID.uuidString)-favicon",
+            context: &context
+        )
+        rewritten.imageExtension = nil
+        rewritten.faviconExtension = nil
+        return rewritten
+    }
+
+    private static func writeModeBArchiveFiles(
+        stagedArchiveURL: URL,
+        manifest: ClipBookArchiveManifest,
+        tags: [ClipBookArchiveTag],
+        items: [ClipBookArchiveItem],
+        encoder: JSONEncoder
+    ) throws {
         let plainManifest = ClipBookArchiveManifest(
             formatVersion: 1,
             appName: manifest.appName,
@@ -2660,32 +3036,21 @@ private enum EncryptedArchiveRecovery {
             to: stagedArchiveURL.appendingPathComponent("manifest.json", isDirectory: false)
         )
         try RecoveryCryptoAndIO.writePrivateFile(
-            try encoder.encode(archiveTags),
+            try encoder.encode(tags),
             to: stagedArchiveURL.appendingPathComponent("tags.json", isDirectory: false)
         )
         try RecoveryCryptoAndIO.writePrivateFile(
-            try encoder.encode(recoveredItems),
+            try encoder.encode(items),
             to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false),
             sync: true
         )
-
-        try RecoveryCryptoAndIO.swapStagedOutput(at: stagedArchiveURL, into: outputDir)
-        return ExitStatus.success
     }
-
-    // MARK: - Mode B Helpers
 
     private static func decryptAndStageV2Asset(
         relativePath: String?,
         preferredExtension: String?,
         defaultStem: String,
-        in archiveURL: URL,
-        archiveID: UUID,
-        manifestDigest: Data,
-        aeadKey: SymmetricKey,
-        stagedImagesDir: URL,
-        stagedPreviewsDir: URL,
-        usedPlainFileNames: inout Set<String>
+        context: inout ModeBRecoveryContext
     ) throws -> String? {
         guard let relativePath, !relativePath.isEmpty else {
             return nil
@@ -2698,15 +3063,15 @@ private enum EncryptedArchiveRecovery {
             throw RecoveryFailure.fatal("Invalid encrypted asset relative path: \(relativePath)")
         }
         let archiveSubdir = components[1]
-        let destinationDir = (archiveSubdir == "images") ? stagedImagesDir : stagedPreviewsDir
+        let destinationDir = (archiveSubdir == "images") ? context.stagedImagesDir : context.stagedPreviewsDir
 
-        let sourceURL = try validateContainedArchiveFile(in: archiveURL, relativePath: relativePath)
+        let sourceURL = try validateContainedArchiveFile(in: context.archiveURL, relativePath: relativePath)
         let sealedBytes = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: sourceURL, label: relativePath)
         let plainBytes = try RecoveryCryptoAndIO.openArchiveEntry(
             sealedBytes,
-            key: aeadKey,
-            archiveID: archiveID,
-            manifestDigest: manifestDigest,
+            key: context.aeadKey,
+            archiveID: context.archiveID,
+            manifestDigest: context.manifestDigest,
             relativePath: relativePath
         )
 
@@ -2721,7 +3086,7 @@ private enum EncryptedArchiveRecovery {
             defaultStem: defaultStem,
             fileExtension: sanitizedExt,
             destinationDir: destinationDir,
-            usedPlainFileNames: &usedPlainFileNames
+            usedPlainFileNames: &context.usedPlainFileNames
         )
         return resolved.relativeArchivePath
     }
@@ -2729,19 +3094,16 @@ private enum EncryptedArchiveRecovery {
     private static func openAndDecodeEncryptedJSON<T: Decodable>(
         _ type: T.Type,
         relativePath: String,
-        in archiveURL: URL,
-        key: SymmetricKey,
-        archiveID: UUID,
-        manifestDigest: Data,
+        session: AuthenticatedArchiveSession,
         decoder: JSONDecoder
     ) throws -> T {
-        let encURL = try validateContainedArchiveFile(in: archiveURL, relativePath: relativePath)
+        let encURL = try validateContainedArchiveFile(in: session.archiveURL, relativePath: relativePath)
         let sealedBytes = try RecoveryCryptoAndIO.readRegularFileDataNoFollow(at: encURL, label: relativePath)
         let decryptedBytes = try RecoveryCryptoAndIO.openArchiveEntry(
             sealedBytes,
-            key: key,
-            archiveID: archiveID,
-            manifestDigest: manifestDigest,
+            key: session.aeadKey,
+            archiveID: session.archiveID,
+            manifestDigest: session.manifestDigest,
             relativePath: relativePath
         )
         do {
