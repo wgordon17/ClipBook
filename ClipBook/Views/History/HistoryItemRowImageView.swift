@@ -61,7 +61,7 @@ final class HistoryItemRowImageView: HistoryItemRowView {
       ownerClipID: item.id,
       requiresEncryption: configuredItem?.id == item.id
         ? requiresEncryptionAtRest
-        : SensitiveContent.shouldEncryptAtRest(item)
+        : SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
     )
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,

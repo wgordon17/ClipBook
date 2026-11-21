@@ -227,11 +227,11 @@ final class OnboardingModel: ObservableObject {
 
     if item.kind == .image,
        let url = item.assetURL,
-       let image = ImageAssetStore.loadImage(
+       let image = ImageAssetThumbnailLoader.loadImage(
          at: url,
          role: .image,
          ownerClipID: item.id,
-         requiresEncryption: SensitiveContent.shouldEncryptAtRest(item)
+         requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
        ) {
       window.makeFirstResponder(nil)
       withAnimation(.easeOut(duration: 0.2)) {

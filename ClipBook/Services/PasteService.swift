@@ -212,7 +212,7 @@ final class PasteService {
               at: url,
               role: .image,
               ownerClipID: item.id,
-              requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+              requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
             ) else {
         throw PasteServiceError.unsupportedItem
       }

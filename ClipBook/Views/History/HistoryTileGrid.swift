@@ -913,7 +913,7 @@ final class HistoryTileView: NSView {
       ? ImageAssetThumbnailLoader.ManagedAssetContext(
           role: .image,
           ownerClipID: item.id,
-          requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+          requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
         )
       : nil
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(

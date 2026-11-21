@@ -426,12 +426,11 @@ nonisolated final class ClipBookArchiveService: Sendable {
         var usedPlainFileNames: Set<String> = []
 
         mutating func makeArchiveItem(from item: ClipboardItem) throws -> ClipBookArchiveItem {
-            let shouldRequireEncryption = SensitiveContent.shouldEncryptAtRest(item)
             let exportedImage = try exportSourceAsset(
                 at: item.assetPath,
                 role: .image,
                 ownerClipID: item.id,
-                requiresEncryption: shouldRequireEncryption,
+                requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image),
                 defaultStem: item.id.uuidString
             )
 
@@ -441,14 +440,14 @@ nonisolated final class ClipBookArchiveService: Sendable {
                     at: linkPreviewDetails.imagePath,
                     role: .linkPreview,
                     ownerClipID: item.id,
-                    requiresEncryption: shouldRequireEncryption,
+                    requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .linkPreview),
                     defaultStem: "\(item.id.uuidString)-preview"
                 )
                 let exportedFavicon = try exportSourceAsset(
                     at: linkPreviewDetails.faviconPath,
                     role: .linkFavicon,
                     ownerClipID: item.id,
-                    requiresEncryption: shouldRequireEncryption,
+                    requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .linkFavicon),
                     defaultStem: "\(item.id.uuidString)-favicon"
                 )
                 archivePreviewDetails = ClipBookArchiveLinkPreviewDetails(

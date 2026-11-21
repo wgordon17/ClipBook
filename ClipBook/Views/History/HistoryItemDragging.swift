@@ -116,7 +116,7 @@ enum HistoryItemDragging {
       assetURL: assetURL,
       fileName: draggedImageFileName(for: item),
       ownerClipID: item.id,
-      requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+      requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
     )
     return singleEntryPayload(pasteboardItem)
   }

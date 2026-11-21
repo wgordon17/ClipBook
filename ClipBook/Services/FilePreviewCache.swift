@@ -558,16 +558,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
   }
 
   private static func canonicalPath(_ path: String) -> String {
-    let url = URL(fileURLWithPath: path)
-    var st = stat()
-    if stat(url.path, &st) == 0 {
-      return url.resolvingSymlinksInPath().standardizedFileURL.path
-    }
-    let parent = ImageAssetStore.canonicalDirectoryURL(url.deletingLastPathComponent())
-    return parent
-      .appendingPathComponent(url.lastPathComponent, isDirectory: false)
-      .standardizedFileURL
-      .path
+    ImageAssetStore.resolvedFilePath(path)
   }
 
   private func cacheKey(canonicalFilePath: String, targetSize: CGSize) -> String {

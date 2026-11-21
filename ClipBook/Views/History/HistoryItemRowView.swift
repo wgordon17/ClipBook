@@ -1003,7 +1003,7 @@ class HistoryItemRowView: NSTableCellView {
     pendingLines = []
     pendingTrailingView = nil
     configuredItem = item
-    requiresEncryptionAtRest = SensitiveContent.shouldEncryptAtRest(item)
+    requiresEncryptionAtRest = SensitiveContent.requiresEncryptedAsset(for: item)
     self.itemTags = itemTags
     rowTableWidth = tableWidth
     self.searchQuery = searchQuery

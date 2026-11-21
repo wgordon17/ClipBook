@@ -31,6 +31,16 @@ nonisolated enum ClipboardContentScope: Comparable, Sendable {
     case full
 }
 
+// What an image is read for when it is captured: the text it shows, and the
+// payload of the QR code it carries. Both are read from the same image in
+// one pass, because an image can hold either, both or neither.
+nonisolated struct RecognizedImageContent: Equatable, Sendable {
+    static let empty = RecognizedImageContent(text: nil, qrCodeText: nil)
+
+    var text: String?
+    var qrCodeText: String?
+}
+
 nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     static let textPreviewBodyLimit = 8_096
     static let textPreviewMaxUTF16Length = 16_384
@@ -1263,7 +1273,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
                 at: assetURL,
                 role: .image,
                 ownerClipID: id,
-                requiresEncryption: SensitiveContent.shouldEncryptAtRest(self)
+                requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: self, role: .image)
             ) else {
                 return nil
             }

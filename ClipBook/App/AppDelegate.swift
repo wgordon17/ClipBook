@@ -35,15 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   // Hosted unit tests launch the app process before running any test, so they
   // get a scratch directory and preferences domain and skip starting the
   // clipboard monitor and menu bar item.
-  nonisolated static let isRunningTests: Bool = {
-    #if DEBUG
-    let env = ProcessInfo.processInfo.environment
-    return env["XCTestConfigurationFilePath"] != nil
-      || env["XCTestSessionIdentifier"] != nil
-    #else
-    return false
-    #endif
-  }()
+  nonisolated static let isRunningTests: Bool = RuntimeSigningEnvironment.isRunningTests
 
   override init() {
     let fileManager = FileManager.default

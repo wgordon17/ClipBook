@@ -399,10 +399,15 @@ struct HistoryCryptoAndKeychainTests {
             #expect(rawEnc1.subdata(in: 8..<20) != rawEnc2.subdata(in: 8..<20))
             #expect(rawEnc1 != rawEnc2)
 
-            // loadImage succeeds on valid encrypted/plain PNGs and returns nil on auth/key failure.
-            #expect(store.loadImage(at: encURL2, role: .image, clipID: clipID, keys: keys, requiresEncryption: true) != nil)
-            #expect(store.loadImage(at: encURL2, role: .image, clipID: clipID, keys: nil, requiresEncryption: true) == nil)
-            #expect(store.loadImage(at: encURL2, role: .linkPreview, clipID: clipID, keys: keys, requiresEncryption: true) == nil)
+            // ImageAssetThumbnailLoader.loadImage succeeds on valid encrypted/plain PNGs and returns nil on auth/key failure.
+            let keyRegistrationOwnerID = UUID()
+            #expect(ImageAssetThumbnailLoader.loadImage(at: encURL2, role: .image, ownerClipID: clipID, requiresEncryption: true) == nil)
+            ImageAssetStore.registerKeys(keys, forSupportDirectory: supportDir, ownerID: keyRegistrationOwnerID)
+            defer {
+                ImageAssetStore.unregisterKeys(forSupportDirectory: supportDir, ownerID: keyRegistrationOwnerID)
+            }
+            #expect(ImageAssetThumbnailLoader.loadImage(at: encURL2, role: .image, ownerClipID: clipID, requiresEncryption: true) != nil)
+            #expect(ImageAssetThumbnailLoader.loadImage(at: encURL2, role: .linkPreview, ownerClipID: clipID, requiresEncryption: true) == nil)
 
             // Nil keys on encrypted write or encrypted read throws .encryptionKeyUnavailable(.notFound).
             #expect(throws: HistoryStoreError.encryptionKeyUnavailable(.notFound)) {
@@ -435,8 +440,8 @@ struct HistoryCryptoAndKeychainTests {
                 keys: nil
             )
             #expect(plainPNGURL.lastPathComponent == "\(clipID.uuidString)-preview.png")
-            #expect(store.loadImage(at: plainPNGURL, role: .linkPreview, clipID: clipID, keys: nil, requiresEncryption: false) != nil)
-            #expect(store.loadImage(at: plainPNGURL, role: .linkPreview, clipID: clipID, keys: keys, requiresEncryption: true) == nil)
+            #expect(ImageAssetThumbnailLoader.loadImage(at: plainPNGURL, role: .linkPreview, ownerClipID: clipID, requiresEncryption: false) != nil)
+            #expect(ImageAssetThumbnailLoader.loadImage(at: plainPNGURL, role: .linkPreview, ownerClipID: clipID, requiresEncryption: true) == nil)
             #expect(throws: HistoryStoreError.authenticationFailed) {
                 _ = try store.readPNGData(
                     at: plainPNGURL,
@@ -461,13 +466,13 @@ struct HistoryCryptoAndKeychainTests {
                 _ = try store.readPNGData(at: truncatedEncURL, role: .image, clipID: clipID, keys: keys)
             }
 
-            // Symlinks are rejected across readPNGData, loadImage, encryptAssetIfNeeded, and decryptAssetIfNeeded.
+            // Symlinks are rejected across readPNGData, ImageAssetThumbnailLoader.loadImage, stageEncryptedAssetIfNeeded, and stageDecryptedAssetIfNeeded.
             let symlinkEncURL = tempDir.appendingPathComponent("symlink-asset.enc")
             try FileManager.default.createSymbolicLink(at: symlinkEncURL, withDestinationURL: encURL2)
             #expect(throws: HistoryStoreError.authenticationFailed) {
                 _ = try store.readPNGData(at: symlinkEncURL, role: .image, clipID: clipID, keys: keys)
             }
-            #expect(store.loadImage(at: symlinkEncURL, role: .image, clipID: clipID, keys: keys) == nil)
+            #expect(ImageAssetThumbnailLoader.loadImage(at: symlinkEncURL, role: .image, ownerClipID: clipID) == nil)
 
             let symlinkPlainURL = tempDir.appendingPathComponent("symlink-plain.png")
             try FileManager.default.createSymbolicLink(at: symlinkPlainURL, withDestinationURL: plainPNGURL)
@@ -475,10 +480,10 @@ struct HistoryCryptoAndKeychainTests {
                 _ = try store.readPNGData(at: symlinkPlainURL, role: .linkPreview, clipID: clipID, keys: nil)
             }
             #expect(throws: HistoryStoreError.authenticationFailed) {
-                _ = try store.encryptAssetIfNeeded(at: symlinkPlainURL.path, role: .linkPreview, clipID: clipID, keys: keys)
+                _ = try store.stageEncryptedAssetIfNeeded(at: symlinkPlainURL.path, role: .linkPreview, clipID: clipID, keys: keys)
             }
             #expect(throws: HistoryStoreError.authenticationFailed) {
-                _ = try store.decryptAssetIfNeeded(at: symlinkEncURL.path, role: .image, clipID: clipID, keys: keys)
+                _ = try store.stageDecryptedAssetIfNeeded(at: symlinkEncURL.path, role: .image, clipID: clipID, keys: keys)
             }
 
             // 1-bit flips in 8-byte CBENC01\0 magic (0 and 7), 12-byte nonce (8), ciphertext (20), and 16-byte GCM tag (last).
@@ -949,13 +954,22 @@ struct HistoryCryptoAndKeychainTests {
             try TestSupport.withTemporaryDirectory { externalDir in
                 let store = ImageAssetStore(supportDirectory: supportDir)
                 let keys = ClipBookDerivedKeys(masterKey: CryptoTestHelpers.deterministicMasterKey(seed: 0x88))
+                func commitConversion(_ outcome: ImageAssetStore.AssetConversionOutcome?) -> String? {
+                    guard let outcome else {
+                        return nil
+                    }
+                    if let superseded = outcome.supersededManagedURL {
+                        ImageAssetStore.secureUnlink(at: superseded)
+                    }
+                    return outcome.writtenURL.path
+                }
 
                 // 1. Missing and empty paths return nil cleanly.
-                #expect(try store.encryptAssetIfNeeded(at: "", role: .image, clipID: UUID(), keys: keys) == nil)
-                #expect(try store.decryptAssetIfNeeded(at: "", role: .image, clipID: UUID(), keys: keys) == nil)
+                #expect(try store.stageEncryptedAssetIfNeeded(at: "", role: .image, clipID: UUID(), keys: keys) == nil)
+                #expect(try store.stageDecryptedAssetIfNeeded(at: "", role: .image, clipID: UUID(), keys: keys) == nil)
                 let missingPath = supportDir.appendingPathComponent("Images/nonexistent.png").path
-                #expect(try store.encryptAssetIfNeeded(at: missingPath, role: .image, clipID: UUID(), keys: keys) == nil)
-                #expect(try store.decryptAssetIfNeeded(at: missingPath, role: .image, clipID: UUID(), keys: keys) == nil)
+                #expect(try store.stageEncryptedAssetIfNeeded(at: missingPath, role: .image, clipID: UUID(), keys: keys) == nil)
+                #expect(try store.stageDecryptedAssetIfNeeded(at: missingPath, role: .image, clipID: UUID(), keys: keys) == nil)
 
                 // 2. .png -> .enc -> .png byte-identical conversion with zero PNG magic inside .enc
                 //    plus hard-link verification that managed source inode is zero-filled before unlink.
@@ -975,11 +989,13 @@ struct HistoryCryptoAndKeychainTests {
                 #expect(Darwin.link(managedPNGURL.path, observerHardLink.path) == 0)
 
                 let encryptedPNGPath = try #require(
-                    try store.encryptAssetIfNeeded(
-                        at: managedPNGURL.path,
-                        role: .image,
-                        clipID: pngClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageEncryptedAssetIfNeeded(
+                            at: managedPNGURL.path,
+                            role: .image,
+                            clipID: pngClipID,
+                            keys: keys
+                        )
                     )
                 )
                 let encryptedPNGURL = URL(fileURLWithPath: encryptedPNGPath)
@@ -998,15 +1014,17 @@ struct HistoryCryptoAndKeychainTests {
                 #expect(rawEncPNG.firstRange(of: Data("IHDR".utf8)) == nil)
                 #expect(rawEncPNG.firstRange(of: Data("IEND".utf8)) == nil)
 
-                // Repeated idempotent encryptAssetIfNeeded preserves file intact (same inode & bytes).
+                // Repeated idempotent stageEncryptedAssetIfNeeded preserves file intact (same inode & bytes).
                 var encStatBefore = stat()
                 #expect(Darwin.lstat(encryptedPNGPath, &encStatBefore) == 0)
                 let secondEncryptedPNGPath = try #require(
-                    try store.encryptAssetIfNeeded(
-                        at: encryptedPNGPath,
-                        role: .image,
-                        clipID: pngClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageEncryptedAssetIfNeeded(
+                            at: encryptedPNGPath,
+                            role: .image,
+                            clipID: pngClipID,
+                            keys: keys
+                        )
                     )
                 )
                 var encStatAfter = stat()
@@ -1015,13 +1033,15 @@ struct HistoryCryptoAndKeychainTests {
                 #expect(encStatBefore.st_ino == encStatAfter.st_ino)
                 #expect(try Data(contentsOf: encryptedPNGURL) == rawEncPNG)
 
-                // Convert .enc -> .png and verify byte-identical restoration + idempotent decryptAssetIfNeeded.
+                // Convert .enc -> .png and verify byte-identical restoration + idempotent stageDecryptedAssetIfNeeded.
                 let decryptedPNGPath = try #require(
-                    try store.decryptAssetIfNeeded(
-                        at: encryptedPNGPath,
-                        role: .image,
-                        clipID: pngClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageDecryptedAssetIfNeeded(
+                            at: encryptedPNGPath,
+                            role: .image,
+                            clipID: pngClipID,
+                            keys: keys
+                        )
                     )
                 )
                 let decryptedPNGURL = URL(fileURLWithPath: decryptedPNGPath)
@@ -1032,11 +1052,13 @@ struct HistoryCryptoAndKeychainTests {
                 var decStatBefore = stat()
                 #expect(Darwin.lstat(decryptedPNGPath, &decStatBefore) == 0)
                 let secondDecryptedPNGPath = try #require(
-                    try store.decryptAssetIfNeeded(
-                        at: decryptedPNGPath,
-                        role: .image,
-                        clipID: pngClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageDecryptedAssetIfNeeded(
+                            at: decryptedPNGPath,
+                            role: .image,
+                            clipID: pngClipID,
+                            keys: keys
+                        )
                     )
                 )
                 var decStatAfter = stat()
@@ -1061,11 +1083,13 @@ struct HistoryCryptoAndKeychainTests {
                 #expect(managedICOURL.lastPathComponent == "\(icoClipID.uuidString)-favicon.ico")
 
                 let encryptedICOPath = try #require(
-                    try store.encryptAssetIfNeeded(
-                        at: managedICOURL.path,
-                        role: .linkFavicon,
-                        clipID: icoClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageEncryptedAssetIfNeeded(
+                            at: managedICOURL.path,
+                            role: .linkFavicon,
+                            clipID: icoClipID,
+                            keys: keys
+                        )
                     )
                 )
                 let encryptedICOURL = URL(fileURLWithPath: encryptedICOPath)
@@ -1079,11 +1103,13 @@ struct HistoryCryptoAndKeychainTests {
                 #expect(rawEncICO.firstRange(of: icoBodyMarker) == nil)
 
                 let decryptedICOPath = try #require(
-                    try store.decryptAssetIfNeeded(
-                        at: encryptedICOPath,
-                        role: .linkFavicon,
-                        clipID: icoClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageDecryptedAssetIfNeeded(
+                            at: encryptedICOPath,
+                            role: .linkFavicon,
+                            clipID: icoClipID,
+                            keys: keys
+                        )
                     )
                 )
                 let decryptedICOURL = URL(fileURLWithPath: decryptedICOPath)
@@ -1093,11 +1119,13 @@ struct HistoryCryptoAndKeychainTests {
 
                 // Idempotent decrypt on .ico preserves .ico intact.
                 let secondDecryptedICOPath = try #require(
-                    try store.decryptAssetIfNeeded(
-                        at: decryptedICOPath,
-                        role: .linkFavicon,
-                        clipID: icoClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageDecryptedAssetIfNeeded(
+                            at: decryptedICOPath,
+                            role: .linkFavicon,
+                            clipID: icoClipID,
+                            keys: keys
+                        )
                     )
                 )
                 #expect(secondDecryptedICOPath == decryptedICOPath)
@@ -1132,11 +1160,13 @@ struct HistoryCryptoAndKeychainTests {
 
                 let importedEncClipID = UUID()
                 let importedEncPath = try #require(
-                    try store.encryptAssetIfNeeded(
-                        at: externalPNGURL.path,
-                        role: .image,
-                        clipID: importedEncClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageEncryptedAssetIfNeeded(
+                            at: externalPNGURL.path,
+                            role: .image,
+                            clipID: importedEncClipID,
+                            keys: keys
+                        )
                     )
                 )
                 #expect(FileManager.default.fileExists(atPath: externalPNGURL.path))
@@ -1153,11 +1183,13 @@ struct HistoryCryptoAndKeychainTests {
 
                 let externalPlainClipID = UUID()
                 let importedPlainPath = try #require(
-                    try store.decryptAssetIfNeeded(
-                        at: externalPNGURL.path,
-                        role: .linkPreview,
-                        clipID: externalPlainClipID,
-                        keys: keys
+                    commitConversion(
+                        try store.stageDecryptedAssetIfNeeded(
+                            at: externalPNGURL.path,
+                            role: .linkPreview,
+                            clipID: externalPlainClipID,
+                            keys: keys
+                        )
                     )
                 )
                 #expect(FileManager.default.fileExists(atPath: externalPNGURL.path))

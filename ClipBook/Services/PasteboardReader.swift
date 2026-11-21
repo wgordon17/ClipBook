@@ -93,16 +93,6 @@ nonisolated struct PasteboardContent: Sendable {
     var isConcealed = false
 }
 
-// What an image is read for when it is captured: the text it shows, and the
-// payload of the QR code it carries. Both are read from the same image in
-// one pass, because an image can hold either, both or neither.
-nonisolated struct RecognizedImageContent: Sendable {
-    static let empty = RecognizedImageContent(text: nil, qrCodeText: nil)
-
-    var text: String?
-    var qrCodeText: String?
-}
-
 /// Reads the general pasteboard. It is called off the main thread: an
 /// application may put a promise on the pasteboard and hand the data over only
 /// when it is asked for, and the read waits for that application as long as it

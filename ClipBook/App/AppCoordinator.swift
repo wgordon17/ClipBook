@@ -1909,6 +1909,9 @@ final class AppCoordinator: ObservableObject {
 
     model.preferences.ignoredAppsText = (existingEntries + addedApplications.map(\.path)).joined(separator: "\n")
     savePreferences()
+    guard historyStore.isOpen, historyStore.lockState == .unlocked else {
+      return
+    }
 
     let keepsProtectedItems = model.preferences.keepFavoritesOnClearHistory
     var items: [ClipboardItem] = []
@@ -1963,7 +1966,9 @@ final class AppCoordinator: ObservableObject {
 
     model.preferences.sensitiveContentLifetime = lifetime
     savePreferences()
-    guard lifetime == ContentLifetime.dontSave else {
+    guard lifetime == ContentLifetime.dontSave,
+          historyStore.isOpen,
+          historyStore.lockState == .unlocked else {
       return
     }
 
@@ -2464,7 +2469,7 @@ final class AppCoordinator: ObservableObject {
     }
 
     guard item.kind.canEditTextContent else {
-      model.lastError = "\(item.kind.title) cannot be edited."
+      model.lastError = L10n.string("%@ cannot be edited.", item.kind.title)
       return
     }
 
@@ -2489,7 +2494,7 @@ final class AppCoordinator: ObservableObject {
     do {
       let item = try historyStore.loadingContent(of: item, scope: .body)
       guard let text = item.text else {
-        model.lastError = "\(item.kind.title) cannot be transformed."
+        model.lastError = L10n.string("%@ cannot be transformed.", item.kind.title)
         return
       }
 
@@ -2737,7 +2742,7 @@ final class AppCoordinator: ObservableObject {
           at: assetURL,
           role: .image,
           ownerClipID: item.id,
-          requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+          requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
         )
         try data.write(to: destinationURL, options: .atomic)
       } catch {
@@ -3035,16 +3040,7 @@ final class AppCoordinator: ObservableObject {
   }
 
   private nonisolated static func canonicalFilePath(_ path: String) -> String {
-    let url = URL(fileURLWithPath: path, isDirectory: false)
-    var st = stat()
-    if Darwin.lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK {
-      return url.resolvingSymlinksInPath().standardizedFileURL.path
-    }
-    let parent = ImageAssetStore.canonicalDirectoryURL(url.deletingLastPathComponent())
-    return parent
-      .appendingPathComponent(url.lastPathComponent, isDirectory: false)
-      .standardizedFileURL
-      .path
+    ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: path, isDirectory: false)).path
   }
 
   private func isContainedInManagedDirectory(_ fileURL: URL, directory: URL) -> Bool {

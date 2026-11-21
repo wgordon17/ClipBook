@@ -1,4 +1,3 @@
-import AppKit
 import CryptoKit
 import Darwin
 import Foundation
@@ -23,23 +22,19 @@ nonisolated final class ImageAssetStore: Sendable {
 
     static func registerKeys(_ keys: ClipBookDerivedKeys, forSupportDirectory url: URL, ownerID: UUID) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalPath = canonicalDirectoryURL(url).path
         keyRegistry.withLock { registry in
-            var entries = registry[resolvedPath] ?? []
+            var entries = registry[canonicalPath] ?? []
             entries.removeAll { $0.ownerID == ownerID }
             entries.append(RegisteredKeysEntry(ownerID: ownerID, keys: keys))
-            registry[resolvedPath] = entries
+            registry[canonicalPath] = entries
         }
     }
 
     static func unregisterKeys(forSupportDirectory url: URL, ownerID: UUID) {
-        let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
         let canonicalPath = canonicalDirectoryURL(url).path
         keyRegistry.withLock { registry in
-            removeOwner(ownerID, forPath: resolvedPath, in: &registry)
-            if canonicalPath != resolvedPath {
-                removeOwner(ownerID, forPath: canonicalPath, in: &registry)
-            }
+            removeOwner(ownerID, forPath: canonicalPath, in: &registry)
         }
     }
 
@@ -95,12 +90,12 @@ nonisolated final class ImageAssetStore: Sendable {
         }
 
         let supportDirURL = parentURL.deletingLastPathComponent()
-        let supportDirPath = supportDirURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let supportDirPath = canonicalDirectoryURL(supportDirURL).path
         let expectedParentPath = URL(fileURLWithPath: supportDirPath, isDirectory: true)
             .appendingPathComponent(expectedSubdir, isDirectory: true)
             .standardizedFileURL
             .path
-        guard parentURL.resolvingSymlinksInPath().standardizedFileURL.path == expectedParentPath else {
+        guard canonicalDirectoryURL(parentURL).path == expectedParentPath else {
             throw HistoryStoreError.authenticationFailed
         }
 
@@ -116,23 +111,6 @@ nonisolated final class ImageAssetStore: Sendable {
             keys: entry.keys,
             requiresEncryption: true
         )
-    }
-
-    static func loadImage(
-        at url: URL,
-        role: AssetRole,
-        ownerClipID: UUID,
-        requiresEncryption: Bool = false
-    ) -> NSImage? {
-        guard let data = try? readAssetData(
-            at: url,
-            role: role,
-            ownerClipID: ownerClipID,
-            requiresEncryption: requiresEncryption
-        ) else {
-            return nil
-        }
-        return NSImage(data: data)
     }
 
     let supportDirectory: URL
@@ -291,25 +269,6 @@ nonisolated final class ImageAssetStore: Sendable {
         return rawData
     }
 
-    func loadImage(
-        at url: URL,
-        role: AssetRole,
-        clipID: UUID,
-        keys: ClipBookDerivedKeys?,
-        requiresEncryption: Bool = false
-    ) -> NSImage? {
-        guard let data = try? readPNGData(
-            at: url,
-            role: role,
-            clipID: clipID,
-            keys: keys,
-            requiresEncryption: requiresEncryption
-        ) else {
-            return nil
-        }
-        return NSImage(data: data)
-    }
-
     func stageEncryptedAssetIfNeeded(
         at path: String,
         role: AssetRole,
@@ -366,17 +325,6 @@ nonisolated final class ImageAssetStore: Sendable {
             writtenURL: writtenURL,
             sourceURL: sourceURL,
             targetPreexisted: targetPreexisted
-        )
-    }
-
-    func encryptAssetIfNeeded(
-        at path: String,
-        role: AssetRole,
-        clipID: UUID,
-        keys: ClipBookDerivedKeys
-    ) throws -> String? {
-        try Self.commitConversionOutcome(
-            stageEncryptedAssetIfNeeded(at: path, role: role, clipID: clipID, keys: keys)
         )
     }
 
@@ -439,17 +387,6 @@ nonisolated final class ImageAssetStore: Sendable {
         )
     }
 
-    func decryptAssetIfNeeded(
-        at path: String,
-        role: AssetRole,
-        clipID: UUID,
-        keys: ClipBookDerivedKeys
-    ) throws -> String? {
-        try Self.commitConversionOutcome(
-            stageDecryptedAssetIfNeeded(at: path, role: role, clipID: clipID, keys: keys)
-        )
-    }
-
     private func makeStagedWriteOutcome(
         writtenURL: URL,
         sourceURL: URL,
@@ -461,16 +398,6 @@ nonisolated final class ImageAssetStore: Sendable {
             createdNewFile: !targetPreexisted && !sameLocation,
             supersededManagedURL: (!sameLocation && isManagedAssetURL(sourceURL)) ? sourceURL : nil
         )
-    }
-
-    private static func commitConversionOutcome(_ outcome: AssetConversionOutcome?) -> String? {
-        guard let outcome else {
-            return nil
-        }
-        if let superseded = outcome.supersededManagedURL {
-            secureUnlink(at: superseded)
-        }
-        return outcome.writtenURL.path
     }
 
     private static func pathExistsNoFollow(_ url: URL) -> Bool {
@@ -698,9 +625,25 @@ nonisolated final class ImageAssetStore: Sendable {
     }
 
     static func canonicalFileURL(_ fileURL: URL) -> URL {
-        canonicalDirectoryURL(fileURL.deletingLastPathComponent())
+        var st = stat()
+        if Darwin.lstat(fileURL.path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK {
+            return fileURL.resolvingSymlinksInPath().standardizedFileURL
+        }
+        return canonicalDirectoryURL(fileURL.deletingLastPathComponent())
             .appendingPathComponent(fileURL.lastPathComponent, isDirectory: false)
             .standardizedFileURL
+    }
+
+    static func resolvedFilePath(_ path: String) -> String {
+        let url = URL(fileURLWithPath: path, isDirectory: false)
+        var st = stat()
+        if stat(url.path, &st) == 0 {
+            return url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+        return canonicalDirectoryURL(url.deletingLastPathComponent())
+            .appendingPathComponent(url.lastPathComponent, isDirectory: false)
+            .standardizedFileURL
+            .path
     }
 
     static func canonicalDirectoryURL(_ directoryURL: URL) -> URL {

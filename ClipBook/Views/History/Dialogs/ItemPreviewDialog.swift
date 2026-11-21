@@ -991,11 +991,11 @@ final class ItemPreviewDialogController: NSViewController {
     switch item.kind {
     case .image:
       if let imageURL = item.assetURL,
-         let image = ImageAssetStore.loadImage(
+         let image = ImageAssetThumbnailLoader.loadImage(
            at: imageURL,
            role: .image,
            ownerClipID: item.id,
-           requiresEncryption: SensitiveContent.shouldEncryptAtRest(item) || item.hasUnverifiedEncryptedImageAsset
+           requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
          ) {
         return .image(image)
       }

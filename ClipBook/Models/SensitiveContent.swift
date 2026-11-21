@@ -358,6 +358,10 @@ nonisolated enum SensitiveContent {
         }
     }
 
+    static func requiresEncryptedAsset(for item: ClipboardItem, role: AssetRole = .image) -> Bool {
+        shouldEncryptAtRest(item) || (role == .image && item.hasUnverifiedEncryptedImageAsset)
+    }
+
     static func isMasked(_ item: ClipboardItem, detectsAutomatically: Bool) -> Bool {
         switch item.sensitivity {
         case .sensitive:

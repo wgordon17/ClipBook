@@ -6,6 +6,21 @@ nonisolated enum StoreLockState: Equatable, Sendable {
     case keyMismatch
 }
 
+nonisolated struct HistoryStoreCacheHooks: Sendable {
+    var registerSVGTextLoader: @Sendable (
+        _ loader: @escaping @Sendable (UUID) -> String?,
+        _ ownsClip: @escaping @Sendable (UUID) -> Bool,
+        _ ownerID: UUID
+    ) -> Void
+    var unregisterSVGTextLoader: @Sendable (_ ownerID: UUID) -> Void
+    var removeSVGRendering: @Sendable (_ clipID: UUID) -> Void
+    var removeOwnerSVGRenderings: @Sendable (_ ownerID: UUID) -> Void
+    var removeThumbnailsForPath: @Sendable (_ path: String) -> Void
+    var removeThumbnailsInDirectory: @Sendable (_ directory: URL) -> Void
+    var removeDragCopiesInDirectory: @Sendable (_ directory: URL) -> Void
+    var removeAllSensitiveContentCaches: @Sendable () -> Void
+}
+
 nonisolated protocol HistoryStore: Sendable {
     var lockState: StoreLockState { get }
     var isOpen: Bool { get }
