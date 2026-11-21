@@ -669,11 +669,6 @@ enum ViewsAndWindowsTests {
             ["sk", "-proj-", tag, "-", String(repeating: "h7J3pQ5w", count: 4)].joined()
         }
 
-        @MainActor
-        private static func drainDelayedPerforms(_ targets: [AnyObject]) {
-            TestSupport.drainDelayedPerforms(targets)
-        }
-
         @Test
         @MainActor
         func rowViewsMaskInlineSecretItemTitlesPreserveHumanTitlesHideSensitiveFileDetailsAndSkipFilePreviewCacheWrites() async throws {
@@ -909,7 +904,7 @@ enum ViewsAndWindowsTests {
 
             try harness.seedHistory([plainImg, encImg, singleFile, multiFile])
             let vc = HistoryContentViewController(model: harness.model, coordinator: harness.coordinator)
-            defer { Self.drainDelayedPerforms([vc]) }
+            defer { TestSupport.drainDelayedPerforms([vc]) }
             let menuBuilder = HistoryItemContextMenu(target: vc, availableTags: [], preferences: harness.model.preferences)
 
             // 1. Context menu checks on plain .png vs encrypted .enc image (including detectSensitiveContent == false!) and .file items.
@@ -953,7 +948,7 @@ enum ViewsAndWindowsTests {
                     revealsSensitiveContent: false,
                     loadContent: { item, _ in item }
                 )
-                defer { Self.drainDelayedPerforms([controller]) }
+                defer { TestSupport.drainDelayedPerforms([controller]) }
                 return withExtendedLifetime(controller) {
                     let toolbar = controller.makeToolbar()
                     return toolbar.delegate?.toolbarDefaultItemIdentifiers?(toolbar) ?? []
@@ -1032,7 +1027,7 @@ enum ViewsAndWindowsTests {
                     revealsSensitiveContent: false,
                     loadContent: { item, _ in item }
                 )
-                defer { Self.drainDelayedPerforms([imageDialog]) }
+                defer { TestSupport.drainDelayedPerforms([imageDialog]) }
                 _ = imageDialog.view
                 imageDialog.view.layoutSubtreeIfNeeded()
 
@@ -1070,7 +1065,7 @@ enum ViewsAndWindowsTests {
                     loadContent: { item, _ in item }
                 )
                 let closeAccessory = fileDialog.makeCloseAccessory()
-                defer { Self.drainDelayedPerforms([fileDialog, closeAccessory]) }
+                defer { TestSupport.drainDelayedPerforms([fileDialog, closeAccessory]) }
                 _ = fileDialog.view
                 fileDialog.view.layoutSubtreeIfNeeded()
                 closeAccessory.view.layoutSubtreeIfNeeded()

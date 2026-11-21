@@ -30,7 +30,7 @@ final class AppCoordinator: ObservableObject {
   let model: AppModel
   
   private let preferencesStore: PreferencesStore
-  nonisolated let historyStore: any HistoryStore
+  private nonisolated let historyStore: any HistoryStore
   private let clipboardMonitor: PasteboardMonitor
   private let pasteService: PasteService
   private let globalShortcuts: GlobalShortcutService
@@ -220,15 +220,11 @@ final class AppCoordinator: ObservableObject {
     stopBackgroundWorkForTesting()
   }
 
-  func isImageRecognitionPending(for id: ClipboardItem.ID) -> Bool {
-    clipboardMonitor.isImageRecognitionPending(for: id)
-  }
-
   private func shouldDeferImageAssetConversion(for item: ClipboardItem) -> Bool {
     guard item.kind == .image else {
       return false
     }
-    if isImageRecognitionPending(for: item.id) {
+    if clipboardMonitor.isImageRecognitionPending(for: item.id) {
       return true
     }
     return item.hasUnverifiedEncryptedImageAsset

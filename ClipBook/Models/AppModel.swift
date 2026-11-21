@@ -490,7 +490,6 @@ final class AppModel: ObservableObject {
                             continue
                         }
                     } else if let installedResult,
-                              installedResult.locale == locale,
                               let corpusIndex = installedResult.indexByID[buffer[itemIndex].id],
                               installedResult.corpus.reusableText(for: buffer[itemIndex], tagNamesByID: tagNamesByID) != nil {
                         if !installedResult.matches[corpusIndex] {
@@ -570,7 +569,6 @@ final class AppModel: ObservableObject {
             let installedResult = (searchResult?.terms == terms && searchResult?.locale == locale) ? searchResult : nil
             result = result.filter { item in
                 if let installedResult,
-                   installedResult.locale == locale,
                    let corpusIndex = installedResult.indexByID[item.id],
                    installedResult.corpus.reusableText(for: item, tagNamesByID: tagNamesByID) != nil {
                     return installedResult.matches[corpusIndex]

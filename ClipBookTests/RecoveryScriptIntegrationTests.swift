@@ -797,7 +797,7 @@ struct RecoveryScriptIntegrationTests {
             let fileManager = FileManager.default
             let decoder = Self.makeArchiveJSONDecoder()
 
-            // --- Case 1: 1-byte flip in an `isEncrypted == 1` `clip_contents.text` cell + wrong `--key-file` ---
+            // Case 1: 1-byte flip in an `isEncrypted == 1` `clip_contents.text` cell and wrong `--key-file`.
             let colSupportDir = workspace.appendingPathComponent("ColumnTamperSupport", isDirectory: true)
             try fileManager.createDirectory(at: colSupportDir, withIntermediateDirectories: true)
             let colKeyProvider = FileDatabaseKeyProvider(supportDirectory: colSupportDir)
@@ -904,7 +904,7 @@ struct RecoveryScriptIntegrationTests {
             #expect(wrongKeyRun.exitCode == 3)
             #expect(!fileManager.fileExists(atPath: wrongKeyOut.path))
 
-            // --- Case 2: Corrupt 1 byte in `Images/<id>.enc` ---
+            // Case 2: Corrupt 1 byte in `Images/<id>.enc`.
             let assetSupportDir = workspace.appendingPathComponent("AssetTamperSupport", isDirectory: true)
             try fileManager.createDirectory(at: assetSupportDir, withIntermediateDirectories: true)
             let assetKeyProvider = FileDatabaseKeyProvider(supportDirectory: assetSupportDir)

@@ -1864,7 +1864,6 @@ extension SharedProcessStateTests {
                     let monitor = PasteboardMonitor(
                         historyStore: spyStore,
                         fileManager: .default,
-                        supportDirectory: supportDir,
                         pasteboard: pasteboard
                     )
                     let pasteService = PasteService(

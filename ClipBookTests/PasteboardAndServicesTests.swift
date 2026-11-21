@@ -658,7 +658,6 @@ enum PasteboardAndServicesTests {
                 let monitor = PasteboardMonitor(
                     historyStore: store,
                     fileManager: .default,
-                    supportDirectory: supportDirectory,
                     pasteboard: pasteboard,
                     now: { clock.current },
                     recognizeImageData: recognizeImageData ?? ImageTextRecognizer.recognizeContent(ofPNGData:),

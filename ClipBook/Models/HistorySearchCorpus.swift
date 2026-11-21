@@ -11,6 +11,7 @@ nonisolated final class HistorySearchCorpus: Sendable {
     let texts: [String]
     let tagNamesByID: [Tag.ID: String]
     let hasCompleteTexts: Bool
+    private static let cancellationPollMask = 4_095
     fileprivate let cachedIndexByID = OSAllocatedUnfairLock<[UUID: Int]?>(initialState: nil)
 
     init(
@@ -110,7 +111,7 @@ nonisolated final class HistorySearchCorpus: Sendable {
         let tagNamesByID = descriptor.tagNamesByID
         headers.withUnsafeBufferPointer { buffer in
             for i in 0..<count {
-                if (i & 4095) == 0, isCancelled() {
+                if (i & cancellationPollMask) == 0, isCancelled() {
                     return
                 }
                 let header = buffer[i]
@@ -143,72 +144,25 @@ nonisolated final class HistorySearchCorpus: Sendable {
             )
         }
 
-        var didFetchSucceed = false
+        let fetched = fetchSearchTexts.flatMap { fetch in
+            try? fetch(missingSlots.map(\.id), descriptor.isTrashed, tagNamesByID, isCancelled)
+        }
+        if fetched == nil, isCancelled() {
+            return nil
+        }
+
         var usedFallback = false
-        if let fetchSearchTexts {
-            do {
-                if let fetched = try fetchSearchTexts(
-                    missingSlots.map(\.id),
-                    descriptor.isTrashed,
-                    tagNamesByID,
-                    isCancelled
-                ) {
-                    didFetchSucceed = true
-                    headers.withUnsafeBufferPointer { buffer in
-                        for (offset, slot) in missingSlots.enumerated() {
-                            if (offset & 4095) == 0, isCancelled() {
-                                return
-                            }
-                            let header = buffer[slot.slotIndex]
-                            if offset < fetched.count, let fetchedText = fetched[offset] {
-                                texts[slot.slotIndex] = fetchedText
-                                revisions[slot.slotIndex] = header.searchRevision
-                            } else {
-                                usedFallback = true
-                                texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
-                                revisions[slot.slotIndex] = 0
-                            }
-                        }
-                    }
-                } else if isCancelled() {
-                    return nil
+        headers.withUnsafeBufferPointer { buffer in
+            for (offset, slot) in missingSlots.enumerated() {
+                if (offset & cancellationPollMask) == 0, isCancelled() {
+                    return
+                }
+                let header = buffer[slot.slotIndex]
+                if let fetched, offset < fetched.count, let fetchedText = fetched[offset] {
+                    texts[slot.slotIndex] = fetchedText
+                    revisions[slot.slotIndex] = header.searchRevision
                 } else {
                     usedFallback = true
-                    headers.withUnsafeBufferPointer { buffer in
-                        for (offset, slot) in missingSlots.enumerated() {
-                            if (offset & 4095) == 0, isCancelled() {
-                                return
-                            }
-                            let header = buffer[slot.slotIndex]
-                            texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
-                            revisions[slot.slotIndex] = 0
-                        }
-                    }
-                }
-            } catch {
-                if isCancelled() {
-                    return nil
-                }
-                usedFallback = true
-                headers.withUnsafeBufferPointer { buffer in
-                    for (offset, slot) in missingSlots.enumerated() {
-                        if (offset & 4095) == 0, isCancelled() {
-                            return
-                        }
-                        let header = buffer[slot.slotIndex]
-                        texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
-                        revisions[slot.slotIndex] = 0
-                    }
-                }
-            }
-        } else {
-            usedFallback = true
-            headers.withUnsafeBufferPointer { buffer in
-                for (offset, slot) in missingSlots.enumerated() {
-                    if (offset & 4095) == 0, isCancelled() {
-                        return
-                    }
-                    let header = buffer[slot.slotIndex]
                     texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
                     revisions[slot.slotIndex] = 0
                 }
@@ -225,7 +179,7 @@ nonisolated final class HistorySearchCorpus: Sendable {
             revisions: revisions,
             texts: texts,
             tagNamesByID: tagNamesByID,
-            hasCompleteTexts: didFetchSucceed && !usedFallback
+            hasCompleteTexts: fetched != nil && !usedFallback
         )
     }
 }

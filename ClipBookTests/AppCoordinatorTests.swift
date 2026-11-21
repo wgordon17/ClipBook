@@ -525,7 +525,7 @@ extension SharedProcessStateTests {
             let imagesDir = harness.supportDirectory.appendingPathComponent("Images", isDirectory: true)
             let pngMagic = Data([0x89, 0x50, 0x4E, 0x47])
 
-            // --- Outcome (a): Empty OCR demotes Images/<id>.enc -> Images/<id>.png and scrubs .enc ---
+            // Outcome (a): Empty OCR demotes Images/<id>.enc -> Images/<id>.png and scrubs .enc.
             let pngA = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 16, color: .systemRed)
             imageGate.armSuspended(returning: .empty)
             harness.pasteboard.clearContents()
@@ -535,7 +535,7 @@ extension SharedProcessStateTests {
             let itemA = try #require(harness.model.items.first)
             let enteredInFlightA = await Task.detached { imageGate.waitForEntry() }.value
             #expect(enteredInFlightA)
-            #expect(harness.coordinator.isImageRecognitionPending(for: itemA.id))
+            #expect(harness.clipboardMonitor.isImageRecognitionPending(for: itemA.id))
 
             let inFlightEntriesA = try FileManager.default.contentsOfDirectory(atPath: imagesDir.path)
             #expect(inFlightEntriesA == ["\(itemA.id.uuidString).enc"])
@@ -547,7 +547,7 @@ extension SharedProcessStateTests {
 
             imageGate.resume()
             let demotedA = await TestSupport.waitUntil {
-                !harness.coordinator.isImageRecognitionPending(for: itemA.id)
+                !harness.clipboardMonitor.isImageRecognitionPending(for: itemA.id)
                     && harness.currentItem(itemA.id)?.assetPath?.hasSuffix(".png") == true
             }
             #expect(demotedA)
@@ -555,7 +555,7 @@ extension SharedProcessStateTests {
             let demotedPathA = try #require(harness.currentItem(itemA.id)?.assetPath)
             #expect(try Data(contentsOf: URL(fileURLWithPath: demotedPathA)) == pngA)
 
-            // --- Outcome (b): Benign OCR demotes Images/<id>.enc -> Images/<id>.png ---
+            // Outcome (b): Benign OCR demotes Images/<id>.enc -> Images/<id>.png.
             clock.withLock { $0 = $0.addingTimeInterval(10) }
             let pngB = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 16, color: .systemGreen)
             imageGate.setImmediate(returning: RecognizedImageContent(text: "Benign quarterly chart", qrCodeText: nil))
@@ -572,7 +572,7 @@ extension SharedProcessStateTests {
             #expect(try harness.historyStore.loadingContent(of: try #require(harness.currentItem(itemB.id)), scope: .body).text == "Benign quarterly chart")
             #expect(!FileManager.default.fileExists(atPath: imagesDir.appendingPathComponent("\(itemB.id.uuidString).enc").path))
 
-            // --- Outcome (c1): Active .image secret OCR/QR with sensitiveContentLifetime == .dontSave purges SQLite/WAL/.enc & scrubs ImageDragFiles ---
+            // Outcome (c1): Active .image secret OCR/QR with sensitiveContentLifetime == .dontSave purges SQLite/WAL/.enc and scrubs ImageDragFiles.
             harness.model.preferences.sensitiveContentLifetime = ContentLifetime.dontSave
             harness.clipboardMonitor.updatePreferences(harness.model.preferences)
             clock.withLock { $0 = $0.addingTimeInterval(10) }
@@ -626,7 +626,7 @@ extension SharedProcessStateTests {
             #expect(diskC1.firstRange(of: Data(qrSecretC1.utf8)) == nil)
             #expect(diskC1.firstRange(of: Data(encURLC1.path.utf8)) == nil)
 
-            // --- Outcome (c2): Moved to Trash while model.isShowingTrash == false during in-flight OCR + .dontSave ---
+            // Outcome (c2): Moved to Trash while model.isShowingTrash == false during in-flight OCR + .dontSave.
             clock.withLock { $0 = $0.addingTimeInterval(10) }
             let secretC2 = Self.makeSecretToken(tag: "ocr-trash-c2")
             let pngC2 = try TestSupport.makePNGData(pixelWidth: 30, pixelHeight: 20, color: .systemPurple)
@@ -657,7 +657,7 @@ extension SharedProcessStateTests {
             #expect(diskC2.firstRange(of: Data(secretC2.utf8)) == nil)
             #expect(diskC2.firstRange(of: Data(encURLC2.path.utf8)) == nil)
 
-            // --- Outcome (c3): Image .file clip with secret OCR/QR and sensitiveContentLifetime == .dontSave ---
+            // Outcome (c3): Image .file clip with secret OCR/QR and sensitiveContentLifetime == .dontSave.
             try await TestSupport.withTemporaryDirectory { externalDir in
                 let externalImageURL = externalDir.appendingPathComponent("scan-invoice-c3.png")
                 try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 32, color: .systemTeal).write(to: externalImageURL)
@@ -704,7 +704,7 @@ extension SharedProcessStateTests {
                 #expect(diskC3.firstRange(of: Data("scan-invoice-c3.png".utf8)) == nil)
             }
 
-            // --- Outcome (d): Secret OCR/QR with sensitiveContentLifetime == 60 on both .image and image .file ---
+            // Outcome (d): Secret OCR/QR with sensitiveContentLifetime == 60 on both .image and image .file.
             harness.model.preferences.sensitiveContentLifetime = 60
             harness.clipboardMonitor.updatePreferences(harness.model.preferences)
             let copiedAtD = Date(timeIntervalSince1970: 2_000_000_000)
@@ -827,7 +827,7 @@ extension SharedProcessStateTests {
                 #expect(diskDFile.firstRange(of: Data("secret-badge-d.png".utf8)) == nil)
             }
 
-            // --- Concealed image with confidentialContentLifetime == .keep and empty OCR stays kept & .enc ---
+            // Concealed image with confidentialContentLifetime == .keep and empty OCR stays kept and .enc.
             harness.model.preferences.confidentialContentLifetime = ContentLifetime.keep
             harness.model.preferences.sensitiveContentLifetime = ContentLifetime.dontSave
             harness.clipboardMonitor.updatePreferences(harness.model.preferences)
@@ -844,7 +844,7 @@ extension SharedProcessStateTests {
             #expect(await Task.detached { imageGate.waitForEntry() }.value)
             imageGate.resume()
             let concealedSettled = await TestSupport.waitUntil {
-                !harness.coordinator.isImageRecognitionPending(for: concealedItem.id)
+                !harness.clipboardMonitor.isImageRecognitionPending(for: concealedItem.id)
             }
             #expect(concealedSettled)
             let updatedConcealed = try #require(harness.currentItem(concealedItem.id))

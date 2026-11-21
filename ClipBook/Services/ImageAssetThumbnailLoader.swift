@@ -179,6 +179,7 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
     }
   }
 
+#if DEBUG
   func hasCachedThumbnails(forPath path: String) -> Bool {
     guard !path.isEmpty else {
       return false
@@ -191,6 +192,7 @@ nonisolated final class ImageAssetThumbnailLoader: @unchecked Sendable {
       return keys.contains { cache.object(forKey: $0 as NSString) != nil }
     }
   }
+#endif
 
   func removeThumbnails(forPath path: String) {
     guard !path.isEmpty else {

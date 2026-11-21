@@ -602,8 +602,8 @@ enum ServicesAndUtilitiesTests {
         }
 
         @Test
-        func grdbRuntimeInfoDeserializesModuleTypesAndResolvesSymbolsViaBundleLoader() throws {
-            let queue: DatabaseQueue = try GRDBRuntimeInfo.makeInMemoryQueue()
+        func grdbDeserializesModuleTypesAndResolvesSymbolsViaBundleLoader() throws {
+            let queue = try DatabaseQueue()
             try queue.write { db in
                 try db.execute(sql: "CREATE TABLE grdb_smoke (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
                 try db.execute(sql: "INSERT INTO grdb_smoke (label) VALUES (?)", arguments: ["bundle-loader-ok"])
@@ -613,7 +613,9 @@ enum ServicesAndUtilitiesTests {
             }
             #expect(storedLabel == "bundle-loader-ok")
 
-            let version = try GRDBRuntimeInfo.sqliteVersion()
+            let version = try queue.read { db in
+                try String.fetchOne(db, sql: "SELECT sqlite_version()") ?? ""
+            }
             #expect(!version.isEmpty)
             #expect(version.range(of: #"^\d+\.\d+\.\d+"#, options: .regularExpression) != nil)
         }

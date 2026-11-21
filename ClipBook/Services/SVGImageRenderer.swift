@@ -178,6 +178,7 @@ final class SVGImageRenderer: @unchecked Sendable {
     }
   }
 
+#if DEBUG
   nonisolated func hasCachedRendering(for clipID: UUID) -> Bool {
     cacheState.withLock { state in
       guard let keys = state.keysByClipID[clipID] else {
@@ -201,6 +202,7 @@ final class SVGImageRenderer: @unchecked Sendable {
       }
     }
   }
+#endif
 
   nonisolated static func registerTextLoader(
     _ loader: @escaping @Sendable (UUID) -> String?,

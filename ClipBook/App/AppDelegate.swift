@@ -74,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     globalShortcuts = GlobalShortcutService(isEnabled: !Self.isRunningTests)
     updateService = Self.isRunningTests ? DisabledUpdateService() : SparkleUpdateService()
     licensingService = LicensingService()
-    clipboardMonitor = PasteboardMonitor(historyStore: historyStore, fileManager: fileManager, supportDirectory: supportDirectory)
+    clipboardMonitor = PasteboardMonitor(historyStore: historyStore, fileManager: fileManager)
     coordinator = AppCoordinator(
       model: model,
       preferencesStore: preferencesStore,

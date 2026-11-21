@@ -679,21 +679,20 @@ private enum RecoveryCryptoAndIO {
         maxBytes: Int? = nil,
         label: String
     ) throws -> [UInt8] {
-        let noSlashURL = URL(fileURLWithPath: url.path, isDirectory: false)
-        if (try? noSlashURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw RecoveryFailure.fatal("Refusing to read symbolic link for \(label): \(url.path)")
-        }
-
         var linkStat = stat()
-        guard Darwin.lstat(noSlashURL.path, &linkStat) == 0 else {
+        guard Darwin.lstat(url.path, &linkStat) == 0 else {
             let err = errno
             throw RecoveryFailure.fatal("Unable to access \(label) (\(url.path)): \(String(cString: strerror(err)))")
         }
-        guard (linkStat.st_mode & S_IFMT) == S_IFREG else {
+        let linkMode = linkStat.st_mode & S_IFMT
+        if linkMode == S_IFLNK {
+            throw RecoveryFailure.fatal("Refusing to read symbolic link for \(label): \(url.path)")
+        }
+        guard linkMode == S_IFREG else {
             throw RecoveryFailure.fatal("Expected regular file for \(label): \(url.path)")
         }
 
-        let fd = Darwin.open(noSlashURL.path, O_RDONLY | O_NOFOLLOW)
+        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
         guard fd >= 0 else {
             let err = errno
             throw RecoveryFailure.fatal("Unable to open \(label) (\(url.path)): \(String(cString: strerror(err)))")
@@ -924,12 +923,8 @@ private enum RecoveryCryptoAndIO {
     }
 
     static func swapStagedOutput(at stagedOutputURL: URL, into outputDirURL: URL) throws {
-        let outputNoSlash = URL(fileURLWithPath: outputDirURL.path, isDirectory: false)
-        if (try? outputNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw RecoveryFailure.fatal("Refusing to overwrite symbolic link at output path: \(outputDirURL.path)")
-        }
         var existingStat = stat()
-        if Darwin.lstat(outputNoSlash.path, &existingStat) == 0 {
+        if Darwin.lstat(outputDirURL.path, &existingStat) == 0 {
             if (existingStat.st_mode & S_IFMT) == S_IFLNK {
                 throw RecoveryFailure.fatal("Refusing to overwrite symbolic link at output path: \(outputDirURL.path)")
             }
@@ -1256,13 +1251,15 @@ private enum LocalStoreRecovery {
         includeTrashed: Bool,
         strict: Bool
     ) throws -> Int32 {
-        let supportNoSlash = URL(fileURLWithPath: supportDir.path, isDirectory: false)
-        if (try? supportNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+        var supportStat = stat()
+        guard Darwin.lstat(supportDir.path, &supportStat) == 0 else {
+            throw RecoveryFailure.fatal("Support directory does not exist or is not a directory: \(supportDir.path)")
+        }
+        let supportMode = supportStat.st_mode & S_IFMT
+        if supportMode == S_IFLNK {
             throw RecoveryFailure.fatal("Refusing symbolic link for --support-dir: \(supportDir.path)")
         }
-        var supportStat = stat()
-        guard Darwin.lstat(supportNoSlash.path, &supportStat) == 0,
-              (supportStat.st_mode & S_IFMT) == S_IFDIR else {
+        guard supportMode == S_IFDIR else {
             throw RecoveryFailure.fatal("Support directory does not exist or is not a directory: \(supportDir.path)")
         }
 
@@ -1914,15 +1911,11 @@ private enum LocalStoreRecovery {
         let requiresEncryptedAsset = isEncryptedRow || hasEncryptedExtension(rawPath)
 
         let managedSubdirURL = supportDir.appendingPathComponent(role.managedSubdirectory, isDirectory: true)
-        let managedSubdirNoSlash = URL(fileURLWithPath: managedSubdirURL.path, isDirectory: false)
-        if (try? managedSubdirNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw RowCorruptionError.assetInvalidOrMissing(managedSubdirURL.path)
-        }
         var dirStat = stat()
-        if Darwin.lstat(managedSubdirNoSlash.path, &dirStat) != 0 {
+        if Darwin.lstat(managedSubdirURL.path, &dirStat) != 0 {
             if errno == ENOENT,
                !requiresEncryptedAsset,
-               !FileManager.default.fileExists(atPath: managedSubdirNoSlash.path) {
+               !FileManager.default.fileExists(atPath: managedSubdirURL.path) {
                 return nil
             }
             throw RowCorruptionError.assetInvalidOrMissing(managedSubdirURL.path)
@@ -1932,9 +1925,6 @@ private enum LocalStoreRecovery {
         }
 
         let sourceURL = managedSubdirURL.appendingPathComponent(fileName, isDirectory: false)
-        if (try? sourceURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
-        }
         var fileStat = stat()
         if Darwin.lstat(sourceURL.path, &fileStat) != 0 {
             if errno == ENOENT,
@@ -1950,8 +1940,7 @@ private enum LocalStoreRecovery {
 
         let canonicalExpectedDir = RecoveryCryptoAndIO.canonicalDirectoryURL(managedSubdirURL)
         let canonicalActualDir = RecoveryCryptoAndIO.canonicalDirectoryURL(sourceURL.deletingLastPathComponent())
-        guard canonicalActualDir == canonicalExpectedDir,
-              (try? sourceURL.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        guard canonicalActualDir == canonicalExpectedDir else {
             throw RowCorruptionError.assetInvalidOrMissing(sourceURL.path)
         }
 
@@ -2090,21 +2079,19 @@ private enum LocalStoreRecovery {
     // MARK: - Mode A SQLite Helpers
 
     private static func validateRegularSidecarOrDatabase(at url: URL, required: Bool, label: String) throws -> Int64? {
-        let noSlash = URL(fileURLWithPath: url.path, isDirectory: false)
-        if (try? noSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw RecoveryFailure.fatal("Refusing symbolic link for \(label): \(url.path)")
-        }
-
         var st = stat()
-        guard Darwin.lstat(noSlash.path, &st) == 0 else {
+        guard Darwin.lstat(url.path, &st) == 0 else {
             let err = errno
             if !required && err == ENOENT {
                 return nil
             }
             throw RecoveryFailure.fatal("Missing or inaccessible \(label) (\(url.path)): \(String(cString: strerror(err)))")
         }
-
-        guard (st.st_mode & S_IFMT) == S_IFREG else {
+        let mode = st.st_mode & S_IFMT
+        if mode == S_IFLNK {
+            throw RecoveryFailure.fatal("Refusing symbolic link for \(label): \(url.path)")
+        }
+        guard mode == S_IFREG else {
             throw RecoveryFailure.fatal("Expected regular file for \(label): \(url.path)")
         }
         return Int64(st.st_size)
@@ -2504,13 +2491,15 @@ private enum EncryptedArchiveRecovery {
         passphraseSource: PassphraseInputSource,
         allowTestIterations: Bool
     ) throws -> Int32 {
-        let archiveNoSlash = URL(fileURLWithPath: archiveURL.path, isDirectory: false)
-        if (try? archiveNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+        var archiveStat = stat()
+        guard Darwin.lstat(archiveURL.path, &archiveStat) == 0 else {
+            throw RecoveryFailure.fatal("Archive bundle does not exist or is not a directory: \(archiveURL.path)")
+        }
+        let archiveMode = archiveStat.st_mode & S_IFMT
+        if archiveMode == S_IFLNK {
             throw RecoveryFailure.fatal("Refusing symbolic link for --archive: \(archiveURL.path)")
         }
-        var archiveStat = stat()
-        guard Darwin.lstat(archiveNoSlash.path, &archiveStat) == 0,
-              (archiveStat.st_mode & S_IFMT) == S_IFDIR else {
+        guard archiveMode == S_IFDIR else {
             throw RecoveryFailure.fatal("Archive bundle does not exist or is not a directory: \(archiveURL.path)")
         }
 
@@ -2824,11 +2813,7 @@ private enum EncryptedArchiveRecovery {
             let isLeaf = (index == rawComponents.count - 1)
             let candidateURL = currentDirectoryURL.appendingPathComponent(component, isDirectory: false)
 
-            // Check isSymbolicLink / lstat BEFORE fileExists so dangling symlinks are caught as path violations.
-            if (try? candidateURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-                throw RecoveryFailure.fatal("Refusing symbolic link inside archive: \(relativePath)")
-            }
-
+            // Check lstat BEFORE fileExists so dangling symlinks are caught as path violations.
             var componentStat = stat()
             if Darwin.lstat(candidateURL.path, &componentStat) == 0 {
                 let mode = componentStat.st_mode & S_IFMT
@@ -2857,8 +2842,7 @@ private enum EncryptedArchiveRecovery {
             ? canonicalArchiveRoot
             : (canonicalArchiveRoot + "/")
         let resolvedTargetURL = targetURL.resolvingSymlinksInPath().standardizedFileURL
-        guard resolvedTargetURL.path.hasPrefix(canonicalArchivePrefix),
-              (try? resolvedTargetURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        guard resolvedTargetURL.path.hasPrefix(canonicalArchivePrefix) else {
             throw RecoveryFailure.fatal("Archive path escapes archive root: \(relativePath)")
         }
 

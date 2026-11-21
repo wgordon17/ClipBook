@@ -97,7 +97,6 @@ final class PasteboardMonitor {
     init(
         historyStore: HistoryStore,
         fileManager: FileManager,
-        supportDirectory _: URL,
         pasteboard: NSPasteboard = .general,
         now: @escaping @Sendable () -> Date = { Date() },
         recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),

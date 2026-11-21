@@ -69,10 +69,6 @@ nonisolated final class ImageAssetStore: Sendable {
         ownerClipID: UUID,
         requiresEncryption: Bool = false
     ) throws -> Data {
-        if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw HistoryStoreError.authenticationFailed
-        }
-
         var leafStat = stat()
         if Darwin.lstat(url.path, &leafStat) == 0, (leafStat.st_mode & S_IFMT) != S_IFREG {
             throw HistoryStoreError.authenticationFailed
@@ -87,10 +83,6 @@ nonisolated final class ImageAssetStore: Sendable {
         }
 
         let parentURL = url.deletingLastPathComponent()
-        if (try? parentURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw HistoryStoreError.authenticationFailed
-        }
-
         var parentStat = stat()
         guard Darwin.lstat(parentURL.path, &parentStat) == 0,
               (parentStat.st_mode & S_IFMT) == S_IFDIR else {
@@ -740,10 +732,6 @@ nonisolated final class ImageAssetStore: Sendable {
     }
 
     private static func readNonSymlinkRegularFileData(at url: URL) throws -> Data {
-        if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw HistoryStoreError.authenticationFailed
-        }
-
         var linkStat = stat()
         if Darwin.lstat(url.path, &linkStat) != 0 {
             let err = errno

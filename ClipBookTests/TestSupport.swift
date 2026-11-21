@@ -569,7 +569,6 @@ enum TestSupport {
         let clipboardMonitor = PasteboardMonitor(
             historyStore: wiredStore,
             fileManager: fileManager,
-            supportDirectory: resolvedSupportDir,
             pasteboard: pasteboard,
             now: now,
             recognizeImageData: recognizeImageData,

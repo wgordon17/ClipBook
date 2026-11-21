@@ -643,31 +643,19 @@ nonisolated final class ClipBookArchiveService: Sendable {
 
         let expectedSubdirName = (role == .image) ? "Images" : "LinkPreviews"
         let expectedParentDir = supportDirectory.appendingPathComponent(expectedSubdirName, isDirectory: true)
-        let expectedParentNoSlash = URL(fileURLWithPath: expectedParentDir.path, isDirectory: false)
 
         var expectedDirStat = stat()
-        if Darwin.lstat(expectedParentNoSlash.path, &expectedDirStat) == 0 {
-            let mode = expectedDirStat.st_mode & S_IFMT
-            if mode == S_IFLNK || mode != S_IFDIR {
-                throw ClipBookArchiveError.invalidAssetPath(path)
-            }
-        }
-        if (try? expectedParentNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+        if Darwin.lstat(expectedParentDir.path, &expectedDirStat) == 0,
+           (expectedDirStat.st_mode & S_IFMT) != S_IFDIR {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
 
         let sourceURL = URL(fileURLWithPath: path, isDirectory: false)
         let sourceParentURL = sourceURL.deletingLastPathComponent()
-        let sourceParentNoSlash = URL(fileURLWithPath: sourceParentURL.path, isDirectory: false)
 
         var parentStat = stat()
-        if Darwin.lstat(sourceParentNoSlash.path, &parentStat) == 0 {
-            let mode = parentStat.st_mode & S_IFMT
-            if mode == S_IFLNK || mode != S_IFDIR {
-                throw ClipBookArchiveError.invalidAssetPath(path)
-            }
-        }
-        if (try? sourceParentNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+        if Darwin.lstat(sourceParentURL.path, &parentStat) == 0,
+           (parentStat.st_mode & S_IFMT) != S_IFDIR {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
 
@@ -675,9 +663,6 @@ nonisolated final class ClipBookArchiveService: Sendable {
         let sourceLstatResult = Darwin.lstat(sourceURL.path, &sourceStat)
         let sourceLstatErrno = errno
         if sourceLstatResult == 0, (sourceStat.st_mode & S_IFMT) == S_IFLNK {
-            throw ClipBookArchiveError.invalidAssetPath(path)
-        }
-        if (try? sourceURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
 
@@ -697,8 +682,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
 
-        guard (sourceStat.st_mode & S_IFMT) == S_IFREG,
-              (try? sourceURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        guard (sourceStat.st_mode & S_IFMT) == S_IFREG else {
             throw ClipBookArchiveError.invalidAssetPath(path)
         }
 
@@ -1243,35 +1227,24 @@ nonisolated final class ClipBookArchiveService: Sendable {
             }
         }
 
-        let archiveNoSlash = URL(fileURLWithPath: archiveURL.path, isDirectory: false)
         var archiveRootStat = stat()
-        if Darwin.lstat(archiveNoSlash.path, &archiveRootStat) == 0,
+        if Darwin.lstat(archiveURL.path, &archiveRootStat) == 0,
            (archiveRootStat.st_mode & S_IFMT) == S_IFLNK {
-            throw ClipBookArchiveError.invalidAssetPath(relativePath)
-        }
-        if (try? archiveNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
             throw ClipBookArchiveError.invalidAssetPath(relativePath)
         }
 
         var currentDirectoryURL = URL(fileURLWithPath: archiveURL.path, isDirectory: true)
-        var targetURL = archiveNoSlash
+        var targetURL = URL(fileURLWithPath: archiveURL.path, isDirectory: false)
 
         for (index, rawComponent) in rawComponents.enumerated() {
             let component = String(rawComponent)
             let isLeaf = (index == rawComponents.count - 1)
             let candidateURL = currentDirectoryURL.appendingPathComponent(component, isDirectory: false)
 
-            if (try? candidateURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-                throw ClipBookArchiveError.invalidAssetPath(relativePath)
-            }
-
             var componentStat = stat()
             if Darwin.lstat(candidateURL.path, &componentStat) == 0 {
                 let mode = componentStat.st_mode & S_IFMT
-                if mode == S_IFLNK {
-                    throw ClipBookArchiveError.invalidAssetPath(relativePath)
-                }
-                if !isLeaf && mode != S_IFDIR {
+                if isLeaf ? mode != S_IFREG : mode != S_IFDIR {
                     throw ClipBookArchiveError.invalidAssetPath(relativePath)
                 }
             } else if errno != ENOENT && errno != ENOTDIR {
@@ -1301,8 +1274,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
             ? canonicalArchiveRoot
             : (canonicalArchiveRoot + "/")
         let resolvedTargetURL = targetURL.resolvingSymlinksInPath().standardizedFileURL
-        guard resolvedTargetURL.path.hasPrefix(canonicalArchivePrefix),
-              (try? resolvedTargetURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        guard resolvedTargetURL.path.hasPrefix(canonicalArchivePrefix) else {
             throw ClipBookArchiveError.invalidAssetPath(relativePath)
         }
 
@@ -1358,12 +1330,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
     }
 
     private static func swapStagedArchive(at stagedArchiveURL: URL, into archiveURL: URL) throws {
-        let targetNoSlash = URL(fileURLWithPath: archiveURL.path, isDirectory: false)
-        if (try? targetNoSlash.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
-            throw ClipBookArchiveError.invalidAssetPath(archiveURL.path)
-        }
         var existingStat = stat()
-        let targetExists = Darwin.lstat(targetNoSlash.path, &existingStat) == 0
+        let targetExists = Darwin.lstat(archiveURL.path, &existingStat) == 0
         if targetExists && (existingStat.st_mode & S_IFMT) == S_IFLNK {
             throw ClipBookArchiveError.invalidAssetPath(archiveURL.path)
         }

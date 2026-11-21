@@ -5,18 +5,6 @@ import GRDB
 import GRDBSQLite
 import os
 
-nonisolated enum GRDBRuntimeInfo {
-    static func makeInMemoryQueue() throws -> DatabaseQueue {
-        try DatabaseQueue()
-    }
-
-    static func sqliteVersion() throws -> String {
-        try makeInMemoryQueue().read { db in
-            try String.fetchOne(db, sql: "SELECT sqlite_version()") ?? ""
-        }
-    }
-}
-
 nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     static let currentSchemaVersion = 5
     static let keyVerifierMetadataKey = "key_verifier_v1"
@@ -303,15 +291,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         sensitiveContentLifetime: Int
     ) throws -> (updated: ClipboardItem?, previous: ClipboardItem?, isTrashed: Bool, purged: Bool) {
         try withWrite { db, keys in
-            guard let priorRow = try Row.fetchOne(
-                db,
-                sql: "SELECT isEncrypted FROM clips WHERE id = ? LIMIT 1",
-                arguments: [id.uuidString]
-            ) else {
-                return (nil, nil, false, false)
-            }
-            let existingIsEncrypted = ((priorRow["isEncrypted"] as Int?) ?? 0) != 0
-
             guard let existing = try self.fetchFullItemByID(
                 in: db,
                 id: id,
@@ -372,9 +351,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 keys: keys,
                 assetMode: .reconcileManagedAssets
             )
-            if !existingIsEncrypted && shouldEncrypt {
-                self.markNeedsFreePageRelease()
-            }
 
             return (saved.unloadingContent(), existing.unloadingContent(), isTrashed, false)
         }
@@ -4456,7 +4432,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    // MARK: - Low-Level POSIX & Image Dimension Utilities
+    // MARK: - JSON & Low-Level POSIX Utilities
 
     private static func makeJSONEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
