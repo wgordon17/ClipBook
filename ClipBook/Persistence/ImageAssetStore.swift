@@ -185,7 +185,8 @@ nonisolated final class ImageAssetStore: Sendable {
         clipID: UUID,
         encrypted: Bool,
         keys: ClipBookDerivedKeys?,
-        preferredPlainExtension: String? = nil
+        preferredPlainExtension: String? = nil,
+        sync: Bool = true
     ) throws -> URL {
         let ext = encrypted ? "enc" : Self.plainAssetExtension(preferred: preferredPlainExtension, magicBytes: pngData)
         let destinationDirectory = directory(for: role)
@@ -227,7 +228,7 @@ nonisolated final class ImageAssetStore: Sendable {
             payload = pngData
         }
 
-        try Self.writeAtomicallyWithFullFsync(payload, to: destinationURL, in: destinationDirectory)
+        try Self.writeAtomically(payload, to: destinationURL, in: destinationDirectory, sync: sync)
         return destinationURL
     }
 
@@ -239,19 +240,36 @@ nonisolated final class ImageAssetStore: Sendable {
         requiresEncryption: Bool = false
     ) throws -> Data {
         let rawData = try Self.readNonSymlinkRegularFileData(at: url)
-        let hasMagic = Self.hasEncryptedMagic(rawData)
-        let hasEncExtension = url.pathExtension.lowercased() == "enc"
+        return try Self.decodePNGData(
+            fromRawData: rawData,
+            hasEncExtension: url.pathExtension.lowercased() == "enc",
+            role: role,
+            clipID: clipID,
+            keys: keys,
+            requiresEncryption: requiresEncryption
+        )
+    }
+
+    private static func decodePNGData(
+        fromRawData rawData: Data,
+        hasEncExtension: Bool,
+        role: AssetRole,
+        clipID: UUID,
+        keys: ClipBookDerivedKeys?,
+        requiresEncryption: Bool
+    ) throws -> Data {
+        let hasMagic = hasEncryptedMagic(rawData)
 
         if hasMagic || hasEncExtension {
             guard let keys else {
                 throw HistoryStoreError.encryptionKeyUnavailable(.notFound)
             }
-            guard hasMagic, rawData.count >= Self.minimumEncryptedFileLength else {
+            guard hasMagic, rawData.count >= minimumEncryptedFileLength else {
                 throw HistoryStoreError.authenticationFailed
             }
             let aad = HistoryCrypto.assetAAD(role: role, clipID: clipID)
             do {
-                let sealedBox = try AES.GCM.SealedBox(combined: Data(rawData.dropFirst(Self.encryptedMagic.count)))
+                let sealedBox = try AES.GCM.SealedBox(combined: rawData.dropFirst(encryptedMagic.count))
                 return try AES.GCM.open(
                     sealedBox,
                     using: keys.assetFileAEADKey,
@@ -288,8 +306,9 @@ nonisolated final class ImageAssetStore: Sendable {
         if Self.sameFileLocation(sourceURL, targetURL) {
             let rawData = try Self.readNonSymlinkRegularFileData(at: sourceURL)
             if Self.hasEncryptedMagic(rawData) {
-                _ = try readPNGData(
-                    at: sourceURL,
+                _ = try Self.decodePNGData(
+                    fromRawData: rawData,
+                    hasEncExtension: true,
                     role: role,
                     clipID: clipID,
                     keys: keys,
@@ -344,13 +363,14 @@ nonisolated final class ImageAssetStore: Sendable {
         }
 
         let rawSourceData = try Self.readNonSymlinkRegularFileData(at: sourceURL)
-        let isEncryptedSource = Self.hasEncryptedMagic(rawSourceData)
-            || sourceURL.pathExtension.lowercased() == "enc"
+        let hasEncExt = sourceURL.pathExtension.lowercased() == "enc"
+        let isEncryptedSource = Self.hasEncryptedMagic(rawSourceData) || hasEncExt
 
         let plainData: Data
         if isEncryptedSource {
-            plainData = try readPNGData(
-                at: sourceURL,
+            plainData = try Self.decodePNGData(
+                fromRawData: rawSourceData,
+                hasEncExtension: hasEncExt,
                 role: role,
                 clipID: clipID,
                 keys: keys,
@@ -405,7 +425,7 @@ nonisolated final class ImageAssetStore: Sendable {
         return Darwin.lstat(url.path, &st) == 0
     }
 
-    static func secureUnlink(at url: URL) {
+    static func secureUnlink(at url: URL, sync: Bool = true) {
         let path = url.path
         guard !path.isEmpty else {
             return
@@ -455,13 +475,83 @@ nonisolated final class ImageAssetStore: Sendable {
                     }
                 }
             }
-            if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
-                _ = Darwin.fsync(fd)
+            if sync {
+                if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+                    _ = Darwin.fsync(fd)
+                }
             }
         }
 
         _ = Darwin.close(fd)
         _ = Darwin.unlink(path)
+    }
+
+    static func secureUnlinkBatch<S: Sequence>(_ urls: S) where S.Element == URL {
+        var zeroFilledRegularURLs: [URL] = []
+        var barrierURLByDevice: [dev_t: URL] = [:]
+        let chunkSize = 64 * 1024
+        let zeroChunk = [UInt8](repeating: 0, count: chunkSize)
+
+        for url in urls {
+            let path = url.path
+            guard !path.isEmpty else {
+                continue
+            }
+            var linkStat = stat()
+            guard Darwin.lstat(path, &linkStat) == 0 else {
+                continue
+            }
+            let mode = linkStat.st_mode & S_IFMT
+            if mode == S_IFLNK {
+                _ = Darwin.unlink(path)
+                continue
+            }
+            guard mode == S_IFREG else {
+                continue
+            }
+            let fd = Darwin.open(path, O_RDWR | O_NOFOLLOW)
+            if fd < 0 {
+                if errno == ELOOP || errno == EACCES || errno == EPERM {
+                    _ = Darwin.unlink(path)
+                }
+                continue
+            }
+            var fileStat = stat()
+            if Darwin.fstat(fd, &fileStat) == 0, (fileStat.st_mode & S_IFMT) == S_IFREG {
+                let fileSize = Int64(fileStat.st_size)
+                if fileSize > 0, Darwin.lseek(fd, 0, SEEK_SET) == 0 {
+                    var remaining = fileSize
+                    zeroChunk.withUnsafeBytes { rawBuffer in
+                        guard let baseAddress = rawBuffer.baseAddress else { return }
+                        while remaining > 0 {
+                            let toWrite = Int(min(Int64(chunkSize), remaining))
+                            let written = Darwin.write(fd, baseAddress, toWrite)
+                            if written > 0 {
+                                remaining -= Int64(written)
+                            } else if written < 0 && errno == EINTR {
+                                continue
+                            } else {
+                                break
+                            }
+                        }
+                    }
+                }
+                // Flush this vnode's dirty zero-fill pages from UBC to the block device before unlinking.
+                _ = Darwin.fsync(fd)
+                if barrierURLByDevice[fileStat.st_dev] == nil {
+                    barrierURLByDevice[fileStat.st_dev] = url
+                }
+            }
+            _ = Darwin.close(fd)
+            zeroFilledRegularURLs.append(url)
+        }
+
+        if !zeroFilledRegularURLs.isEmpty {
+            issueFullFsyncDeviceBarriers(barrierURLByDevice.values)
+            for url in zeroFilledRegularURLs {
+                _ = Darwin.unlink(url.path)
+            }
+        }
     }
 
     static func secureRemoveItem(at url: URL) {
@@ -739,14 +829,48 @@ nonisolated final class ImageAssetStore: Sendable {
         return data
     }
 
-    private static func writeAtomicallyWithFullFsync(
+    static func fullFsyncBatch<S: Sequence>(_ urls: S) where S.Element == URL {
+        var barrierURLByDevice: [dev_t: URL] = [:]
+        for url in urls {
+            let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+            guard fd >= 0 else {
+                continue
+            }
+            var fileStat = stat()
+            if Darwin.fstat(fd, &fileStat) == 0, (fileStat.st_mode & S_IFMT) == S_IFREG {
+                // Push each file's dirty UBC pages to the device before issuing per-device hardware cache barriers.
+                _ = Darwin.fsync(fd)
+                if barrierURLByDevice[fileStat.st_dev] == nil {
+                    barrierURLByDevice[fileStat.st_dev] = url
+                }
+            }
+            _ = Darwin.close(fd)
+        }
+        issueFullFsyncDeviceBarriers(barrierURLByDevice.values)
+    }
+
+    private static func issueFullFsyncDeviceBarriers<S: Sequence>(_ barrierURLs: S) where S.Element == URL {
+        for url in barrierURLs {
+            let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+            guard fd >= 0 else {
+                continue
+            }
+            if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+                _ = Darwin.fsync(fd)
+            }
+            _ = Darwin.close(fd)
+        }
+    }
+
+    private static func writeAtomically(
         _ data: Data,
         to destinationURL: URL,
-        in directoryURL: URL
+        in directoryURL: URL,
+        sync: Bool
     ) throws {
         let tempFileName = ".\(destinationURL.lastPathComponent).tmp-\(UUID().uuidString)"
         let tempURL = directoryURL.appendingPathComponent(tempFileName, isDirectory: false)
-        try writeExclusivePrivateFile(data, to: tempURL, sync: true, mapELOOPToAuthFailed: true)
+        try writeExclusivePrivateFile(data, to: tempURL, sync: sync, mapELOOPToAuthFailed: true)
         guard Darwin.rename(tempURL.path, destinationURL.path) == 0 else {
             let err = errno
             secureUnlink(at: tempURL)

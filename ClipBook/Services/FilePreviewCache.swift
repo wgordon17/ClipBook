@@ -38,25 +38,45 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     let startPathEpoch: UInt64
   }
 
+  private final class CachedPreviewEntry: NSObject {
+    let image: NSImage
+    let metadata: Metadata
+    let globalEpoch: UInt64
+    let pathEpoch: UInt64
+
+    init(image: NSImage, metadata: Metadata, globalEpoch: UInt64, pathEpoch: UInt64) {
+      self.image = image
+      self.metadata = metadata
+      self.globalEpoch = globalEpoch
+      self.pathEpoch = pathEpoch
+    }
+  }
+
   private enum StagedCommitOutcome {
     case committed
     case abortedKeepBothStaged
     case metadataRenameFailed(scrubbedImageURL: URL)
   }
 
+  private static let maxAuxiliaryCacheEntries = 4_096
+
   private let directory: URL
   private let fileManager: FileManager
-  private let encoder = JSONEncoder()
-  private let decoder = JSONDecoder()
   private let generationQueue = DispatchQueue(label: "com.clipbook.file-preview-cache", qos: .utility)
   private let pendingLock = NSLock()
-  private let imageCache = NSCache<NSString, NSImage>()
+  private let imageCache: NSCache<NSString, CachedPreviewEntry> = {
+    let cache = NSCache<NSString, CachedPreviewEntry>()
+    cache.totalCostLimit = 64 * 1024 * 1024
+    cache.countLimit = 1_024
+    return cache
+  }()
   private var globalEpoch: UInt64 = 0
   private var pathEpochs: [String: UInt64] = [:]
   private var nextGenerationID: UInt64 = 0
   private var inFlightByKey: [String: InFlightEntry] = [:]
   private var displaySizeCache: [String: CachedDisplaySize] = [:]
   private var imageFileCache: [String: Bool] = [:]
+  private var canonicalPathCache: [String: String] = [:]
 
   init(directory: URL, fileManager: FileManager = .default) {
     self.directory = directory
@@ -107,7 +127,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       return type.conforms(to: .image)
     }
 
-    let canonicalFilePath = Self.canonicalPath(filePath)
+    let canonicalFilePath = cachedCanonicalPath(for: filePath)
     return isExtensionlessImageFile(canonicalFilePath: canonicalFilePath)
   }
 
@@ -117,14 +137,28 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       guard type.conforms(to: .image) else {
         return nil
       }
-      return Self.canonicalPath(filePath)
+      return cachedCanonicalPath(for: filePath)
     }
 
-    let canonicalFilePath = Self.canonicalPath(filePath)
+    let canonicalFilePath = cachedCanonicalPath(for: filePath)
     guard isExtensionlessImageFile(canonicalFilePath: canonicalFilePath) else {
       return nil
     }
     return canonicalFilePath
+  }
+
+  private func cachedCanonicalPath(for rawPath: String) -> String {
+    if let cached = pendingLock.withLock({ canonicalPathCache[rawPath] }) {
+      return cached
+    }
+    let resolved = Self.canonicalPath(rawPath)
+    pendingLock.withLock {
+      if canonicalPathCache.count >= Self.maxAuxiliaryCacheEntries {
+        canonicalPathCache.removeAll(keepingCapacity: false)
+      }
+      canonicalPathCache[rawPath] = resolved
+    }
+    return resolved
   }
 
   private func isExtensionlessImageFile(canonicalFilePath: String) -> Bool {
@@ -139,6 +173,9 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     }
     let isImage = type.conforms(to: .image)
     pendingLock.withLock {
+      if imageFileCache.count >= Self.maxAuxiliaryCacheEntries {
+        imageFileCache.removeAll(keepingCapacity: false)
+      }
       imageFileCache[canonicalFilePath] = isImage
     }
     return isImage
@@ -172,6 +209,9 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       height: displayLength(forPixelLength: height, dpi: dpiHeight)
     )
     pendingLock.withLock {
+      if displaySizeCache.count >= Self.maxAuxiliaryCacheEntries {
+        displaySizeCache.removeAll(keepingCapacity: false)
+      }
       displaySizeCache[canonicalFilePath] = CachedDisplaySize(signature: signature, size: size)
     }
     return size
@@ -185,6 +225,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     let canonicalPaths = Set(filePaths.map(Self.canonicalPath))
     var urlsToScrub: [URL] = []
     pendingLock.withLock {
+      canonicalPathCache.removeAll(keepingCapacity: false)
       for path in canonicalPaths {
         pathEpochs[path, default: 0] &+= 1
         displaySizeCache.removeValue(forKey: path)
@@ -201,9 +242,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
           || filePaths.contains(metadata.sourcePath)
       }
     }
-    for scrubURL in urlsToScrub {
-      ImageAssetStore.secureUnlink(at: scrubURL)
-    }
+    ImageAssetStore.secureUnlinkBatch(urlsToScrub)
   }
 
   func prune(keepingFilePaths filePaths: Set<String>) {
@@ -233,6 +272,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     var urlsToScrub: [URL] = []
 
     pendingLock.withLock {
+      canonicalPathCache.removeAll(keepingCapacity: false)
       for (_, entry) in inFlightByKey where !canonicalKeptPaths.contains(entry.canonicalPath) {
         pathEpochs[entry.canonicalPath, default: 0] &+= 1
         displaySizeCache.removeValue(forKey: entry.canonicalPath)
@@ -252,35 +292,27 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         urlsToScrub.append(entryURL)
       }
 
-      stageCacheEntriesForScrubLocked(in: entryURLs, into: &urlsToScrub) { metadata in
+      let removedJSONKeys = stageCacheEntriesForScrubLocked(in: entryURLs, into: &urlsToScrub) { metadata in
         let canonicalMeta = Self.canonicalPath(metadata.sourcePath)
         return !canonicalKeptPaths.contains(canonicalMeta) && !rawKeptPaths.contains(metadata.sourcePath)
       }
 
-      // Stage any orphaned .png files lacking a matching .json metadata entry.
-      if let remainingURLs = try? fileManager.contentsOfDirectory(
-        at: directory,
-        includingPropertiesForKeys: nil,
-        options: []
-      ) {
-        let jsonKeys = Set(
-          remainingURLs
-            .filter { $0.pathExtension.lowercased() == "json" }
-            .map { $0.deletingPathExtension().lastPathComponent }
-        )
-        for url in remainingURLs where url.pathExtension.lowercased() == "png" {
-          let key = url.deletingPathExtension().lastPathComponent
-          if !jsonKeys.contains(key) {
-            stageForScrubLocked(url, into: &urlsToScrub)
-            imageCache.removeObject(forKey: key as NSString)
-          }
+      // Stage any orphaned .png files lacking a surviving .json metadata entry.
+      let survivingJSONKeys = Set(
+        entryURLs
+          .filter { $0.pathExtension.lowercased() == "json" }
+          .map { $0.deletingPathExtension().lastPathComponent }
+      ).subtracting(removedJSONKeys)
+      for url in entryURLs where url.pathExtension.lowercased() == "png" && !url.lastPathComponent.hasPrefix(".scrubbing-") {
+        let key = url.deletingPathExtension().lastPathComponent
+        if !survivingJSONKeys.contains(key) && !removedJSONKeys.contains(key) {
+          stageForScrubLocked(url, into: &urlsToScrub)
+          imageCache.removeObject(forKey: key as NSString)
         }
       }
     }
 
-    for scrubURL in urlsToScrub {
-      ImageAssetStore.secureUnlink(at: scrubURL)
-    }
+    ImageAssetStore.secureUnlinkBatch(urlsToScrub)
   }
 
   func removeAll() {
@@ -290,6 +322,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       pathEpochs.removeAll()
       displaySizeCache.removeAll()
       imageFileCache.removeAll()
+      canonicalPathCache.removeAll()
       imageCache.removeAllObjects()
 
       if let entries = try? fileManager.contentsOfDirectory(
@@ -302,9 +335,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
         }
       }
     }
-    for scrubURL in urlsToScrub {
-      ImageAssetStore.secureUnlink(at: scrubURL)
-    }
+    ImageAssetStore.secureUnlinkBatch(urlsToScrub)
     _ = Darwin.rmdir(directory.path)
   }
 
@@ -313,37 +344,51 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       return nil
     }
 
-    let (startGlobalEpoch, startPathEpoch): (UInt64, UInt64) = pendingLock.withLock {
-      (globalEpoch, pathEpochs[canonicalFilePath] ?? 0)
+    let (startGlobalEpoch, startPathEpoch, memoryHit): (UInt64, UInt64, CachedPreviewEntry?) = pendingLock.withLock {
+      (
+        globalEpoch,
+        pathEpochs[canonicalFilePath] ?? 0,
+        imageCache.object(forKey: key as NSString)
+      )
+    }
+
+    if let memoryHit,
+       memoryHit.globalEpoch == startGlobalEpoch,
+       memoryHit.pathEpoch == startPathEpoch,
+       memoryHit.metadata.matches(canonicalSourcePath: canonicalFilePath, signature: signature, targetSize: targetSize) {
+      return memoryHit.image
     }
 
     guard let metadata = readMetadata(key: key),
-          metadata.matches(canonicalSourcePath: canonicalFilePath, signature: signature, targetSize: targetSize) else {
+          metadata.matches(canonicalSourcePath: canonicalFilePath, signature: signature, targetSize: targetSize),
+          let image = NSImage(contentsOf: imageURL(forKey: key)) else {
       return nil
     }
 
-    if let cached = pendingLock.withLock({ () -> NSImage? in
-      guard globalEpoch == startGlobalEpoch,
-            (pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
-        return nil
-      }
-      return imageCache.object(forKey: key as NSString)
-    }) {
-      return cached
-    }
-
-    guard let image = NSImage(contentsOf: imageURL(forKey: key)) else {
-      return nil
-    }
-
+    let cost = Self.estimatedByteCost(of: image, targetSize: targetSize)
     return pendingLock.withLock {
       guard globalEpoch == startGlobalEpoch,
             (pathEpochs[canonicalFilePath] ?? 0) == startPathEpoch else {
         return nil
       }
-      imageCache.setObject(image, forKey: key as NSString)
+      let cachedEntry = CachedPreviewEntry(
+        image: image,
+        metadata: metadata,
+        globalEpoch: startGlobalEpoch,
+        pathEpoch: startPathEpoch
+      )
+      imageCache.setObject(cachedEntry, forKey: key as NSString, cost: cost)
       return image
     }
+  }
+
+  private static func estimatedByteCost(of image: NSImage, targetSize: CGSize) -> Int {
+    if let rep = image.representations.first, rep.pixelsWide > 0, rep.pixelsHigh > 0 {
+      return max(1, rep.pixelsWide * rep.pixelsHigh * 4)
+    }
+    let width = max(1, Int(targetSize.width.rounded()) * 2)
+    let height = max(1, Int(targetSize.height.rounded()) * 2)
+    return width * height * 4
   }
 
   private func scheduleImageThumbnailGeneration(
@@ -404,15 +449,21 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
       let tempImageURL = try Self.stageTempFile0600(pngData, for: imageURL(forKey: key), in: directory)
       stagedImageURL = tempImageURL
-      let metadataData = try encoder.encode(metadata)
+      let metadataData = try JSONEncoder().encode(metadata)
       let tempMetadataURL = try Self.stageTempFile0600(metadataData, for: metadataURL(forKey: key), in: directory)
       stagedMetadataURL = tempMetadataURL
 
+      let cost = Self.estimatedByteCost(
+        of: image,
+        targetSize: CGSize(width: metadata.targetWidth, height: metadata.targetHeight)
+      )
       let outcome = pendingLock.withLock {
         publishStagedThumbnailLocked(
           stagedImageURL: tempImageURL,
           stagedMetadataURL: tempMetadataURL,
           image: image,
+          metadata: metadata,
+          cost: cost,
           key: key,
           entry: entry
         )
@@ -438,6 +489,8 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     stagedImageURL: URL,
     stagedMetadataURL: URL,
     image: NSImage,
+    metadata: Metadata,
+    cost: Int,
     key: String,
     entry: InFlightEntry
   ) -> StagedCommitOutcome {
@@ -454,16 +507,26 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       let failedImageURL = Darwin.rename(targetImageURL.path, scrubURL.path) == 0 ? scrubURL : targetImageURL
       return .metadataRenameFailed(scrubbedImageURL: failedImageURL)
     }
-    imageCache.setObject(image, forKey: key as NSString)
+    let cachedEntry = CachedPreviewEntry(
+      image: image,
+      metadata: metadata,
+      globalEpoch: entry.startGlobalEpoch,
+      pathEpoch: entry.startPathEpoch
+    )
+    imageCache.setObject(cachedEntry, forKey: key as NSString, cost: cost)
     return .committed
   }
 
   private func cleanupUncommittedStagedFiles(imageURL: URL?, metadataURL: URL?) {
+    var urls: [URL] = []
     if let imageURL {
-      ImageAssetStore.secureUnlink(at: imageURL)
+      urls.append(imageURL)
     }
     if let metadataURL {
-      ImageAssetStore.secureUnlink(at: metadataURL)
+      urls.append(metadataURL)
+    }
+    if !urls.isEmpty {
+      ImageAssetStore.secureUnlinkBatch(urls)
     }
     _ = Darwin.rmdir(directory.path)
   }
@@ -583,7 +646,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       return nil
     }
 
-    return try? decoder.decode(Metadata.self, from: data)
+    return try? JSONDecoder().decode(Metadata.self, from: data)
   }
 
   private func stageForScrubLocked(_ url: URL, into urlsToScrub: inout [URL]) {
@@ -603,26 +666,30 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
     }
   }
 
+  @discardableResult
   private func stageCacheEntriesForScrubLocked(
     into urlsToScrub: inout [URL],
     where shouldRemove: (Metadata) -> Bool
-  ) {
+  ) -> Set<String> {
     guard let metadataURLs = try? fileManager.contentsOfDirectory(
       at: directory,
       includingPropertiesForKeys: nil,
       options: []
     ) else {
-      return
+      return []
     }
 
-    stageCacheEntriesForScrubLocked(in: metadataURLs, into: &urlsToScrub, where: shouldRemove)
+    return stageCacheEntriesForScrubLocked(in: metadataURLs, into: &urlsToScrub, where: shouldRemove)
   }
 
+  @discardableResult
   private func stageCacheEntriesForScrubLocked(
     in metadataURLs: [URL],
     into urlsToScrub: inout [URL],
     where shouldRemove: (Metadata) -> Bool
-  ) {
+  ) -> Set<String> {
+    var removedKeys = Set<String>()
+    let decoder = JSONDecoder()
     for metadataURL in metadataURLs where metadataURL.pathExtension == "json" {
       guard let data = try? Data(contentsOf: metadataURL),
             let metadata = try? decoder.decode(Metadata.self, from: data),
@@ -633,6 +700,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       let canonicalMetaPath = Self.canonicalPath(metadata.sourcePath)
       pathEpochs[canonicalMetaPath, default: 0] &+= 1
       let key = metadataURL.deletingPathExtension().lastPathComponent
+      removedKeys.insert(key)
       stageForScrubLocked(metadataURL, into: &urlsToScrub)
       stageForScrubLocked(imageURL(forKey: key), into: &urlsToScrub)
       imageCache.removeObject(forKey: key as NSString)
@@ -641,6 +709,7 @@ nonisolated final class FilePreviewCache: @unchecked Sendable {
       imageFileCache.removeValue(forKey: metadata.sourcePath)
       imageFileCache.removeValue(forKey: canonicalMetaPath)
     }
+    return removedKeys
   }
 
   private func compactPathEpochsIfNeeded() {

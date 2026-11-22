@@ -535,11 +535,12 @@ final class PasteboardMonitor {
         var newlyStagedAssetURL: URL?
         if item.kind == .image, let pngData = pendingPNGData {
             let parts = item.contentKeyComponents
-            let existing = try? historyStore.fetchItem(
+            let fetchedExisting = try? historyStore.fetchItem(
                 kind: .image,
                 contentKey: parts.canonicalContent,
                 htmlDigest: parts.htmlDigest
             )
+            let existing = (fetchedExisting?.isCorruptPlaceholder == true) ? nil : fetchedExisting
             let targetID = existing?.id ?? sourceItemID
             item.id = targetID
             if let existingAssetPath = existing?.assetPath,
@@ -564,7 +565,7 @@ final class PasteboardMonitor {
                 kind: .file,
                 contentKey: parts.canonicalContent,
                 htmlDigest: parts.htmlDigest
-            ) {
+            ), !storedItem.isCorruptPlaceholder {
                 // Copying a file again keeps the text read from it before until the
                 // file is read again.
                 item.text = storedItem.text

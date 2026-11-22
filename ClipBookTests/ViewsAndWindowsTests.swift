@@ -2,9 +2,11 @@
 import AppKit
 import CryptoKit
 import Foundation
+import ImageIO
 import os
 import SwiftUI
 import Testing
+import UniformTypeIdentifiers
 import WebKit
 
 @Suite(.serialized)
@@ -68,12 +70,16 @@ enum ViewsAndWindowsTests {
                 calendar: calendar
             )
 
+            let favoritesHeader = L10n.string("Favorites")
+            let todayHeader = L10n.string("Today")
+            let yesterdayHeader = L10n.string("Yesterday")
+
             #expect(rows.count == 11)
-            #expect(rows[0] == .sectionHeader("Favorites"))
+            #expect(rows[0] == .sectionHeader(favoritesHeader))
             #expect(rows[1] == .item(pinnedFav, itemIndex: 0))
-            #expect(rows[2] == .sectionHeader("Today"))
+            #expect(rows[2] == .sectionHeader(todayHeader))
             #expect(rows[3] == .item(todayItem, itemIndex: 1))
-            #expect(rows[4] == .sectionHeader("Yesterday"))
+            #expect(rows[4] == .sectionHeader(yesterdayHeader))
             #expect(rows[5] == .item(yesterdayItem, itemIndex: 2))
 
             guard case .sectionHeader(let nextDayTitle) = rows[6], case .sectionHeader(let jumpDayTitle) = rows[8] else {
@@ -83,8 +89,8 @@ enum ViewsAndWindowsTests {
             #expect(!nextDayTitle.isEmpty)
             #expect(!jumpDayTitle.isEmpty)
             #expect(nextDayTitle != jumpDayTitle)
-            #expect(![nextDayTitle, jumpDayTitle].contains("Today"))
-            #expect(![nextDayTitle, jumpDayTitle].contains("Yesterday"))
+            #expect(![nextDayTitle, jumpDayTitle].contains(todayHeader))
+            #expect(![nextDayTitle, jumpDayTitle].contains(yesterdayHeader))
             #expect(rows[7] == .item(dstNextDay, itemIndex: 3))
             #expect(rows[9] == .item(dstItem1, itemIndex: 4))
             #expect(rows[10] == .item(dstItem2, itemIndex: 5))
@@ -908,9 +914,10 @@ enum ViewsAndWindowsTests {
             let menuBuilder = HistoryItemContextMenu(target: vc, availableTags: [], preferences: harness.model.preferences)
 
             // 1. Context menu checks on plain .png vs encrypted .enc image (including detectSensitiveContent == false!) and .file items.
-            let plainImgMenuTitles = Self.allItems(in: menuBuilder.makeMenu(for: plainImg)).map(\.title)
+            let plainImgMenuItems = Self.allItems(in: menuBuilder.makeMenu(for: plainImg))
+            let plainImgMenuTitles = plainImgMenuItems.map(\.title)
             #expect(plainImgMenuTitles.contains(L10n.string("Mark as Sensitive")))
-            #expect(plainImgMenuTitles.contains { $0.hasPrefix("Open") })
+            #expect(plainImgMenuItems.contains { $0.action == #selector(HistoryContentViewController.openInAssociatedApplicationMenuItem(_:)) })
 
             let encImgMenu = menuBuilder.makeMenu(for: encImg)
             let encImgItems = Self.allItems(in: encImgMenu)
@@ -3052,6 +3059,8 @@ extension SharedProcessStateTests {
             #expect(streamedPreview.description == "Within 512KB Limit")
             #expect(streamedPreview.image != nil)
             #expect(streamedPreview.favicon != nil)
+            #expect(streamedPreview.imagePNGData != nil)
+            #expect(streamedPreview.faviconPNGData != nil)
 
             #expect(await TestSupport.waitUntil {
                 BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/streaming-page").didStopLoading
@@ -3165,7 +3174,41 @@ extension SharedProcessStateTests {
                     && BoundedLinkPreviewTestURLProtocol.metrics(forPath: "/oversized-favicon.png").didStopLoading
             })
 
-            // 5. Non-2xx/3xx HTTP response is rejected cleanly.
+            // 5. Multi-frame favicon selects largest pixel-area frame (64x64 over 16x16) and normalizes to PNG off-main.
+            let frame16PNG = try TestSupport.makePNGData(pixelWidth: 16, pixelHeight: 16, color: .systemRed)
+            let frame64PNG = try TestSupport.makePNGData(pixelWidth: 64, pixelHeight: 64, color: .systemGreen)
+            let src16 = try #require(CGImageSourceCreateWithData(frame16PNG as CFData, nil))
+            let src64 = try #require(CGImageSourceCreateWithData(frame64PNG as CFData, nil))
+            let img16 = try #require(CGImageSourceCreateImageAtIndex(src16, 0, nil))
+            let img64 = try #require(CGImageSourceCreateImageAtIndex(src64, 0, nil))
+            let multiFrameTIFF = NSMutableData()
+            let tiffDest = try #require(CGImageDestinationCreateWithData(multiFrameTIFF, UTType.tiff.identifier as CFString, 2, nil))
+            CGImageDestinationAddImage(tiffDest, img16, nil)
+            CGImageDestinationAddImage(tiffDest, img64, nil)
+            #expect(CGImageDestinationFinalize(tiffDest))
+
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/multi-icon.tiff",
+                route: .complete(statusCode: 200, headers: ["Content-Type": "image/tiff"], body: multiFrameTIFF as Data)
+            )
+            BoundedLinkPreviewTestURLProtocol.setRoute(
+                path: "/multi-icon-page",
+                route: .complete(
+                    statusCode: 200,
+                    headers: ["Content-Type": "text/html"],
+                    body: Data("<html><head><title>Multi</title><link rel=\"icon\" href=\"https://\(host)/multi-icon.tiff\"></head></html>".utf8)
+                )
+            )
+            let multiPageURL = try #require(URL(string: "https://\(host)/multi-icon-page"))
+            let multiPreview = try #require(await fetcher.fetchPreview(for: multiPageURL))
+            let encodedFaviconPNG = try #require(multiPreview.faviconPNGData)
+            #expect(encodedFaviconPNG.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+            let decodedFavSrc = try #require(CGImageSourceCreateWithData(encodedFaviconPNG as CFData, nil))
+            let decodedFavProps = try #require(CGImageSourceCopyPropertiesAtIndex(decodedFavSrc, 0, nil) as? [CFString: Any])
+            #expect((decodedFavProps[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue == 64)
+            #expect((decodedFavProps[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue == 64)
+
+            // 6. Non-2xx/3xx HTTP response is rejected cleanly.
             BoundedLinkPreviewTestURLProtocol.setRoute(
                 path: "/error-page",
                 route: .complete(statusCode: 500, headers: ["Content-Type": "text/html"], body: Data("<title>Err</title>".utf8))
@@ -3175,9 +3218,9 @@ extension SharedProcessStateTests {
             #expect(failedPreview == nil)
         }
 
-        @Test
+        @Test(.timeLimit(.minutes(1)))
         @MainActor
-        func itemPreviewDialogWebViewBlocksUnsafeSchemesAndUsesNonPersistentDataStore() throws {
+        func itemPreviewDialogWebViewBlocksUnsafeSchemesAndUsesNonPersistentDataStore() async throws {
             TestSupport.ensureAppKitInitialized()
 
             var openedURLs: [URL] = []
@@ -3218,6 +3261,7 @@ extension SharedProcessStateTests {
 
             let webView = try #require(findWebView(in: controller.view))
             #expect(webView.configuration.websiteDataStore.isPersistent == false)
+            #expect(webView.configuration.preferences.javaScriptCanOpenWindowsAutomatically == false)
             #expect(webView.navigationDelegate === controller)
             #expect(webView.uiDelegate === controller)
             #expect(
@@ -3225,7 +3269,7 @@ extension SharedProcessStateTests {
                     to: #selector(
                         WKNavigationDelegate.webView(
                             _:decidePolicyFor:decisionHandler:
-                        ) as (WKNavigationDelegate) -> ((WKWebView, WKNavigationAction, @escaping (WKNavigationActionPolicy) -> Void) -> Void)?
+                        ) as (WKNavigationDelegate) -> ((WKWebView, WKNavigationAction, @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) -> Void)?
                     )
                 )
             )
@@ -3319,6 +3363,31 @@ extension SharedProcessStateTests {
                 ) == nil
             )
             #expect(openedURLs == [httpsURL, httpURL])
+
+            // Ungestured on-load JS window.open(...) and synthetic target="_blank" click must never auto-invoke openExternalURL.
+            openedURLs.removeAll()
+            let autoPopupHTML = """
+            <!doctype html>
+            <html><body>
+            <a id="autoLink" href="https://example.com/synthetic-click" target="_blank">go</a>
+            <script>
+              window.open("https://example.com/window-open");
+              document.getElementById("autoLink").click();
+              window.__popupProbeDone = true;
+            </script>
+            </body></html>
+            """
+            webView.loadHTMLString(autoPopupHTML, baseURL: try #require(URL(string: "https://example.com")))
+            var probeCompleted = false
+            for _ in 0..<100 {
+                if (try? await webView.evaluateJavaScript("window.__popupProbeDone === true") as? Bool) == true {
+                    probeCompleted = true
+                    break
+                }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            #expect(probeCompleted)
+            #expect(openedURLs.isEmpty, "Ungestured JavaScript popups must be blocked by javaScriptCanOpenWindowsAutomatically == false")
         }
     }
 }

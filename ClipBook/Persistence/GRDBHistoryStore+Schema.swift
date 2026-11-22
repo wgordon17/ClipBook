@@ -105,6 +105,8 @@ nonisolated extension GRDBHistoryStore {
                 ON clips(expiresAt) WHERE expiresAt IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_clips_stored_files
                 ON clips(id) WHERE assetPath IS NOT NULL OR linkPreviewData IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_clips_svg
+                ON clips(id) WHERE isSVGText != 0;
 
             CREATE TABLE IF NOT EXISTS clip_contents (
                 clipId TEXT PRIMARY KEY NOT NULL REFERENCES clips(id) ON DELETE CASCADE,

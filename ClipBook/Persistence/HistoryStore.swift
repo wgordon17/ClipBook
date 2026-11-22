@@ -34,7 +34,8 @@ nonisolated protocol HistoryStore: Sendable {
         role: AssetRole,
         clipID: UUID,
         encrypted: Bool,
-        preferredPlainExtension: String?
+        preferredPlainExtension: String?,
+        sync: Bool
     ) throws -> URL
     func finalizeRecognizedImage(
         id: UUID,
@@ -116,14 +117,16 @@ nonisolated extension HistoryStore {
         pngData: Data,
         role: AssetRole,
         clipID: UUID,
-        encrypted: Bool
+        encrypted: Bool,
+        preferredPlainExtension: String? = nil
     ) throws -> URL {
         try writeManagedAsset(
             pngData: pngData,
             role: role,
             clipID: clipID,
             encrypted: encrypted,
-            preferredPlainExtension: nil
+            preferredPlainExtension: preferredPlainExtension,
+            sync: true
         )
     }
 

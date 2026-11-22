@@ -148,7 +148,7 @@ nonisolated enum HistoryCrypto {
 
         let aad = columnAAD(table: table, column: column, clipID: clipID)
         do {
-            let sealedBox = try AES.GCM.SealedBox(combined: Data(blob.dropFirst()))
+            let sealedBox = try AES.GCM.SealedBox(combined: blob.dropFirst())
             return try AES.GCM.open(
                 sealedBox,
                 using: keys.dbColumnAEADKey,
@@ -364,7 +364,7 @@ nonisolated enum HistoryCrypto {
         }
 
         do {
-            let sealedBox = try AES.GCM.SealedBox(combined: Data(blob.dropFirst(archiveEntryMagic.count)))
+            let sealedBox = try AES.GCM.SealedBox(combined: blob.dropFirst(archiveEntryMagic.count))
             return try AES.GCM.open(
                 sealedBox,
                 using: key,

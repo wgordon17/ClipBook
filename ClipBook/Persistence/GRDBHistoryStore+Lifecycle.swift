@@ -477,13 +477,31 @@ nonisolated extension GRDBHistoryStore {
         }
 
         let writer = try Self.makeDatabaseWriter(at: databaseURL.path)
-        if case .fresh = probeState {
+        switch probeState {
+        case .fresh:
             do {
                 try bootstrapFreshV5Schema(in: writer, keys: keys)
             } catch {
                 closeWriterCleanly(writer)
                 throw error
             }
+        case .existingV5:
+            let hasSVGIndex = (try? writer.unsafeReentrantRead { db in
+                try Int.fetchOne(
+                    db,
+                    sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_clips_svg' LIMIT 1"
+                )
+            }) != nil
+            if !hasSVGIndex {
+                try? writer.unsafeReentrantWrite { db in
+                    try db.execute(sql: """
+                        CREATE INDEX IF NOT EXISTS idx_clips_svg
+                            ON clips(id) WHERE isSVGText != 0;
+                        """)
+                }
+            }
+        case .legacy:
+            break
         }
         return writer
     }

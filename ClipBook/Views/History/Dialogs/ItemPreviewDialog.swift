@@ -1521,8 +1521,9 @@ final class ItemPreviewDialogController: NSViewController {
     let configuration = WKWebViewConfiguration()
     // Link previews use an ephemeral data store so cookies and site storage do not persist across previews.
     configuration.websiteDataStore = .nonPersistent()
-    // A preview is not a browser: it never starts playing media on its own.
+    // A preview is not a browser: it never starts playing media or opening external windows on its own.
     configuration.mediaTypesRequiringUserActionForPlayback = .all
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
     let webView = WKWebView(frame: containerView.bounds, configuration: configuration)
     webView.autoresizingMask = [.width, .height]

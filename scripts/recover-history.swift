@@ -251,15 +251,23 @@ private enum RecoveryCryptoAndIO {
         return decoder
     }
 
+    private static let fractionalISO8601Formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let standardISO8601Formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
     static func parseISO8601Date(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) {
+        if let date = fractionalISO8601Formatter.date(from: raw) {
             return date
         }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: raw)
+        return standardISO8601Formatter.date(from: raw)
     }
 
     static func zeroBytes(_ bytes: inout [UInt8]) {
@@ -376,7 +384,7 @@ private enum RecoveryCryptoAndIO {
         }
         let aad = columnAAD(table: table, column: column, clipID: clipID)
         do {
-            let sealedBox = try AES.GCM.SealedBox(combined: Data(blob.dropFirst()))
+            let sealedBox = try AES.GCM.SealedBox(combined: blob.dropFirst())
             return try AES.GCM.open(sealedBox, using: keys.dbColumnAEADKey, authenticating: aad)
         } catch {
             throw RowCorruptionError.columnAuthenticationFailed("\(table).\(column)")
@@ -395,7 +403,7 @@ private enum RecoveryCryptoAndIO {
         }
         let aad = assetAAD(role: role, clipID: clipID)
         do {
-            let sealedBox = try AES.GCM.SealedBox(combined: Data(rawData.dropFirst(assetEncryptedMagic.count)))
+            let sealedBox = try AES.GCM.SealedBox(combined: rawData.dropFirst(assetEncryptedMagic.count))
             return try AES.GCM.open(sealedBox, using: keys.assetFileAEADKey, authenticating: aad)
         } catch {
             throw RowCorruptionError.assetInvalidOrMissing(role.rawValue)
@@ -540,7 +548,7 @@ private enum RecoveryCryptoAndIO {
         }
 
         do {
-            let sealedBox = try AES.GCM.SealedBox(combined: Data(blob.dropFirst(archiveEntryMagic.count)))
+            let sealedBox = try AES.GCM.SealedBox(combined: blob.dropFirst(archiveEntryMagic.count))
             return try AES.GCM.open(sealedBox, using: key, authenticating: aad)
         } catch {
             throw RecoveryFailure.fatal("Encrypted archive entry failed authentication: \(relativePath)")

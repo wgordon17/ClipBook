@@ -1550,6 +1550,13 @@ enum DomainAndSensitiveContentTests {
             )
             #expect(!maskedUnloadedPreview.contains(Self.openAITokenSample))
             #expect(maskedUnloadedPreview.contains(SensitiveContent.inlineMask))
+
+            // 7. ClipboardItem.init and isMasked use zero-plaintext SHA-256 restVerdictCache without inserting plaintext into SensitiveContent.cache (so dontSave-rejected secrets leave zero plaintext in SensitiveContent.cache).
+            let dontSaveUniqueSecret = ["sk-", "proj-", UUID().uuidString.replacingOccurrences(of: "-", with: ""), "DontSaveProbe99"].joined()
+            let transientSecretItem = ClipboardItem.fixture(kind: .text, text: dontSaveUniqueSecret)
+            #expect(SensitiveContent.shouldEncryptAtRest(transientSecretItem))
+            #expect(SensitiveContent.isMasked(transientSecretItem, detectsAutomatically: true))
+            #expect(!SensitiveContent.hasCachedMaskSecretsForTesting(in: dontSaveUniqueSecret, detectsPasswordLikeText: true))
         }
     }
 }

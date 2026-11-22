@@ -213,19 +213,18 @@ nonisolated enum SensitiveContent {
         guard SensitiveContentDetector.mayContainSecret(in: previewText) else {
             return false
         }
-        return !SensitiveContentDetector.secrets(
+        return containsSecretAtRest(
             in: searchedText(previewText, limit: previewCharacterLimit),
             detectsPasswordLikeText: item.kind == .text || item.kind == .richText
-        ).isEmpty
+        )
     }
 
     static func detectsPreviewSecret(in item: ClipboardItem) -> Bool {
         if let itemTitle = item.itemTitle,
-           SensitiveContentDetector.mayContainSecret(in: itemTitle),
-           !cachedSecrets(
+           containsSecretAtRest(
                in: searchedText(itemTitle, limit: previewCharacterLimit),
                detectsPasswordLikeText: false
-           ).isEmpty {
+           ) {
             return true
         }
 
@@ -235,19 +234,17 @@ nonisolated enum SensitiveContent {
                 return true
             }
             if let previewTitle = item.linkPreviewDetails?.title,
-               SensitiveContentDetector.mayContainSecret(in: previewTitle),
-               !cachedSecrets(
+               containsSecretAtRest(
                    in: searchedText(previewTitle, limit: previewCharacterLimit),
                    detectsPasswordLikeText: false
-               ).isEmpty {
+               ) {
                 return true
             }
             if let previewDescription = item.linkPreviewDetails?.description,
-               SensitiveContentDetector.mayContainSecret(in: previewDescription),
-               !cachedSecrets(
+               containsSecretAtRest(
                    in: searchedText(previewDescription, limit: previewCharacterLimit),
                    detectsPasswordLikeText: false
-               ).isEmpty {
+               ) {
                 return true
             }
             return false
@@ -255,13 +252,7 @@ nonisolated enum SensitiveContent {
             return item.containsRestSecret
         case .file:
             return item.containsRestSecret || item.filePaths.contains { path in
-                if path.utf16.count > maxEncryptionScanUTF16Length {
-                    return true
-                }
-                guard SensitiveContentDetector.mayContainSecret(in: path) else {
-                    return false
-                }
-                return !detectedSecrets(in: path, for: item).isEmpty
+                containsSecretAtRest(in: path, detectsPasswordLikeText: false)
             }
         case .color:
             return false
@@ -279,22 +270,16 @@ nonisolated enum SensitiveContent {
         guard SensitiveContentDetector.mayContainSecret(in: text) else {
             return false
         }
-        if utf16Count <= previewCharacterLimit {
-            let key = restVerdictCacheKey(for: text, detectsPasswordLikeText: detectsPasswordLikeText)
-            if let cached = restVerdictCache.object(forKey: key) {
-                return cached.containsSecret
-            }
-            let hasSecret = !SensitiveContentDetector.secrets(
-                in: text,
-                detectsPasswordLikeText: detectsPasswordLikeText
-            ).isEmpty
-            restVerdictCache.setObject(hasSecret ? .yes : .no, forKey: key)
-            return hasSecret
+        let key = restVerdictCacheKey(for: text, detectsPasswordLikeText: detectsPasswordLikeText)
+        if let cached = restVerdictCache.object(forKey: key) {
+            return cached.containsSecret
         }
-        return !SensitiveContentDetector.secrets(
+        let hasSecret = !SensitiveContentDetector.secrets(
             in: text,
             detectsPasswordLikeText: detectsPasswordLikeText
         ).isEmpty
+        restVerdictCache.setObject(hasSecret ? .yes : .no, forKey: key)
+        return hasSecret
     }
 
     static func detectsBodySecretAtRest(
@@ -526,6 +511,16 @@ nonisolated enum SensitiveContent {
         cache.removeAllObjects()
         restVerdictCache.removeAllObjects()
     }
+
+    #if DEBUG
+    nonisolated static func hasCachedMaskSecretsForTesting(
+        in text: String,
+        detectsPasswordLikeText: Bool
+    ) -> Bool {
+        let key = "\(detectsPasswordLikeText ? 1 : 0)\(text)" as NSString
+        return cache.object(forKey: key) != nil
+    }
+    #endif
 
     private nonisolated final class CachedSecrets: Sendable {
         let secrets: [SensitiveContentDetector.Secret]

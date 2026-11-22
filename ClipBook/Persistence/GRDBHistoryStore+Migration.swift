@@ -1,4 +1,3 @@
-import CryptoKit
 import Darwin
 import Foundation
 import GRDB
@@ -73,6 +72,9 @@ nonisolated extension GRDBHistoryStore {
             try openedLegacy.close()
             legacyQueue = nil
 
+            if !context.stagedEncURLs.isEmpty {
+                ImageAssetStore.fullFsyncBatch(context.stagedEncURLs)
+            }
             try Self.fullFsyncFile(at: migratingURL)
             return context.unsharedSensitiveLegacyURLs
         } catch {
@@ -555,7 +557,8 @@ nonisolated extension GRDBHistoryStore {
             role: role,
             clipID: clipID,
             encrypted: true,
-            keys: keys
+            keys: keys,
+            sync: false
         )
         context.stagedEncURLs.append(stagedURL)
 

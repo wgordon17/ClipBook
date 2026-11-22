@@ -125,14 +125,16 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
         role: AssetRole,
         clipID: UUID,
         encrypted: Bool,
-        preferredPlainExtension: String?
+        preferredPlainExtension: String?,
+        sync: Bool
     ) throws -> URL {
         try base.writeManagedAsset(
             pngData: pngData,
             role: role,
             clipID: clipID,
             encrypted: encrypted,
-            preferredPlainExtension: preferredPlainExtension
+            preferredPlainExtension: preferredPlainExtension,
+            sync: sync
         )
     }
 

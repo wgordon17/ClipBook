@@ -2450,6 +2450,277 @@ enum SQLiteHistoryStoreAndArchiveTests {
             }
         }
 
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func recapturingContentMatchingCorruptEncryptedRowSkipsPlaceholderAndPreservesExistingEncAsset() async throws {
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let keyProvider = InMemoryDatabaseKeyProvider()
+                let pngBytes = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20, color: .systemPurple)
+                let corruptTextID = UUID()
+                let corruptImageID = UUID()
+                let sharedSecretText = ["CorruptRecapturePayload_", "Alpha9911"].joined()
+                let corruptImageURL: URL
+                let originalEncBytes: Data
+
+                do {
+                    let seedStore = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                    defer { seedStore.close() }
+
+                    let seededText = ClipboardItem.fixture(
+                        id: corruptTextID,
+                        kind: .text,
+                        title: "Encrypted Title",
+                        text: sharedSecretText,
+                        copiedAt: Date(timeIntervalSince1970: 1_700_010_010),
+                        sensitivity: .sensitive
+                    )
+                    _ = try seedStore.saveAndReconcileItem(seededText)
+
+                    corruptImageURL = try seedStore.writeManagedAsset(
+                        pngData: pngBytes,
+                        role: .image,
+                        clipID: corruptImageID,
+                        encrypted: true
+                    )
+                    originalEncBytes = try Data(contentsOf: corruptImageURL)
+                    let seededImage = ClipboardItem.fixture(
+                        id: corruptImageID,
+                        kind: .image,
+                        title: "Encrypted Screenshot Title",
+                        text: "OCR text",
+                        assetPath: corruptImageURL.path,
+                        imageDigest: seedStore.computeImageDigest(forPNGData: pngBytes),
+                        copiedAt: Date(timeIntervalSince1970: 1_700_010_020),
+                        sensitivity: .sensitive
+                    )
+                    _ = try seedStore.saveAndReconcileItem(seededImage)
+                    seedStore.flushPendingFreePageRelease()
+                }
+
+                // Corrupt only the sealed `clips.title` column on both rows so `contentKey` still matches!
+                let dbURL = supportDir.appendingPathComponent("History.sqlite")
+                var rawDB: OpaquePointer?
+                #expect(sqlite3_open_v2(dbURL.path, &rawDB, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+                defer { if let rawDB { sqlite3_close(rawDB) } }
+                for targetID in [corruptTextID, corruptImageID] {
+                    let corruptSQL = "UPDATE clips SET title = X'01FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF' WHERE id = '\(targetID.uuidString)';"
+                    #expect(sqlite3_exec(rawDB, corruptSQL, nil, nil, nil) == SQLITE_OK)
+                }
+                sqlite3_close(rawDB)
+                rawDB = nil
+
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                defer { store.close() }
+
+                // 1. Re-capturing identical text skips the corrupt placeholder and inserts a new healthy row.
+                let recapturedText = try store.capture(
+                    ClipboardItem.fixture(
+                        kind: .text,
+                        text: sharedSecretText,
+                        copiedAt: Date(timeIntervalSince1970: 1_700_010_030),
+                        sensitivity: .sensitive
+                    ),
+                    updatesCopySequence: false
+                )
+                #expect(recapturedText.id != corruptTextID)
+                #expect(!recapturedText.isCorruptPlaceholder)
+                #expect(try store.loadingContent(of: recapturedText, scope: .body).text == sharedSecretText)
+
+                // 2. Re-capturing identical PNG via PasteboardMonitor leaves `Images/<corruptImageID>.enc` intact and captures a new healthy image row.
+                let pasteboard = NSPasteboard.withUniqueName()
+                defer { pasteboard.releaseGlobally() }
+                let monitor = PasteboardMonitor(
+                    historyStore: store,
+                    fileManager: .default,
+                    pasteboard: pasteboard,
+                    recognizeImageData: { _ in .empty }
+                )
+                defer { monitor.stop() }
+                var prefs = AppPreferences()
+                prefs.confidentialContentLifetime = ContentLifetime.keep
+                monitor.start(preferences: prefs)
+
+                pasteboard.clearContents()
+                #expect(pasteboard.setData(pngBytes, forType: .png))
+                pasteboard.setData(Data(), forType: PasteboardReader.concealedType)
+                #expect(await TestSupport.waitUntil {
+                    (try? store.fetchAll().contains { $0.kind == .image && $0.id != corruptImageID }) == true
+                })
+
+                let allHeaders = try store.fetchAll()
+                let corruptPlaceholder = try #require(allHeaders.first { $0.id == corruptImageID })
+                #expect(corruptPlaceholder.isCorruptPlaceholder)
+                let healthyImageHeader = try #require(allHeaders.first { $0.kind == .image && $0.id != corruptImageID })
+                #expect(!healthyImageHeader.isCorruptPlaceholder)
+                #expect(healthyImageHeader.assetPath != corruptImageURL.path)
+                #expect(FileManager.default.fileExists(atPath: corruptImageURL.path))
+                #expect(try Data(contentsOf: corruptImageURL) == originalEncBytes)
+            }
+        }
+
+        @Test
+        func customHistoryStoreCacheHooksFireOnlyAfterCommitAndPairAcrossOpenAndClose() throws {
+            nonisolated struct HookLog: Sendable {
+                var registeredOwners: [UUID] = []
+                var unregisteredOwners: [UUID] = []
+                var removedSVGIDs: [UUID] = []
+                var purgedOwnerSVGs: [UUID] = []
+                var removedThumbnailPaths: [String] = []
+                var removedThumbnailDirs: [URL] = []
+                var removedDragDirs: [URL] = []
+                var sensitiveCacheClears: Int = 0
+            }
+
+            try TestSupport.withTemporaryDirectory { supportDir in
+                let logLock = OSAllocatedUnfairLock<HookLog>(initialState: HookLog())
+                let hooks = HistoryStoreCacheHooks(
+                    registerSVGTextLoader: { _, _, ownerID in
+                        logLock.withLock { $0.registeredOwners.append(ownerID) }
+                    },
+                    unregisterSVGTextLoader: { ownerID in
+                        logLock.withLock { $0.unregisteredOwners.append(ownerID) }
+                    },
+                    removeSVGRendering: { clipID in
+                        logLock.withLock { $0.removedSVGIDs.append(clipID) }
+                    },
+                    removeOwnerSVGRenderings: { ownerID in
+                        logLock.withLock { $0.purgedOwnerSVGs.append(ownerID) }
+                    },
+                    removeThumbnailsForPath: { path in
+                        logLock.withLock { $0.removedThumbnailPaths.append(path) }
+                    },
+                    removeThumbnailsInDirectory: { dir in
+                        logLock.withLock { $0.removedThumbnailDirs.append(dir) }
+                    },
+                    removeDragCopiesInDirectory: { dir in
+                        logLock.withLock { $0.removedDragDirs.append(dir) }
+                    },
+                    removeAllSensitiveContentCaches: {
+                        logLock.withLock { $0.sensitiveCacheClears += 1 }
+                    }
+                )
+
+                let store = GRDBHistoryStore(
+                    directory: supportDir,
+                    keyProvider: InMemoryDatabaseKeyProvider(),
+                    cacheHooks: hooks
+                )
+
+                let afterOpen = logLock.withLock { $0 }
+                #expect(afterOpen.registeredOwners.count == 1)
+                let ownerID = try #require(afterOpen.registeredOwners.first)
+
+                let svgMarkup = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\"/></svg>"
+                let svgItem = try store.saveAndReconcileItem(ClipboardItem.fixture(kind: .text, text: svgMarkup))
+                let pngBytes = try TestSupport.makePNGData(pixelWidth: 12, pixelHeight: 12, color: .systemTeal)
+                let imgID = UUID()
+                let imgURL = try store.writeManagedAsset(pngData: pngBytes, role: .image, clipID: imgID, encrypted: false)
+                let imgItem = try store.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        id: imgID,
+                        kind: .image,
+                        assetPath: imgURL.path,
+                        imageDigest: store.computeImageDigest(forPNGData: pngBytes)
+                    )
+                )
+
+                // Rolled-back transaction must NOT invoke post-commit cache evictions!
+                struct RollbackSentinel: Error {}
+                let preRollbackSnapshot = logLock.withLock { $0 }
+                #expect(throws: RollbackSentinel.self) {
+                    try store.performInTransaction {
+                        _ = try store.setSensitivity(.sensitive, for: svgItem.id)
+                        _ = try store.setSensitivity(.sensitive, for: imgItem.id)
+                        try store.clear()
+                        throw RollbackSentinel()
+                    }
+                }
+                let postRollbackSnapshot = logLock.withLock { $0 }
+                #expect(postRollbackSnapshot.removedSVGIDs == preRollbackSnapshot.removedSVGIDs)
+                #expect(postRollbackSnapshot.purgedOwnerSVGs == preRollbackSnapshot.purgedOwnerSVGs)
+                #expect(postRollbackSnapshot.removedThumbnailPaths == preRollbackSnapshot.removedThumbnailPaths)
+
+                // Committed encryption upgrades & clear() fire post-commit hooks cleanly.
+                _ = try store.setSensitivity(.sensitive, for: svgItem.id)
+                _ = try store.setSensitivity(.sensitive, for: imgItem.id)
+                try store.clear()
+
+                let afterCommit = logLock.withLock { $0 }
+                #expect(afterCommit.removedSVGIDs.contains(svgItem.id))
+                #expect(afterCommit.removedThumbnailPaths.contains(imgURL.path))
+                #expect(afterCommit.purgedOwnerSVGs == [ownerID])
+
+                store.close()
+                let afterClose = logLock.withLock { $0 }
+                #expect(afterClose.unregisteredOwners == [ownerID])
+                #expect(afterClose.removedThumbnailDirs == [supportDir])
+                #expect(afterClose.removedDragDirs == [supportDir])
+                #expect(afterClose.sensitiveCacheClears >= 1)
+            }
+        }
+
+        @Test
+        func existingV5OpenBackfillsSVGPartialIndexAndBatchSyncHelpersHandleEdgeCases() throws {
+            try TestSupport.withTemporaryDirectory { supportDir in
+                let keyProvider = InMemoryDatabaseKeyProvider()
+                let svgMarkup = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\"><circle cx=\"6\" cy=\"6\" r=\"5\"/></svg>"
+
+                do {
+                    let store = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                    defer { store.close() }
+                    _ = try store.saveAndReconcileItem(ClipboardItem.fixture(kind: .text, text: svgMarkup))
+                }
+
+                let dbURL = supportDir.appendingPathComponent("History.sqlite")
+                #expect(try Self.queryInt(at: dbURL, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_clips_svg';") == 1)
+
+                var rawDB: OpaquePointer?
+                #expect(sqlite3_open_v2(dbURL.path, &rawDB, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+                defer { if let rawDB { sqlite3_close(rawDB) } }
+                #expect(sqlite3_exec(rawDB, "DROP INDEX idx_clips_svg;", nil, nil, nil) == SQLITE_OK)
+                sqlite3_close(rawDB)
+                rawDB = nil
+                #expect(try Self.queryInt(at: dbURL, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_clips_svg';") == 0)
+
+                // Reopening the existing v5 store backfills idx_clips_svg automatically.
+                let reopened = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                defer { reopened.close() }
+                let fetched = try reopened.fetchAll()
+                #expect(fetched.count == 1)
+                #expect(fetched.first?.isSVGText == true)
+                reopened.close()
+                #expect(try Self.queryInt(at: dbURL, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_clips_svg';") == 1)
+
+                // Exercise ImageAssetStore.fullFsyncBatch & secureUnlinkBatch on empty, missing+valid, and hard-linked files.
+                ImageAssetStore.fullFsyncBatch([] as [URL])
+                ImageAssetStore.secureUnlinkBatch([] as [URL])
+
+                let missingURL = supportDir.appendingPathComponent("missing-batch-file.bin")
+                let validA = supportDir.appendingPathComponent("batch-a.bin")
+                let validB = supportDir.appendingPathComponent("batch-b.bin")
+                let pinA = supportDir.appendingPathComponent("batch-a.pin")
+                let pinB = supportDir.appendingPathComponent("batch-b.pin")
+                try Data(repeating: 0x5A, count: 4096).write(to: validA)
+                try Data(repeating: 0x3C, count: 2048).write(to: validB)
+                #expect(Darwin.link(validA.path, pinA.path) == 0)
+                #expect(Darwin.link(validB.path, pinB.path) == 0)
+
+                ImageAssetStore.fullFsyncBatch([missingURL, validA, validB])
+                #expect(FileManager.default.fileExists(atPath: validA.path))
+                #expect(FileManager.default.fileExists(atPath: validB.path))
+
+                ImageAssetStore.secureUnlinkBatch([missingURL, validA, validB])
+                #expect(!FileManager.default.fileExists(atPath: validA.path))
+                #expect(!FileManager.default.fileExists(atPath: validB.path))
+                let zeroedBytesA = try Data(contentsOf: pinA)
+                #expect(zeroedBytesA.count == 4096)
+                #expect(zeroedBytesA.allSatisfy { $0 == 0 })
+                let zeroedBytesB = try Data(contentsOf: pinB)
+                #expect(zeroedBytesB.count == 2048)
+                #expect(zeroedBytesB.allSatisfy { $0 == 0 })
+            }
+        }
+
         // MARK: - Legacy Fixture Synthesis & Raw-Disk Scan Helpers
 
         private static func createSynthesizedLegacyDatabase(

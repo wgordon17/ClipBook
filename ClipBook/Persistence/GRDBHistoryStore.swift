@@ -1,8 +1,6 @@
-import CryptoKit
 import Darwin
 import Foundation
 import GRDB
-import GRDBSQLite
 import os
 
 nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
@@ -151,7 +149,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         role: AssetRole,
         clipID: UUID,
         encrypted: Bool,
-        preferredPlainExtension: String? = nil
+        preferredPlainExtension: String? = nil,
+        sync: Bool = true
     ) throws -> URL {
         let (_, keys) = try acquireAccess()
         defer {
@@ -163,7 +162,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             clipID: clipID,
             encrypted: encrypted,
             keys: keys,
-            preferredPlainExtension: preferredPlainExtension
+            preferredPlainExtension: preferredPlainExtension,
+            sync: sync
         )
     }
 
@@ -730,7 +730,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 html: resolvedHTML,
                 rtfData: resolvedRTF,
                 scope: effectiveScope,
-                tagNames: tagNames
+                tagNames: tagNames,
+                recomputesDerivedMetadata: item.storedContentKey == nil
             )
         }
     }
@@ -1118,31 +1119,15 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
     func fetchMostRecentItem(where isIncluded: (ClipboardItem) -> Bool) throws -> ClipboardItem? {
         try withRead { db, keys in
-            let sql = """
+            let stmt = try db.cachedStatement(sql: """
                 SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
                 FROM clips c
                 LEFT JOIN clip_contents cc ON cc.clipId = c.id
                 WHERE c.deletedAt IS NULL
                 ORDER BY c.copiedAt DESC
-                """
-            let decoder = Self.makeJSONDecoder()
-            let cursor = try Row.fetchCursor(db, sql: sql)
-            while let row = try cursor.next() {
-                guard let idString: String = row["id"] else {
-                    continue
-                }
-                let attachment = try self.fetchTagAttachment(in: db, clipIDString: idString)
-                if let item = try self.decodeBatchRow(
-                    row,
-                    attachment: attachment,
-                    hydratesBody: true,
-                    keys: keys,
-                    decoder: decoder
-                ), isIncluded(item) {
-                    return item
-                }
-            }
-            return nil
+                """)
+            let cursor = try Row.fetchCursor(stmt)
+            return try self.fetchFirstMatchingItem(in: db, cursor: cursor, keys: keys, where: isIncluded)
         }
     }
 
@@ -1738,7 +1723,8 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             text: preserved.plainText,
             qrCodeText: preserved.plainQR,
             scope: .body,
-            tagNames: nil
+            tagNames: nil,
+            recomputesDerivedMetadata: false
         )
         let parts = hydrated.contentKeyComponents
         return HistoryCrypto.contentKey(

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import GRDB
 
@@ -472,7 +471,8 @@ nonisolated extension GRDBHistoryStore {
             text: bodyText,
             qrCodeText: bodyQRCodeText,
             scope: .body,
-            tagNames: attachment.tagNames
+            tagNames: attachment.tagNames,
+            recomputesDerivedMetadata: false
         )
     }
 
@@ -632,32 +632,59 @@ nonisolated extension GRDBHistoryStore {
         }
     }
 
+    func fetchFirstMatchingItem(
+        in db: Database,
+        cursor: RowCursor,
+        keys: ClipBookDerivedKeys,
+        where predicate: (ClipboardItem) -> Bool
+    ) throws -> ClipboardItem? {
+        let decoder = Self.makeJSONDecoder()
+        var finished = false
+        var matched: ClipboardItem?
+        while !finished && matched == nil {
+            try autoreleasepool {
+                var count = 0
+                while count < Self.cursorBatchSize {
+                    guard let row = try cursor.next() else {
+                        finished = true
+                        return
+                    }
+                    count += 1
+                    guard let idString: String = row["id"] else {
+                        continue
+                    }
+                    let attachment = try self.fetchTagAttachment(in: db, clipIDString: idString)
+                    if let decoded = try self.decodeBatchRow(
+                        row,
+                        attachment: attachment,
+                        hydratesBody: true,
+                        keys: keys,
+                        decoder: decoder
+                    ), predicate(decoded) {
+                        matched = decoded
+                        return
+                    }
+                }
+            }
+        }
+        return matched
+    }
+
     func fetchMatchingItem(
         in db: Database,
         kind: ClipboardKind,
         contentKeyBlob: Data,
         keys: ClipBookDerivedKeys
     ) throws -> ClipboardItem? {
-        let sql = """
+        let stmt = try db.cachedStatement(sql: """
             SELECT c.*, cc.text AS bodyText, cc.qrCodeText AS bodyQRCodeText
             FROM clips c
             LEFT JOIN clip_contents cc ON cc.clipId = c.id
             WHERE c.kind = ? AND c.contentKey = ?
             ORDER BY c.deletedAt IS NOT NULL, c.copiedAt DESC
-            LIMIT 1
-            """
-        guard let row = try Row.fetchOne(db, sql: sql, arguments: [kind.rawValue, contentKeyBlob]),
-              let idString: String = row["id"] else {
-            return nil
-        }
-        let attachment = try fetchTagAttachment(in: db, clipIDString: idString)
-        return try decodeBatchRow(
-            row,
-            attachment: attachment,
-            hydratesBody: true,
-            keys: keys,
-            decoder: Self.makeJSONDecoder()
-        )
+            """)
+        let cursor = try Row.fetchCursor(stmt, arguments: [kind.rawValue, contentKeyBlob])
+        return try fetchFirstMatchingItem(in: db, cursor: cursor, keys: keys) { !$0.isCorruptPlaceholder }
     }
 
     func fetchFullItemByID(
@@ -731,7 +758,8 @@ nonisolated extension GRDBHistoryStore {
             html: html,
             rtfData: rtfData,
             scope: .full,
-            tagNames: attachment.tagNames
+            tagNames: attachment.tagNames,
+            recomputesDerivedMetadata: false
         )
     }
 
@@ -804,17 +832,14 @@ nonisolated extension GRDBHistoryStore {
     }
 
     func fetchTagAttachment(in db: Database, clipIDString: String) throws -> TagAttachment {
-        let cursor = try Row.fetchCursor(
-            db,
-            sql: """
-                SELECT ct.tagId, ct.sortOrder, t.name
-                FROM clip_tags ct
-                JOIN tags t ON t.id = ct.tagId
-                WHERE ct.clipId = ?
-                ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
-                """,
-            arguments: [clipIDString]
-        )
+        let stmt = try db.cachedStatement(sql: """
+            SELECT ct.tagId, ct.sortOrder, t.name
+            FROM clip_tags ct
+            JOIN tags t ON t.id = ct.tagId
+            WHERE ct.clipId = ?
+            ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
+            """)
+        let cursor = try Row.fetchCursor(stmt, arguments: [clipIDString])
         var attachment = TagAttachment()
         while let row = try cursor.next() {
             attachment.append(row: row)
@@ -823,16 +848,13 @@ nonisolated extension GRDBHistoryStore {
     }
 
     func fetchOrderedTagNames(in db: Database, clipIDString: String) throws -> [String] {
-        try String.fetchAll(
-            db,
-            sql: """
-                SELECT t.name
-                FROM clip_tags ct
-                JOIN tags t ON t.id = ct.tagId
-                WHERE ct.clipId = ?
-                ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
-                """,
-            arguments: [clipIDString]
-        )
+        let stmt = try db.cachedStatement(sql: """
+            SELECT t.name
+            FROM clip_tags ct
+            JOIN tags t ON t.id = ct.tagId
+            WHERE ct.clipId = ?
+            ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
+            """)
+        return try String.fetchAll(stmt, arguments: [clipIDString])
     }
 }

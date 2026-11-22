@@ -748,7 +748,8 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         html: String? = nil,
         rtfData: Data? = nil,
         scope: ClipboardContentScope = .full,
-        tagNames: [String]? = nil
+        tagNames: [String]? = nil,
+        recomputesDerivedMetadata: Bool = true
     ) -> ClipboardItem {
         let resolvedHTML: String?
         let resolvedRTFData: Data?
@@ -835,18 +836,20 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             containsPreviewSecret: containsPreviewSecret,
             containsRestSecret: containsRestSecret,
             hasRecognizedText: hasRecognizedText,
-            hasQRCodeText: Self.computeHasNonWhitespaceText(qrCodeText),
+            hasQRCodeText: recomputesDerivedMetadata ? Self.computeHasNonWhitespaceText(qrCodeText) : hasQRCodeText,
             isSVGText: isSVGText,
             isCorruptPlaceholder: isCorruptPlaceholder,
             storedContentKey: storedContentKey,
             searchRevision: searchRevision
         )
-        updated.syncDerivedMetadata(textModified: true, formattingModified: scope == .full)
+        if recomputesDerivedMetadata {
+            updated.syncDerivedMetadata(textModified: true, formattingModified: scope == .full)
+        }
         return updated
     }
 
     private static func computeHasNonWhitespaceText(_ value: String?) -> Bool {
-        !(value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        value?.unicodeScalars.contains(where: { !CharacterSet.whitespacesAndNewlines.contains($0) }) == true
     }
 
     private mutating func syncLoadedSecretFlags() {

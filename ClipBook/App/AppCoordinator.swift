@@ -69,6 +69,7 @@ final class AppCoordinator: ObservableObject {
     qos: .utility
   )
   private nonisolated let orphanSweepGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+  private nonisolated let startupMaintenanceGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
   private var retentionTimer: Timer?
   private var expiryTimer: Timer?
   private var isRetentionPromptPresented = false
@@ -171,11 +172,10 @@ final class AppCoordinator: ObservableObject {
     }
     let initialLockState = syncStoreLockState()
     var didLoadHistory = false
-    var startupTrashedItems: [ClipboardItem]?
     if initialLockState == .unlocked {
       didLoadHistory = loadHistory(sweepsCaches: false)
       if didLoadHistory && syncStoreOpenAndUnlocked() {
-        startupTrashedItems = runReadyStoreStartupMaintenance()
+        runReadyStoreStartupMaintenance()
       }
     } else {
       model.lastError = Self.lockedStoreErrorMessage(for: initialLockState)
@@ -193,7 +193,7 @@ final class AppCoordinator: ObservableObject {
     let isStoreReady = didLoadHistory && syncStoreOpenAndUnlocked()
     clipboardMonitor.isPaused = model.isPaused || !isStoreReady
     if isStoreReady {
-      resumePendingImageRecognitions(trashedItems: startupTrashedItems)
+      resumePendingImageRecognitions()
     }
     applyAppearance()
     #if DEBUG
@@ -216,7 +216,7 @@ final class AppCoordinator: ObservableObject {
     if model.preferences.clearHistoryOnQuit, historyStore.isOpen, historyStore.lockState == .unlocked {
       clearHistory()
     }
-    ImageDragFiles.removeAll()
+    ImageDragFiles.removeCopies(forSupportDirectory: supportDirectory)
     stopBackgroundWorkForTesting()
   }
 
@@ -237,24 +237,52 @@ final class AppCoordinator: ObservableObject {
     historyStore.isOpen && syncStoreLockState() == .unlocked
   }
 
-  @discardableResult
-  private func runReadyStoreStartupMaintenance() -> [ClipboardItem] {
+  private func runReadyStoreStartupMaintenance() {
     clearHistoryAfterRebootIfNeeded()
     applyRetention()
     deleteExpiredItems()
-    let trashedItems = model.isShowingTrash
-      ? model.trashedItems
-      : ((try? historyStore.fetchTrashedItems()) ?? [])
-    pruneFilePreviewCache(trashedItems: trashedItems)
+    pruneFilePreviewCache()
     removeOrphanedStoredFiles()
-    return trashedItems
   }
 
-  private func resumePendingImageRecognitions(trashedItems: [ClipboardItem]? = nil) {
-    let resolvedTrashedItems = trashedItems
-      ?? (model.isShowingTrash ? model.trashedItems : ((try? historyStore.fetchTrashedItems()) ?? []))
-    let resumableItems = model.items + resolvedTrashedItems
-    clipboardMonitor.resumePendingImageRecognitions(for: resumableItems)
+  private func resumePendingImageRecognitions() {
+    clipboardMonitor.resumePendingImageRecognitions(for: model.items)
+    if model.isShowingTrash {
+      clipboardMonitor.resumePendingImageRecognitions(for: model.trashedItems)
+      return
+    }
+
+    let historyStore = self.historyStore
+    let startupMaintenanceGeneration = self.startupMaintenanceGeneration
+    let generation = startupMaintenanceGeneration.withLock { $0 }
+    maintenanceQueue.async { [weak self] in
+      guard startupMaintenanceGeneration.withLock({ $0 == generation }),
+            historyStore.isOpen,
+            historyStore.lockState == .unlocked,
+            let trashedItems = try? historyStore.fetchTrashedItems() else {
+        return
+      }
+      let candidates = trashedItems.filter {
+        $0.kind == .image
+          && $0.hasUnverifiedEncryptedImageAsset
+          && !SensitiveContent.shouldEncryptAtRest($0)
+          && !$0.hasRecognizedText
+      }
+      guard !candidates.isEmpty else {
+        return
+      }
+      DispatchQueue.main.async { [weak self] in
+        MainActor.assumeIsolated {
+          guard let self,
+                self.startupMaintenanceGeneration.withLock({ $0 == generation }),
+                self.historyStore.isOpen,
+                self.historyStore.lockState == .unlocked else {
+            return
+          }
+          self.clipboardMonitor.resumePendingImageRecognitions(for: candidates)
+        }
+      }
+    }
   }
 
   @discardableResult
@@ -265,8 +293,8 @@ final class AppCoordinator: ObservableObject {
       _ = syncStoreLockState()
       let didLoadHistory = loadHistory(sweepsCaches: false)
       if didLoadHistory && syncStoreOpenAndUnlocked() {
-        let trashedItems = runReadyStoreStartupMaintenance()
-        resumePendingImageRecognitions(trashedItems: trashedItems)
+        runReadyStoreStartupMaintenance()
+        resumePendingImageRecognitions()
       }
       let finalReady = didLoadHistory && syncStoreOpenAndUnlocked()
       clipboardMonitor.isPaused = model.isPaused || !finalReady
@@ -301,6 +329,7 @@ final class AppCoordinator: ObservableObject {
 
   nonisolated func cancelOrphanedFileSweeps(waitUntilDone: Bool = true) {
     orphanSweepGeneration.withLock { $0 &+= 1 }
+    startupMaintenanceGeneration.withLock { $0 &+= 1 }
     if waitUntilDone {
       maintenanceQueue.sync {}
     }
@@ -676,6 +705,9 @@ final class AppCoordinator: ObservableObject {
             self.pruneFilePreviewCache()
             self.removeOrphanedStoredFiles()
           }
+          if isReady {
+            self.resumePendingImageRecognitions()
+          }
           completion(.success(result))
           if !expiredItems.isEmpty {
             self.confirmKeepingExpiredImportedItems(expiredItems)
@@ -689,9 +721,13 @@ final class AppCoordinator: ObservableObject {
           self.deferredRecognitionsDuringArchive.removeAll()
           ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: self.supportDirectory)
           self.clipboardMonitor.start(preferences: self.model.preferences)
-          self.clipboardMonitor.isPaused = self.model.isPaused || !self.syncStoreOpenAndUnlocked()
+          let isReady = self.syncStoreOpenAndUnlocked()
+          self.clipboardMonitor.isPaused = self.model.isPaused || !isReady
           self.isHistoryArchiveOperationRunning = false
           self.deleteExpiredItems()
+          if isReady {
+            self.resumePendingImageRecognitions()
+          }
           completion(.failure(error))
         }
       }
@@ -977,7 +1013,7 @@ final class AppCoordinator: ObservableObject {
       return false
     }
     cancelOrphanedFileSweeps(waitUntilDone: false)
-    ImageDragFiles.removeAll()
+    ImageDragFiles.removeCopies(forSupportDirectory: supportDirectory)
     do {
       let keepingItems = model.preferences.keepFavoritesOnClearHistory
       let deletedItems = model.items.filter { !keepingItems || !shouldKeepWhenClearingHistory($0) }
@@ -987,7 +1023,10 @@ final class AppCoordinator: ObservableObject {
         deletedItems.forEach(removeLinkPreviewFiles)
         removeFilePreviewFiles(for: deletedItems, remainingItems: model.items.filter(shouldKeepWhenClearingHistory))
       } else {
-        ImageAssetThumbnailLoader.shared.removeAll()
+        ImageAssetThumbnailLoader.shared.removeThumbnails(inDirectory: supportDirectory)
+        for path in Set(deletedItems.flatMap(\.filePaths)) {
+          ImageAssetThumbnailLoader.shared.removeThumbnails(forPath: path)
+        }
         scrubManagedDirectoryFiles(at: linkPreviewsDirectory)
         try? fileManager.removeItem(at: linkPreviewsDirectory)
         filePreviewCache.removeAll()
@@ -996,7 +1035,9 @@ final class AppCoordinator: ObservableObject {
       model.remove(Set(deletedItems.map(\.id)))
       HistoryRowTextCache.removeAll()
       SensitiveContent.removeAll()
-      SVGImageRenderer.shared.removeAll()
+      for item in deletedItems where item.isSVGText {
+        SVGImageRenderer.shared.removeRendering(for: item.id)
+      }
       return true
     } catch {
       _ = syncStoreLockState()
@@ -2943,12 +2984,14 @@ final class AppCoordinator: ObservableObject {
       removeLinkPreviewFiles(for: updated)
       let imagePath = try writeLinkPreviewImage(
         preview?.image,
+        preencodedPNGData: preview?.imagePNGData,
         itemID: updated.id,
         role: .linkPreview,
         encrypted: encryptAssets
       )
       let faviconPath = try writeLinkPreviewImage(
         preview?.favicon,
+        preencodedPNGData: preview?.faviconPNGData,
         itemID: updated.id,
         role: .linkFavicon,
         encrypted: encryptAssets
@@ -3007,12 +3050,12 @@ final class AppCoordinator: ObservableObject {
 
   private func writeLinkPreviewImage(
     _ image: NSImage?,
+    preencodedPNGData: Data? = nil,
     itemID: UUID,
     role: AssetRole,
     encrypted: Bool
   ) throws -> String? {
-    guard let image,
-          let data = pngData(from: image) else {
+    guard let data = preencodedPNGData ?? image.flatMap(pngData(from:)) else {
       return nil
     }
 
@@ -3219,18 +3262,40 @@ final class AppCoordinator: ObservableObject {
     }
   }
 
-  private func pruneFilePreviewCache(trashedItems: [ClipboardItem]? = nil) {
-    filePreviewCache.prune {
-      var keptFilePaths = Set<String>()
-      for item in model.items where !item.filePaths.isEmpty && !SensitiveContent.shouldEncryptAtRest(item) {
-        keptFilePaths.formUnion(item.filePaths)
+  private func pruneFilePreviewCache() {
+    guard !isHistoryArchiveOperationRunning,
+          historyStore.isOpen,
+          historyStore.lockState == .unlocked else {
+      return
+    }
+
+    var activeKeptPaths = Set<String>()
+    for item in model.items where !item.filePaths.isEmpty && !SensitiveContent.shouldEncryptAtRest(item) {
+      activeKeptPaths.formUnion(item.filePaths)
+    }
+    let inMemoryTrashedItems: [ClipboardItem]? = model.isShowingTrash ? model.trashedItems : nil
+    let filePreviewCache = self.filePreviewCache
+    let historyStore = self.historyStore
+    let startupMaintenanceGeneration = self.startupMaintenanceGeneration
+    let generation = startupMaintenanceGeneration.withLock {
+      $0 &+= 1
+      return $0
+    }
+
+    maintenanceQueue.async {
+      guard startupMaintenanceGeneration.withLock({ $0 == generation }),
+            historyStore.isOpen,
+            historyStore.lockState == .unlocked else {
+        return
       }
-      let resolvedTrashedItems = trashedItems
-        ?? (model.isShowingTrash ? model.trashedItems : ((try? historyStore.fetchTrashedItems()) ?? []))
-      for item in resolvedTrashedItems where !item.filePaths.isEmpty && !SensitiveContent.shouldEncryptAtRest(item) {
-        keptFilePaths.formUnion(item.filePaths)
+      filePreviewCache.prune {
+        var keptFilePaths = activeKeptPaths
+        let resolvedTrashedItems = inMemoryTrashedItems ?? ((try? historyStore.fetchTrashedItems()) ?? [])
+        for item in resolvedTrashedItems where !item.filePaths.isEmpty && !SensitiveContent.shouldEncryptAtRest(item) {
+          keptFilePaths.formUnion(item.filePaths)
+        }
+        return keptFilePaths
       }
-      return keptFilePaths
     }
   }
 

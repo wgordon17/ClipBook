@@ -343,6 +343,9 @@ nonisolated final class ClipBookArchiveService: Sendable {
                 }
 
                 try historyStore.restoreFromTrash(ids: Array(importedItemIDs))
+                if !importSession.writtenFilesByRoleKey.isEmpty {
+                    ImageAssetStore.fullFsyncBatch(importSession.writtenFilesByRoleKey.values)
+                }
             }
         } catch {
             importSession.rollbackStagedFiles(using: fileManager)
@@ -817,7 +820,9 @@ nonisolated final class ClipBookArchiveService: Sendable {
                     pngData: payload.bytes,
                     role: role,
                     clipID: itemID,
-                    encrypted: true
+                    encrypted: true,
+                    preferredPlainExtension: nil,
+                    sync: false
                 )
             } else {
                 let ext = ImageAssetStore.plainAssetExtension(
@@ -829,7 +834,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
                     role: role,
                     clipID: itemID,
                     encrypted: false,
-                    preferredPlainExtension: ext
+                    preferredPlainExtension: ext,
+                    sync: false
                 )
             }
             writtenFilesByRoleKey[roleKey] = writtenURL
@@ -1361,55 +1367,49 @@ nonisolated final class ClipBookArchiveService: Sendable {
     }
 
     static func readRegularFileNoFollow(at url: URL, relativePath: String) throws -> Data {
-        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
-        guard fd >= 0 else {
-            let err = errno
-            if err == ELOOP {
-                throw ClipBookArchiveError.invalidAssetPath(relativePath)
-            }
-            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
-        }
-        defer {
-            _ = Darwin.close(fd)
-        }
-
-        var fileStat = stat()
-        guard Darwin.fstat(fd, &fileStat) == 0,
-              (fileStat.st_mode & S_IFMT) == S_IFREG else {
-            throw ClipBookArchiveError.invalidAssetPath(relativePath)
-        }
-
         var data = Data()
-        data.reserveCapacity(max(0, Int(clamping: fileStat.st_size)))
-
-        let chunkSize = 64 * 1024
-        var buffer = [UInt8](repeating: 0, count: chunkSize)
-        try buffer.withUnsafeMutableBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress else { return }
-            while true {
-                let bytesRead = Darwin.read(fd, baseAddress, chunkSize)
-                if bytesRead > 0 {
-                    data.append(baseAddress.assumingMemoryBound(to: UInt8.self), count: bytesRead)
-                } else if bytesRead == 0 {
-                    break
-                } else if errno == EINTR {
-                    continue
-                } else {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        try streamRegularFileNoFollow(
+            at: url,
+            relativePath: relativePath,
+            makeOpenOrReadError: { err in POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO) },
+            reserveCapacity: { data.reserveCapacity($0) },
+            onChunk: { chunk in
+                if let base = chunk.baseAddress?.assumingMemoryBound(to: UInt8.self), chunk.count > 0 {
+                    data.append(base, count: chunk.count)
                 }
             }
-        }
+        )
         return data
     }
 
     static func sha256HexNoFollow(at url: URL, relativePath: String) throws -> String {
+        var hasher = SHA256()
+        try streamRegularFileNoFollow(
+            at: url,
+            relativePath: relativePath,
+            makeOpenOrReadError: { _ in ClipBookArchiveError.corruptedEncryptedArchive(relativePath) },
+            onChunk: { chunk in
+                hasher.update(bufferPointer: chunk)
+            }
+        )
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func streamRegularFileNoFollow(
+        at url: URL,
+        relativePath: String,
+        makeOpenOrReadError: (_ errnoValue: Int32) -> Error,
+        reserveCapacity: (_ byteSize: Int) -> Void = { _ in },
+        onChunk: (UnsafeRawBufferPointer) -> Void
+    ) throws {
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
         guard fd >= 0 else {
             let err = errno
             if err == ELOOP {
                 throw ClipBookArchiveError.invalidAssetPath(relativePath)
             }
-            throw ClipBookArchiveError.corruptedEncryptedArchive(relativePath)
+            throw makeOpenOrReadError(err)
         }
         defer {
             _ = Darwin.close(fd)
@@ -1421,7 +1421,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
             throw ClipBookArchiveError.invalidAssetPath(relativePath)
         }
 
-        var hasher = SHA256()
+        reserveCapacity(max(0, Int(clamping: fileStat.st_size)))
+
         let chunkSize = 64 * 1024
         var buffer = [UInt8](repeating: 0, count: chunkSize)
         try buffer.withUnsafeMutableBytes { rawBuffer in
@@ -1429,19 +1430,16 @@ nonisolated final class ClipBookArchiveService: Sendable {
             while true {
                 let bytesRead = Darwin.read(fd, baseAddress, chunkSize)
                 if bytesRead > 0 {
-                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: baseAddress, count: bytesRead))
+                    onChunk(UnsafeRawBufferPointer(start: baseAddress, count: bytesRead))
                 } else if bytesRead == 0 {
                     break
                 } else if errno == EINTR {
                     continue
                 } else {
-                    throw ClipBookArchiveError.corruptedEncryptedArchive(relativePath)
+                    throw makeOpenOrReadError(errno)
                 }
             }
         }
-
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     static func isValidLowercaseSHA256Hex(_ hex: String) -> Bool {

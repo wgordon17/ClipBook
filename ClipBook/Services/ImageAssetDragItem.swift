@@ -143,7 +143,8 @@ nonisolated enum ImageDragFiles {
       let url = folder.appendingPathComponent(safeLeaf, isDirectory: false)
       do {
         try ImageAssetStore.writeExclusivePrivateFile(pngData, to: url)
-        tracked[supportDirPath, default: []].insert(folder.path)
+        let canonicalFolderPath = ImageAssetStore.canonicalDirectoryURL(folder).path
+        tracked[supportDirPath, default: []].insert(canonicalFolderPath)
         return url
       } catch {
         scrubAndRemoveLocked(at: folder)
@@ -177,7 +178,7 @@ nonisolated enum ImageDragFiles {
         if let timestamp, timestamp < cutoff {
           scrubAndRemoveLocked(at: entry)
         } else {
-          survivingFolderPaths.insert(entry.path)
+          survivingFolderPaths.insert(ImageAssetStore.canonicalDirectoryURL(entry).path)
         }
       }
       pruneTrackedFoldersLocked(&tracked, keepingOnly: survivingFolderPaths)

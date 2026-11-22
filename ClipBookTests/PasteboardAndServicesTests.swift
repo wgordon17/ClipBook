@@ -1603,7 +1603,7 @@ extension SharedProcessStateTests {
                 }
 
                 // 2. Non-sensitive plain .png drag omits ConcealedType.
-                try TestSupport.withUniquePasteboard { pasteboard in
+                TestSupport.withUniquePasteboard { pasteboard in
                     pasteboard.clearContents()
                     let plainDrag = ImageAssetDragItem.make(
                         assetURL: plainURL,
@@ -1618,7 +1618,7 @@ extension SharedProcessStateTests {
                 }
 
                 // 3. Transplanted / downgraded / tampered drag items attach NO .fileURL and yield nil PNG/TIFF data.
-                try TestSupport.withUniquePasteboard { pasteboard in
+                TestSupport.withUniquePasteboard { pasteboard in
                     pasteboard.clearContents()
                     let transplantedDrag = ImageAssetDragItem.make(
                         assetURL: encURL,
