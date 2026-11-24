@@ -904,6 +904,10 @@ extension SharedProcessStateTests {
             for testCase in errorCases {
                 let msg = PersistenceErrorLocalization.message(for: testCase.error)
                 #expect(!msg.isEmpty, Comment(rawValue: "en \(testCase.label)"))
+                #expect(
+                    msg == testCase.error.localizedDescription,
+                    Comment(rawValue: "en \(testCase.label) matches errorDescription")
+                )
                 if let sub = testCase.expectedSubstring {
                     #expect(msg.contains(sub), Comment(rawValue: "en \(testCase.label) missing \(sub)"))
                 }

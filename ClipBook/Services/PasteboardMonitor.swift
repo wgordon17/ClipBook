@@ -83,6 +83,8 @@ final class PasteboardMonitor {
     nonisolated private static func makeFindStoredImageCallback(store: HistoryStore) -> @Sendable (String) -> StoredImage? {
         { digest in
             guard let item = try? store.fetchItem(kind: .image, contentKey: digest),
+                  !item.isCorruptPlaceholder,
+                  !(item.hasUnverifiedEncryptedImageAsset && !item.hasRecognizedText && !item.hasQRCodeText),
                   let assetPath = item.assetPath else {
                 return nil
             }
@@ -118,11 +120,7 @@ final class PasteboardMonitor {
     }
 
     func resumePendingImageRecognitions(for items: [ClipboardItem]) {
-        for item in items where item.kind == .image
-            && item.hasUnverifiedEncryptedImageAsset
-            && !SensitiveContent.shouldEncryptAtRest(item)
-            && !item.hasRecognizedText
-            && !item.hasQRCodeText
+        for item in items where item.needsPendingImageRecognition
             && !inFlightImageRecognitionIDs.contains(item.id) {
             guard let assetURL = item.assetURL,
                   let pngData = try? ImageAssetStore.readAssetData(
@@ -515,7 +513,7 @@ final class PasteboardMonitor {
     }
 
     @discardableResult
-    private func capture(_ item: ClipboardItem) throws -> ClipboardItem {
+    private func capture(_ item: ClipboardItem) throws -> ClipboardItem? {
         let sourceItemID = item.id
         let pendingPNGData = pendingPNGDataByItemID.removeValue(forKey: sourceItemID)
         var pendingRecognition = pendingRecognitionsByItemID.removeValue(forKey: sourceItemID)
@@ -526,14 +524,10 @@ final class PasteboardMonitor {
         var item = item
         let updatesCopySequence = preferences.copySequenceModeEnabled
         var updatedItems: [ClipboardItem] = []
-        if updatesCopySequence {
-            let sequenceTrackingResult = try itemWithTrackedCopySequence(item)
-            item = sequenceTrackingResult.item
-            updatedItems = sequenceTrackingResult.updatedItems
-        }
 
         var newlyStagedAssetURL: URL?
-        if item.kind == .image, let pngData = pendingPNGData {
+        var pngDataToStage: (data: Data, targetID: UUID)?
+        if item.kind == .image {
             let parts = item.contentKeyComponents
             let fetchedExisting = try? historyStore.fetchItem(
                 kind: .image,
@@ -541,23 +535,33 @@ final class PasteboardMonitor {
                 htmlDigest: parts.htmlDigest
             )
             let existing = (fetchedExisting?.isCorruptPlaceholder == true) ? nil : fetchedExisting
-            let targetID = existing?.id ?? sourceItemID
-            item.id = targetID
-            if let existingAssetPath = existing?.assetPath,
-               fileManager.fileExists(atPath: existingAssetPath) {
-                item.assetPath = existingAssetPath
-                item.text = existing?.text
-                item.qrCodeText = existing?.qrCodeText
-                pendingRecognition = nil
-            } else {
-                let stagedURL = try historyStore.writeManagedAsset(
-                    pngData: pngData,
-                    role: .image,
-                    clipID: targetID,
-                    encrypted: true
-                )
-                newlyStagedAssetURL = stagedURL
-                item.assetPath = stagedURL.path
+
+            if let pngData = pendingPNGData {
+                let targetID = existing?.id ?? sourceItemID
+                item.id = targetID
+                if let existing,
+                   let existingAssetPath = existing.assetPath,
+                   fileManager.fileExists(atPath: existingAssetPath) {
+                    guard adoptExistingImageAsset(existing, at: existingAssetPath, into: &item) else {
+                        return nil
+                    }
+                    if !(existing.needsPendingImageRecognition && !inFlightImageRecognitionIDs.contains(targetID)) {
+                        pendingRecognition = nil
+                    }
+                } else {
+                    pngDataToStage = (pngData, targetID)
+                }
+            } else if let currentAssetPath = item.assetPath,
+                      !fileManager.fileExists(atPath: currentAssetPath) {
+                if let existing,
+                   let existingAssetPath = existing.assetPath,
+                   fileManager.fileExists(atPath: existingAssetPath) {
+                    guard adoptExistingImageAsset(existing, at: existingAssetPath, into: &item) else {
+                        return nil
+                    }
+                } else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
             }
         } else if pendingRecognition != nil, item.kind == .file {
             let parts = item.contentKeyComponents
@@ -571,6 +575,23 @@ final class PasteboardMonitor {
                 item.text = storedItem.text
                 item.qrCodeText = storedItem.qrCodeText
             }
+        }
+
+        if updatesCopySequence {
+            let sequenceTrackingResult = try itemWithTrackedCopySequence(item)
+            item = sequenceTrackingResult.item
+            updatedItems = sequenceTrackingResult.updatedItems
+        }
+
+        if let (pngData, targetID) = pngDataToStage {
+            let stagedURL = try historyStore.writeManagedAsset(
+                pngData: pngData,
+                role: .image,
+                clipID: targetID,
+                encrypted: true
+            )
+            newlyStagedAssetURL = stagedURL
+            item.assetPath = stagedURL.path
         }
 
         let capturedItem: ClipboardItem
@@ -594,6 +615,29 @@ final class PasteboardMonitor {
             }
         }
         return capturedItem
+    }
+
+    private func adoptExistingImageAsset(
+        _ existing: ClipboardItem,
+        at existingAssetPath: String,
+        into item: inout ClipboardItem
+    ) -> Bool {
+        item.assetPath = existingAssetPath
+        item.text = existing.text
+        item.qrCodeText = existing.qrCodeText
+        if preferences.sensitiveContentLifetime != ContentLifetime.keep,
+           isSensitiveContent(item) {
+            if preferences.sensitiveContentLifetime == ContentLifetime.dontSave {
+                return false
+            }
+            if let ocrExpiry = ContentLifetime.expiryDate(
+                for: preferences.sensitiveContentLifetime,
+                from: item.copiedAt
+            ) {
+                item.expiresAt = item.expiresAt.map { min($0, ocrExpiry) } ?? ocrExpiry
+            }
+        }
+        return true
     }
 
     private func recognizeText(ofPNGData pngData: Data, inItemWithID itemID: ClipboardItem.ID) {

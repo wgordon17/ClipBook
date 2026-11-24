@@ -81,9 +81,7 @@ nonisolated extension GRDBHistoryStore {
             try? migratingQueue?.close()
             try? legacyQueue?.close()
             removeMigratingArtifacts()
-            for stagedURL in context.stagedEncURLs {
-                ImageAssetStore.secureUnlink(at: stagedURL)
-            }
+            ImageAssetStore.secureUnlinkBatch(context.stagedEncURLs)
             throw error
         }
     }
@@ -408,49 +406,24 @@ nonisolated extension GRDBHistoryStore {
         keys: ClipBookDerivedKeys
     ) throws {
         if SensitiveContent.shouldEncryptAtRest(item) {
-            item.assetPath = try stageMigratedEncryptedAsset(
-                sourcePath: item.assetPath,
-                role: .image,
-                clipID: item.id,
-                keys: keys,
-                context: context
-            )
-            if var details = item.linkPreviewDetails {
-                details.imagePath = try stageMigratedEncryptedAsset(
-                    sourcePath: details.imagePath,
-                    role: .linkPreview,
-                    clipID: item.id,
+            let clipID = item.id
+            try Self.mapManagedAssetPaths(on: &item) { sourcePath, role in
+                try stageMigratedEncryptedAsset(
+                    sourcePath: sourcePath,
+                    role: role,
+                    clipID: clipID,
                     keys: keys,
                     context: context
                 )
-                details.faviconPath = try stageMigratedEncryptedAsset(
-                    sourcePath: details.faviconPath,
-                    role: .linkFavicon,
-                    clipID: item.id,
-                    keys: keys,
-                    context: context
-                )
-                item.linkPreviewDetails = details
             }
             return
         }
 
-        if let assetPath = item.assetPath {
+        Self.mapManagedAssetPaths(on: &item) { path, _ in
             context.nonSensitiveReferencedCanonicalURLs.insert(
-                ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: assetPath, isDirectory: false))
+                ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: path, isDirectory: false))
             )
-        }
-        if let details = item.linkPreviewDetails {
-            if let imagePath = details.imagePath {
-                context.nonSensitiveReferencedCanonicalURLs.insert(
-                    ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: imagePath, isDirectory: false))
-                )
-            }
-            if let faviconPath = details.faviconPath {
-                context.nonSensitiveReferencedCanonicalURLs.insert(
-                    ImageAssetStore.canonicalFileURL(URL(fileURLWithPath: faviconPath, isDirectory: false))
-                )
-            }
+            return path
         }
     }
 
@@ -505,14 +478,15 @@ nonisolated extension GRDBHistoryStore {
             throw HistoryStoreError.migrationFailed("Unable to rename History.v5.migrating.sqlite into place (errno \(errno))")
         }
 
-        for scrubURL in [scrubbingDBURL, scrubbingWALURL, scrubbingSHMURL, scrubbingJournalURL]
-        where Self.fileOrSymlinkExists(at: scrubURL) {
-            unlinkOrScrubSupportEntry(at: scrubURL)
-        }
+        let existingScrubURLs = [scrubbingDBURL, scrubbingWALURL, scrubbingSHMURL, scrubbingJournalURL]
+            .filter { Self.fileOrSymlinkExists(at: $0) }
+        unlinkOrScrubSupportEntries(existingScrubURLs)
 
-        for legacyURL in unsharedSensitiveLegacyURLs {
-            ImageAssetStore.secureUnlink(at: legacyURL)
-            cacheHooks.removeThumbnailsForPath(legacyURL.path)
+        if !unsharedSensitiveLegacyURLs.isEmpty {
+            ImageAssetStore.secureUnlinkBatch(unsharedSensitiveLegacyURLs)
+            for legacyURL in unsharedSensitiveLegacyURLs {
+                cacheHooks.removeThumbnailsForPath(legacyURL.path)
+            }
         }
     }
 
@@ -573,11 +547,13 @@ nonisolated extension GRDBHistoryStore {
 
     private func removeMigratingArtifacts() {
         let suffixes = ["", "-wal", "-shm", "-journal"]
-        for suffix in suffixes {
+        let urlsToUnlink = suffixes.compactMap { suffix -> URL? in
             let url = URL(fileURLWithPath: migratingURL.path + suffix, isDirectory: false)
-            if Self.fileOrSymlinkExists(at: url) && !Self.sameInode(url, databaseURL) {
-                ImageAssetStore.secureUnlink(at: url)
+            guard Self.fileOrSymlinkExists(at: url) && !Self.sameInode(url, databaseURL) else {
+                return nil
             }
+            return url
         }
+        ImageAssetStore.secureUnlinkBatch(urlsToUnlink)
     }
 }

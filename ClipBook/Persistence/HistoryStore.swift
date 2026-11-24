@@ -91,6 +91,8 @@ nonisolated protocol HistoryStore: Sendable {
     /// The files every item in the store refers to, its image and its link
     /// preview pictures, the items in the Trash included.
     func fetchStoredFilePaths() throws -> Set<String>
+    /// The asset paths referenced by items currently in the Trash.
+    func fetchTrashedAssetPaths() throws -> Set<String>
     func fetchSearchTexts(
         for ids: [UUID],
         trashed: Bool,
@@ -128,6 +130,10 @@ nonisolated extension HistoryStore {
             preferredPlainExtension: preferredPlainExtension,
             sync: true
         )
+    }
+
+    func fetchTrashedAssetPaths() throws -> Set<String> {
+        Set(try fetchTrashedItems().compactMap(\.assetPath))
     }
 
     func fetchItem(kind: ClipboardKind, contentKey: String) throws -> ClipboardItem? {

@@ -2559,6 +2559,51 @@ enum SQLiteHistoryStoreAndArchiveTests {
         }
 
         @Test
+        func capturePreservesLiveOnDiskAssetPathOverStaleDeletedPath() throws {
+            try TestSupport.withTemporaryDirectory { supportDir in
+                let keyProvider = InMemoryDatabaseKeyProvider()
+                let store = GRDBHistoryStore(directory: supportDir, keyProvider: keyProvider)
+                defer { store.close() }
+
+                let clipID = UUID()
+                let pngBytes = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemGreen)
+                let livePNGURL = try store.writeManagedAsset(
+                    pngData: pngBytes,
+                    role: .image,
+                    clipID: clipID,
+                    encrypted: false
+                )
+                let digest = store.computeImageDigest(forPNGData: pngBytes)
+                let initialItem = ClipboardItem.fixture(
+                    id: clipID,
+                    kind: .image,
+                    assetPath: livePNGURL.path,
+                    imageDigest: digest,
+                    copiedAt: Date(timeIntervalSince1970: 1_710_100_000)
+                )
+                _ = try store.capture(initialItem, updatesCopySequence: false)
+
+                let staleDeletedEncPath = supportDir
+                    .appendingPathComponent("Images", isDirectory: true)
+                    .appendingPathComponent("\(clipID.uuidString).enc", isDirectory: false)
+                    .path
+                #expect(!FileManager.default.fileExists(atPath: staleDeletedEncPath))
+
+                let staleRecopy = ClipboardItem.fixture(
+                    id: UUID(),
+                    kind: .image,
+                    assetPath: staleDeletedEncPath,
+                    imageDigest: digest,
+                    copiedAt: Date(timeIntervalSince1970: 1_710_100_010)
+                )
+                let updated = try store.capture(staleRecopy, updatesCopySequence: false)
+                #expect(updated.id == clipID)
+                #expect(updated.assetPath == livePNGURL.path)
+                #expect(FileManager.default.fileExists(atPath: livePNGURL.path))
+            }
+        }
+
+        @Test
         func customHistoryStoreCacheHooksFireOnlyAfterCommitAndPairAcrossOpenAndClose() throws {
             nonisolated struct HookLog: Sendable {
                 var registeredOwners: [UUID] = []
@@ -2718,6 +2763,23 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 let zeroedBytesB = try Data(contentsOf: pinB)
                 #expect(zeroedBytesB.count == 2048)
                 #expect(zeroedBytesB.allSatisfy { $0 == 0 })
+
+                // Exercise ImageAssetStore.secureRemoveItem on a nested tree with hard-linked files.
+                let nestedTreeRoot = supportDir.appendingPathComponent("nested-scrub-tree", isDirectory: true)
+                let nestedLeafDir = nestedTreeRoot.appendingPathComponent("level1/level2", isDirectory: true)
+                try FileManager.default.createDirectory(at: nestedLeafDir, withIntermediateDirectories: true)
+                let treeFileA = nestedLeafDir.appendingPathComponent("secret.bin")
+                let treeFileAHardLink = nestedTreeRoot.appendingPathComponent("secret.bin.pin")
+                let externalPin = supportDir.appendingPathComponent("nested-secret-external.pin")
+                try Data(repeating: 0x7E, count: 3072).write(to: treeFileA)
+                #expect(Darwin.link(treeFileA.path, treeFileAHardLink.path) == 0)
+                #expect(Darwin.link(treeFileA.path, externalPin.path) == 0)
+
+                ImageAssetStore.secureRemoveItem(at: nestedTreeRoot)
+                #expect(!FileManager.default.fileExists(atPath: nestedTreeRoot.path))
+                let zeroedTreeBytes = try Data(contentsOf: externalPin)
+                #expect(zeroedTreeBytes.count == 3072)
+                #expect(zeroedTreeBytes.allSatisfy { $0 == 0 })
             }
         }
 

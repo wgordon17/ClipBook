@@ -9,9 +9,10 @@ import Testing
 import UniformTypeIdentifiers
 import WebKit
 
-@Suite(.serialized)
-enum ViewsAndWindowsTests {
-    @Suite
+// These suites touch process-global state (`L10n`, `NSApp` focus/appearance,
+// `ImageAssetThumbnailLoader.shared`, `SVGImageRenderer.shared`, `ImageDragFiles`).
+extension SharedProcessStateTests {
+    @Suite(.serialized)
     struct RowBuilderAndFormattingTests {
         @Test
         func historyTableRowBuilderGroupingAndDST() throws {
@@ -211,7 +212,7 @@ enum ViewsAndWindowsTests {
         }
     }
 
-    @Suite
+    @Suite(.serialized)
     struct ViewsDialogsAndWindowsTests {
         private static let rowFrame = NSRect(x: 0, y: 0, width: 480, height: HistoryRow.height)
 
@@ -1130,11 +1131,6 @@ enum ViewsAndWindowsTests {
             return results
         }
     }
-}
-
-// Saving applies appearance and language, which are process-wide, and key-window
-// presentation mutates process-global NSApp focus state.
-extension SharedProcessStateTests {
     /// A link row decodes the pictures of a stored preview in the background via
     /// `ImageAssetThumbnailLoader.shared`.
     @Suite(.serialized)
@@ -1618,7 +1614,7 @@ extension SharedProcessStateTests {
         }
     }
 
-    @Suite
+    @Suite(.serialized)
     struct SettingsViewWiringTests {
         @MainActor
         private static func makeLockedCoordinatorHarness(
@@ -2152,7 +2148,7 @@ extension SharedProcessStateTests {
         }
     }
 
-    @Suite
+    @Suite(.serialized)
     struct LazyPreviewDragAndSVGHydrationTests {
         private static let sentinel = "TAIL_SENTINEL_AT_40KB"
 

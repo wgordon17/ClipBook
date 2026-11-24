@@ -1070,6 +1070,14 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         hasEncryptedImageAsset && sensitivity != .notSensitive
     }
 
+    var needsPendingImageRecognition: Bool {
+        kind == .image
+            && hasUnverifiedEncryptedImageAsset
+            && !SensitiveContent.shouldEncryptAtRest(self)
+            && !hasRecognizedText
+            && !hasQRCodeText
+    }
+
     var quickLookURL: URL? {
         if hasEncryptedImageAsset {
             return nil

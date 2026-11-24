@@ -486,11 +486,17 @@ nonisolated final class ImageAssetStore: Sendable {
         _ = Darwin.unlink(path)
     }
 
+    private struct InodeKey: Hashable {
+        let dev: dev_t
+        let ino: ino_t
+    }
+
     static func secureUnlinkBatch<S: Sequence>(_ urls: S) where S.Element == URL {
         var zeroFilledRegularURLs: [URL] = []
         var barrierURLByDevice: [dev_t: URL] = [:]
+        var zeroFilledInodes: Set<InodeKey> = []
         let chunkSize = 64 * 1024
-        let zeroChunk = [UInt8](repeating: 0, count: chunkSize)
+        var zeroChunk: [UInt8]?
 
         for url in urls {
             let path = url.path
@@ -518,28 +524,34 @@ nonisolated final class ImageAssetStore: Sendable {
             }
             var fileStat = stat()
             if Darwin.fstat(fd, &fileStat) == 0, (fileStat.st_mode & S_IFMT) == S_IFREG {
-                let fileSize = Int64(fileStat.st_size)
-                if fileSize > 0, Darwin.lseek(fd, 0, SEEK_SET) == 0 {
-                    var remaining = fileSize
-                    zeroChunk.withUnsafeBytes { rawBuffer in
-                        guard let baseAddress = rawBuffer.baseAddress else { return }
-                        while remaining > 0 {
-                            let toWrite = Int(min(Int64(chunkSize), remaining))
-                            let written = Darwin.write(fd, baseAddress, toWrite)
-                            if written > 0 {
-                                remaining -= Int64(written)
-                            } else if written < 0 && errno == EINTR {
-                                continue
-                            } else {
-                                break
+                let inodeKey = InodeKey(dev: fileStat.st_dev, ino: fileStat.st_ino)
+                if zeroFilledInodes.insert(inodeKey).inserted {
+                    let fileSize = Int64(fileStat.st_size)
+                    if fileSize > 0, Darwin.lseek(fd, 0, SEEK_SET) == 0 {
+                        if zeroChunk == nil {
+                            zeroChunk = [UInt8](repeating: 0, count: chunkSize)
+                        }
+                        var remaining = fileSize
+                        zeroChunk?.withUnsafeBytes { rawBuffer in
+                            guard let baseAddress = rawBuffer.baseAddress else { return }
+                            while remaining > 0 {
+                                let toWrite = Int(min(Int64(chunkSize), remaining))
+                                let written = Darwin.write(fd, baseAddress, toWrite)
+                                if written > 0 {
+                                    remaining -= Int64(written)
+                                } else if written < 0 && errno == EINTR {
+                                    continue
+                                } else {
+                                    break
+                                }
                             }
                         }
                     }
-                }
-                // Flush this vnode's dirty zero-fill pages from UBC to the block device before unlinking.
-                _ = Darwin.fsync(fd)
-                if barrierURLByDevice[fileStat.st_dev] == nil {
-                    barrierURLByDevice[fileStat.st_dev] = url
+                    // Flush this vnode's dirty zero-fill pages from UBC to the block device before unlinking.
+                    _ = Darwin.fsync(fd)
+                    if barrierURLByDevice[fileStat.st_dev] == nil {
+                        barrierURLByDevice[fileStat.st_dev] = url
+                    }
                 }
             }
             _ = Darwin.close(fd)
@@ -554,7 +566,11 @@ nonisolated final class ImageAssetStore: Sendable {
         }
     }
 
-    static func secureRemoveItem(at url: URL) {
+    private static func collectEntriesForSecureRemoval(
+        at url: URL,
+        files: inout [URL],
+        directoriesPostOrder: inout [URL]
+    ) {
         let path = url.path
         guard !path.isEmpty else {
             return
@@ -572,17 +588,41 @@ nonisolated final class ImageAssetStore: Sendable {
                 options: []
             ) {
                 for child in children {
-                    secureRemoveItem(at: child)
+                    collectEntriesForSecureRemoval(
+                        at: child,
+                        files: &files,
+                        directoriesPostOrder: &directoriesPostOrder
+                    )
                 }
             }
-            _ = Darwin.rmdir(path)
-            if Darwin.lstat(path, &st) == 0 {
-                try? FileManager.default.removeItem(at: url)
-            }
+            directoriesPostOrder.append(url)
         } else {
-            secureUnlink(at: url)
-            if Darwin.lstat(path, &st) == 0 {
-                try? FileManager.default.removeItem(at: url)
+            files.append(url)
+        }
+    }
+
+    static func secureRemoveItem(at url: URL) {
+        var files: [URL] = []
+        var directoriesPostOrder: [URL] = []
+        collectEntriesForSecureRemoval(
+            at: url,
+            files: &files,
+            directoriesPostOrder: &directoriesPostOrder
+        )
+
+        if !files.isEmpty {
+            secureUnlinkBatch(files)
+            var st = stat()
+            for fileURL in files where Darwin.lstat(fileURL.path, &st) == 0 {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+        }
+
+        var st = stat()
+        for dirURL in directoriesPostOrder {
+            _ = Darwin.rmdir(dirURL.path)
+            if Darwin.lstat(dirURL.path, &st) == 0 {
+                try? FileManager.default.removeItem(at: dirURL)
             }
         }
     }

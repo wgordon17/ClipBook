@@ -2537,5 +2537,251 @@ extension SharedProcessStateTests {
             coordinator.savePreferences()
             #expect(harness.globalShortcuts.unregisterAllCallCount == shortcutPasses + 1)
         }
+
+        @Test
+        @MainActor
+        func pendingEncryptedImageOCRResumesOnUnlockAndArchiveImport() async throws {
+            try await TestSupport.withTemporaryDirectory { workspace in
+                let activePNG = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20, color: .systemTeal)
+                let trashedPNG = try TestSupport.makePNGData(pixelWidth: 28, pixelHeight: 20, color: .systemPurple)
+                let activeImageID = UUID()
+                let trashedImageID = UUID()
+
+                // 1. Seed active + trashed unverified .enc images in a store, lock it, unlock via retryUnlockHistoryStore(),
+                //    and verify both resume OCR (active benign demotes to .png; trashed secret purges).
+                let unlockDir = workspace.appendingPathComponent("UnlockResumeStore", isDirectory: true)
+                let sharedKeyProvider = InMemoryDatabaseKeyProvider()
+                let secretToken = ["sk", "-", String(repeating: "rS7tU8vW", count: 4)].joined()
+
+                do {
+                    let seedStore = GRDBHistoryStore(directory: unlockDir, keyProvider: sharedKeyProvider)
+                    defer { seedStore.close() }
+                    let activeEnc = try seedStore.writeManagedAsset(pngData: activePNG, role: .image, clipID: activeImageID, encrypted: true)
+                    let trashedEnc = try seedStore.writeManagedAsset(pngData: trashedPNG, role: .image, clipID: trashedImageID, encrypted: true)
+                    let activeItem = ClipboardItem.fixture(
+                        id: activeImageID,
+                        kind: .image,
+                        text: nil,
+                        qrCodeText: nil,
+                        assetPath: activeEnc.path,
+                        imageDigest: seedStore.computeImageDigest(forPNGData: activePNG),
+                        copiedAt: Date(timeIntervalSince1970: 1_710_800_000)
+                    )
+                    var trashedItem = ClipboardItem.fixture(
+                        id: trashedImageID,
+                        kind: .image,
+                        text: nil,
+                        qrCodeText: nil,
+                        assetPath: trashedEnc.path,
+                        imageDigest: seedStore.computeImageDigest(forPNGData: trashedPNG),
+                        copiedAt: Date(timeIntervalSince1970: 1_710_800_001)
+                    )
+                    trashedItem.deletedAt = Date(timeIntervalSince1970: 1_710_800_002)
+                    _ = try seedStore.saveAndReconcileItem(activeItem, convertingExternalAssets: false)
+                    _ = try seedStore.saveAndReconcileItem(trashedItem, convertingExternalAssets: false)
+                }
+
+                // Lock the key provider before constructing the coordinator harness.
+                sharedKeyProvider.setError(.encryptionKeyUnavailable(.interactionNotAllowed))
+                let unlockHarness = try TestSupport.makeTestCoordinator(
+                    supportDirectory: unlockDir,
+                    keyProvider: sharedKeyProvider,
+                    probeStoreBeforeInit: true,
+                    recognizeImageData: { pngData in
+                        pngData == activePNG
+                            ? RecognizedImageContent(text: "Benign resumed text", qrCodeText: nil)
+                            : RecognizedImageContent(text: secretToken, qrCodeText: nil)
+                    },
+                    bindsMonitorDelegate: true
+                )
+                defer { unlockHarness.cleanup() }
+                #expect(unlockHarness.model.storeLockState == .locked(.interactionNotAllowed))
+
+                sharedKeyProvider.setError(nil)
+                #expect(unlockHarness.coordinator.retryUnlockHistoryStore())
+
+                #expect(await TestSupport.waitUntil {
+                    guard let active = unlockHarness.model.items.first(where: { $0.id == activeImageID }),
+                          let activePath = active.assetPath else {
+                        return false
+                    }
+                    let trashed = (try? unlockHarness.historyStore.fetchTrashedItems()) ?? []
+                    return activePath.hasSuffix(".png") && !trashed.contains { $0.id == trashedImageID }
+                })
+
+                // 2. Verify performImportHistoryArchive invokes resumePendingImageRecognitions when unverified .enc images exist.
+                let importDir = workspace.appendingPathComponent("ImportResumeStore", isDirectory: true)
+                let preExistingPendingID = UUID()
+                let importOCRCalls = OSAllocatedUnfairLock(initialState: 0)
+                let importHarness = try TestSupport.makeTestCoordinator(
+                    supportDirectory: importDir,
+                    recognizeImageData: { _ in
+                        importOCRCalls.withLock { $0 += 1 }
+                        return RecognizedImageContent(text: "Post-import resumed OCR", qrCodeText: nil)
+                    },
+                    bindsMonitorDelegate: true
+                )
+                defer { importHarness.cleanup() }
+
+                let pendingEncURL = try importHarness.historyStore.writeManagedAsset(
+                    pngData: activePNG,
+                    role: .image,
+                    clipID: preExistingPendingID,
+                    encrypted: true
+                )
+                let preExistingPendingItem = ClipboardItem.fixture(
+                    id: preExistingPendingID,
+                    kind: .image,
+                    text: nil,
+                    qrCodeText: nil,
+                    assetPath: pendingEncURL.path,
+                    imageDigest: importHarness.historyStore.computeImageDigest(forPNGData: activePNG)
+                )
+                _ = try importHarness.historyStore.saveAndReconcileItem(preExistingPendingItem, convertingExternalAssets: false)
+                #expect(importHarness.coordinator.loadHistory(sweepsCaches: false))
+
+                // Export a tiny v1 archive from a separate directory and import it into importHarness.
+                let archiveSourceDir = workspace.appendingPathComponent("ArchiveSource", isDirectory: true)
+                let archiveURL = workspace.appendingPathComponent("Minimal.clipbookarchive", isDirectory: true)
+                try ClipBookArchiveService(supportDirectory: archiveSourceDir).export(
+                    items: [ClipboardItem.fixture(kind: .text, text: "Imported note")],
+                    tags: [],
+                    to: archiveURL
+                )
+
+                let importResult: Result<ClipBookArchiveImportResult, Error> = await withCheckedContinuation { continuation in
+                    let started = importHarness.coordinator.performImportHistoryArchive(
+                        from: archiveURL,
+                        passphrase: nil,
+                        progress: { _ in },
+                        completion: { continuation.resume(returning: $0) }
+                    )
+                    #expect(started)
+                }
+                _ = try importResult.get()
+
+                #expect(await TestSupport.waitUntil {
+                    importOCRCalls.withLock { $0 >= 1 }
+                        && importHarness.model.items.first(where: { $0.id == preExistingPendingID })?.assetPath?.hasSuffix(".png") == true
+                })
+            }
+        }
+    }
+}
+
+extension SharedProcessStateTests {
+    @Suite(.serialized)
+    struct CoordinatorPendingLinkPreviewMutationTests {
+        private nonisolated final class StubLinkPreviewURLProtocol: URLProtocol {
+            static let host = "clipbook-pending-preview.test"
+
+            override class func canInit(with request: URLRequest) -> Bool {
+                request.url?.host == host
+            }
+
+            override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+                request
+            }
+
+            override func startLoading() {
+                guard let url = request.url else {
+                    client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+                    return
+                }
+                let html = """
+                <html><head>
+                <meta property="og:title" content="Fetched Preview Title" />
+                <meta property="og:description" content="Fetched Preview Description" />
+                </head><body>ok</body></html>
+                """
+                let data = Data(html.utf8)
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "text/html; charset=utf-8"]
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: data)
+                client?.urlProtocolDidFinishLoading(self)
+            }
+
+            override func stopLoading() {}
+        }
+
+        @Test
+        @MainActor
+        func mutationsDuringPendingLinkPreviewFlushPreserveLinkPreviewAndApplyMutations() async throws {
+            URLProtocol.registerClass(StubLinkPreviewURLProtocol.self)
+            defer { URLProtocol.unregisterClass(StubLinkPreviewURLProtocol.self) }
+
+            let harness = try TestSupport.makeTestCoordinator(configureInitialPreferences: {
+                $0.showPreviewForLinks = true
+            })
+            defer { harness.cleanup() }
+
+            let workTag = try #require(harness.coordinator.createTag(name: "Reading", color: .systemBlue))
+            let linkA = ClipboardItem.fixture(
+                kind: .link,
+                text: "https://\(StubLinkPreviewURLProtocol.host)/article-a",
+                tags: [workTag.id]
+            )
+            let linkB = ClipboardItem.fixture(
+                kind: .link,
+                text: "https://\(StubLinkPreviewURLProtocol.host)/article-b",
+                sensitivity: .sensitive
+            )
+            try harness.seedHistory([linkA, linkB])
+            let seededA = try #require(harness.model.items.first { $0.id == linkA.id })
+            let seededB = try #require(harness.model.items.first { $0.id == linkB.id })
+
+            // 1. Trigger updateLink on linkA, assert pre-flush linkPreviewDetails == nil, then run toggleFavorite,
+            //    rename, and deleteTag BEFORE any setSensitive call so resolvingPendingLinkPreviewUpdate is exercised.
+            harness.coordinator.updateLink(seededA)
+            #expect(await TestSupport.waitUntil {
+                (try? harness.historyStore.fetchAll().first(where: { $0.id == seededA.id })?.linkPreviewDetails?.title)
+                    == "Fetched Preview Title"
+            })
+            let pendingHeaderA = try #require(harness.model.items.first { $0.id == seededA.id })
+            #expect(pendingHeaderA.linkPreviewDetails == nil, "Test must mutate within the 150ms coalescing window")
+
+            harness.coordinator.toggleFavorite(pendingHeaderA)
+            let afterFavoriteA = try #require(harness.model.items.first { $0.id == seededA.id })
+            harness.coordinator.rename(afterFavoriteA, title: "Saved Article")
+            harness.coordinator.deleteTag(workTag)
+
+            // 2. Trigger updateLink on linkB (sensitive), assert pre-flush linkPreviewDetails == nil, then mark not sensitive.
+            harness.coordinator.updateLink(seededB)
+            #expect(await TestSupport.waitUntil {
+                (try? harness.historyStore.fetchAll().first(where: { $0.id == seededB.id })?.linkPreviewDetails?.title)
+                    == "Fetched Preview Title"
+            })
+            let pendingHeaderB = try #require(harness.model.items.first { $0.id == seededB.id })
+            #expect(pendingHeaderB.linkPreviewDetails == nil, "Test must mutate linkB within the 150ms coalescing window")
+            harness.coordinator.setSensitive(false, for: pendingHeaderB)
+
+            // Wait past the 150ms coalescing window so any stale pending flush would have fired.
+            try await Task.sleep(for: .milliseconds(250))
+
+            let modelA = try #require(harness.model.items.first { $0.id == seededA.id })
+            #expect(modelA.isFavorite)
+            #expect(modelA.title == "Saved Article")
+            #expect(modelA.tags.isEmpty, "Pending flush must not resurrect deleted tag")
+            #expect(modelA.linkPreviewDetails?.title == "Fetched Preview Title")
+
+            let storedA = try #require(try harness.historyStore.fetchAll().first { $0.id == seededA.id })
+            #expect(storedA.isFavorite)
+            #expect(storedA.title == "Saved Article")
+            #expect(storedA.tags.isEmpty)
+            #expect(storedA.linkPreviewDetails?.title == "Fetched Preview Title")
+
+            let modelB = try #require(harness.model.items.first { $0.id == seededB.id })
+            #expect(modelB.sensitivity == .notSensitive)
+            #expect(modelB.linkPreviewDetails?.title == "Fetched Preview Title")
+
+            let storedB = try #require(try harness.historyStore.fetchAll().first { $0.id == seededB.id })
+            #expect(storedB.sensitivity == .notSensitive)
+            #expect(storedB.linkPreviewDetails?.title == "Fetched Preview Title")
+        }
     }
 }

@@ -134,96 +134,6 @@ enum ServicesAndUtilitiesTests {
             }
         }
 
-        @Test(.timeLimit(.minutes(1)))
-        @MainActor
-        func previewCacheInvalidatesMemoryHitsOnFileEditSymlinkRetargetAndSiblingDirectoryCleanupPreservesOtherDirectories() async throws {
-            try await TestSupport.withTemporaryDirectory { tempDir in
-                // 1. FilePreviewCache memory hit === cached image, invalidated on file edit and symlink retarget after removePreviews.
-                let cacheDir = tempDir.appendingPathComponent("PreviewCacheInvalidation", isDirectory: true)
-                let previewCache = FilePreviewCache(directory: cacheDir)
-                let targetA = tempDir.appendingPathComponent("target-a.png")
-                let targetB = tempDir.appendingPathComponent("target-b.png")
-                let symlinkURL = tempDir.appendingPathComponent("current-photo.png")
-                try TestSupport.makePNGData(pixelWidth: 80, pixelHeight: 80, color: .systemRed).write(to: targetA)
-                try TestSupport.makePNGData(pixelWidth: 160, pixelHeight: 80, color: .systemBlue).write(to: targetB)
-                try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: targetA)
-
-                let generatedFirst: NSImage = await withCheckedContinuation { continuation in
-                    _ = previewCache.image(forFileAt: symlinkURL.path, targetSize: CGSize(width: 40, height: 40)) { img in
-                        continuation.resume(returning: img)
-                    }
-                }
-                let syncHit = previewCache.image(forFileAt: symlinkURL.path, targetSize: CGSize(width: 40, height: 40)) { _ in }
-                #expect(syncHit === generatedFirst)
-
-                // Overwriting targetA with larger payload invalidates signature on synchronous lookup.
-                try TestSupport.makePNGData(pixelWidth: 200, pixelHeight: 120, color: .systemOrange).write(to: targetA)
-                try FileManager.default.setAttributes(
-                    [.modificationDate: Date().addingTimeInterval(10)],
-                    ofItemAtPath: targetA.path
-                )
-                var regeneratedAfterEdit: NSImage?
-                let staleOrFallback = previewCache.image(forFileAt: symlinkURL.path, targetSize: CGSize(width: 40, height: 40)) { img in
-                    regeneratedAfterEdit = img
-                }
-                #expect(staleOrFallback !== generatedFirst)
-                #expect(await TestSupport.waitUntil { regeneratedAfterEdit != nil })
-
-                // Retargeting symlink after removePreviews clears canonicalPathCache and resolves targetB's 2:1 aspect display size.
-                previewCache.removePreviews(forFilePaths: [symlinkURL.path, targetA.path])
-                try FileManager.default.removeItem(at: symlinkURL)
-                try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: targetB)
-                let retargetedSize = try #require(previewCache.displaySizeForImageFile(at: symlinkURL.path))
-                #expect(abs(retargetedSize.width - 160) < 0.5)
-                #expect(abs(retargetedSize.height - 80) < 0.5)
-
-                // 2. Sibling support directories ("Support" vs "Support2") do not cross-evict thumbnails or drag copies!
-                let support1 = tempDir.appendingPathComponent("Support", isDirectory: true)
-                let support2 = tempDir.appendingPathComponent("Support2", isDirectory: true)
-                let store1 = GRDBHistoryStore(directory: support1, keyProvider: InMemoryDatabaseKeyProvider())
-                defer { store1.close() }
-                let store2 = GRDBHistoryStore(directory: support2, keyProvider: InMemoryDatabaseKeyProvider())
-                defer { store2.close() }
-
-                let clip1 = UUID()
-                let clip2 = UUID()
-                let samplePNG = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 32, color: .systemTeal)
-                let enc1 = try store1.writeManagedAsset(pngData: samplePNG, role: .image, clipID: clip1, encrypted: true)
-                let enc2 = try store2.writeManagedAsset(pngData: samplePNG, role: .image, clipID: clip2, encrypted: true)
-                let ctx1 = ImageAssetThumbnailLoader.ManagedAssetContext(role: .image, ownerClipID: clip1, requiresEncryption: true)
-                let ctx2 = ImageAssetThumbnailLoader.ManagedAssetContext(role: .image, ownerClipID: clip2, requiresEncryption: true)
-
-                let loader = ImageAssetThumbnailLoader()
-                for (url, ctx) in [(enc1, ctx1), (enc2, ctx2)] {
-                    _ = await withCheckedContinuation { (continuation: CheckedContinuation<NSImage?, Never>) in
-                        if let hit = loader.thumbnail(for: url, maximumPixelSize: 128, assetContext: ctx, completion: { continuation.resume(returning: $0) }) {
-                            continuation.resume(returning: hit)
-                        }
-                    }
-                }
-                #expect(loader.thumbnail(for: enc1, maximumPixelSize: 128, assetContext: ctx1) { _ in } != nil)
-                #expect(loader.thumbnail(for: enc2, maximumPixelSize: 128, assetContext: ctx2) { _ in } != nil)
-
-                loader.removeThumbnails(inDirectory: support1)
-                #expect(loader.thumbnail(for: enc1, maximumPixelSize: 128, assetContext: ctx1) { _ in } == nil)
-                #expect(loader.thumbnail(for: enc2, maximumPixelSize: 128, assetContext: ctx2) { _ in } != nil, "Support eviction must not prefix-match Support2")
-
-                defer { ImageDragFiles.removeAll() }
-                let dragItem1 = ImageAssetDragItem.make(assetURL: enc1, fileName: "one.png", ownerClipID: clip1, requiresEncryption: true)
-                let dragItem2 = ImageAssetDragItem.make(assetURL: enc2, fileName: "two.png", ownerClipID: clip2, requiresEncryption: true)
-                let dragURL1 = try #require(dragItem1.string(forType: .fileURL).flatMap(URL.init(string:)))
-                let dragURL2 = try #require(dragItem2.string(forType: .fileURL).flatMap(URL.init(string:)))
-                #expect(dragURL1.path != enc1.path)
-                #expect(dragURL2.path != enc2.path)
-                #expect(FileManager.default.fileExists(atPath: dragURL1.path))
-                #expect(FileManager.default.fileExists(atPath: dragURL2.path))
-
-                ImageDragFiles.removeCopies(forSupportDirectory: support1)
-                #expect(!FileManager.default.fileExists(atPath: dragURL1.path))
-                #expect(FileManager.default.fileExists(atPath: dragURL2.path), "Support drag cleanup must preserve Support2 drag copies")
-            }
-        }
-
         @Test
         @MainActor
         func svgImageRendererValidationAndRendering() {
@@ -708,6 +618,101 @@ enum ServicesAndUtilitiesTests {
             }
             #expect(!version.isEmpty)
             #expect(version.range(of: #"^\d+\.\d+\.\d+"#, options: .regularExpression) != nil)
+        }
+    }
+}
+
+extension SharedProcessStateTests {
+    @Suite(.serialized)
+    struct PreviewCacheAndDragFilesTests {
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func previewCacheInvalidatesMemoryHitsOnFileEditSymlinkRetargetAndSiblingDirectoryCleanupPreservesOtherDirectories() async throws {
+            try await TestSupport.withTemporaryDirectory { tempDir in
+                // 1. FilePreviewCache memory hit === cached image, invalidated on file edit and symlink retarget after removePreviews.
+                let cacheDir = tempDir.appendingPathComponent("PreviewCacheInvalidation", isDirectory: true)
+                let previewCache = FilePreviewCache(directory: cacheDir)
+                let targetA = tempDir.appendingPathComponent("target-a.png")
+                let targetB = tempDir.appendingPathComponent("target-b.png")
+                let symlinkURL = tempDir.appendingPathComponent("current-photo.png")
+                try TestSupport.makePNGData(pixelWidth: 80, pixelHeight: 80, color: .systemRed).write(to: targetA)
+                try TestSupport.makePNGData(pixelWidth: 160, pixelHeight: 80, color: .systemBlue).write(to: targetB)
+                try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: targetA)
+
+                let generatedFirst: NSImage = await withCheckedContinuation { continuation in
+                    _ = previewCache.image(forFileAt: symlinkURL.path, targetSize: CGSize(width: 40, height: 40)) { img in
+                        continuation.resume(returning: img)
+                    }
+                }
+                let syncHit = previewCache.image(forFileAt: symlinkURL.path, targetSize: CGSize(width: 40, height: 40)) { _ in }
+                #expect(syncHit === generatedFirst)
+
+                // Overwriting targetA with larger payload invalidates signature on synchronous lookup.
+                try TestSupport.makePNGData(pixelWidth: 200, pixelHeight: 120, color: .systemOrange).write(to: targetA)
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date().addingTimeInterval(10)],
+                    ofItemAtPath: targetA.path
+                )
+                var regeneratedAfterEdit: NSImage?
+                let staleOrFallback = previewCache.image(forFileAt: symlinkURL.path, targetSize: CGSize(width: 40, height: 40)) { img in
+                    regeneratedAfterEdit = img
+                }
+                #expect(staleOrFallback !== generatedFirst)
+                #expect(await TestSupport.waitUntil { regeneratedAfterEdit != nil })
+
+                // Retargeting symlink after removePreviews clears canonicalPathCache and resolves targetB's 2:1 aspect display size.
+                previewCache.removePreviews(forFilePaths: [symlinkURL.path, targetA.path])
+                try FileManager.default.removeItem(at: symlinkURL)
+                try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: targetB)
+                let retargetedSize = try #require(previewCache.displaySizeForImageFile(at: symlinkURL.path))
+                #expect(abs(retargetedSize.width - 160) < 0.5)
+                #expect(abs(retargetedSize.height - 80) < 0.5)
+
+                // 2. Sibling support directories ("Support" vs "Support2") do not cross-evict thumbnails or drag copies!
+                let support1 = tempDir.appendingPathComponent("Support", isDirectory: true)
+                let support2 = tempDir.appendingPathComponent("Support2", isDirectory: true)
+                let store1 = GRDBHistoryStore(directory: support1, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { store1.close() }
+                let store2 = GRDBHistoryStore(directory: support2, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { store2.close() }
+
+                let clip1 = UUID()
+                let clip2 = UUID()
+                let samplePNG = try TestSupport.makePNGData(pixelWidth: 32, pixelHeight: 32, color: .systemTeal)
+                let enc1 = try store1.writeManagedAsset(pngData: samplePNG, role: .image, clipID: clip1, encrypted: true)
+                let enc2 = try store2.writeManagedAsset(pngData: samplePNG, role: .image, clipID: clip2, encrypted: true)
+                let ctx1 = ImageAssetThumbnailLoader.ManagedAssetContext(role: .image, ownerClipID: clip1, requiresEncryption: true)
+                let ctx2 = ImageAssetThumbnailLoader.ManagedAssetContext(role: .image, ownerClipID: clip2, requiresEncryption: true)
+
+                let loader = ImageAssetThumbnailLoader()
+                for (url, ctx) in [(enc1, ctx1), (enc2, ctx2)] {
+                    _ = await withCheckedContinuation { (continuation: CheckedContinuation<NSImage?, Never>) in
+                        if let hit = loader.thumbnail(for: url, maximumPixelSize: 128, assetContext: ctx, completion: { continuation.resume(returning: $0) }) {
+                            continuation.resume(returning: hit)
+                        }
+                    }
+                }
+                #expect(loader.thumbnail(for: enc1, maximumPixelSize: 128, assetContext: ctx1) { _ in } != nil)
+                #expect(loader.thumbnail(for: enc2, maximumPixelSize: 128, assetContext: ctx2) { _ in } != nil)
+
+                loader.removeThumbnails(inDirectory: support1)
+                #expect(loader.thumbnail(for: enc1, maximumPixelSize: 128, assetContext: ctx1) { _ in } == nil)
+                #expect(loader.thumbnail(for: enc2, maximumPixelSize: 128, assetContext: ctx2) { _ in } != nil, "Support eviction must not prefix-match Support2")
+
+                defer { ImageDragFiles.removeAll() }
+                let dragItem1 = ImageAssetDragItem.make(assetURL: enc1, fileName: "one.png", ownerClipID: clip1, requiresEncryption: true)
+                let dragItem2 = ImageAssetDragItem.make(assetURL: enc2, fileName: "two.png", ownerClipID: clip2, requiresEncryption: true)
+                let dragURL1 = try #require(dragItem1.string(forType: .fileURL).flatMap(URL.init(string:)))
+                let dragURL2 = try #require(dragItem2.string(forType: .fileURL).flatMap(URL.init(string:)))
+                #expect(dragURL1.path != enc1.path)
+                #expect(dragURL2.path != enc2.path)
+                #expect(FileManager.default.fileExists(atPath: dragURL1.path))
+                #expect(FileManager.default.fileExists(atPath: dragURL2.path))
+
+                ImageDragFiles.removeCopies(forSupportDirectory: support1)
+                #expect(!FileManager.default.fileExists(atPath: dragURL1.path))
+                #expect(FileManager.default.fileExists(atPath: dragURL2.path), "Support drag cleanup must preserve Support2 drag copies")
+            }
         }
     }
 }

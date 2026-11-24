@@ -61,6 +61,7 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
         var shouldThrowOnFetchSearchTexts = false
         var suppressBrowserURLOnLoadingContent = false
         var resolvedBrowserURLsOnLoadingContent: [URL] = []
+        var fetchItemOverride: (@Sendable (ClipboardKind, String, String?) -> ClipboardItem?)?
     }
 
     let base: GRDBHistoryStore
@@ -204,10 +205,20 @@ nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
     func fetchItems(expiredBy policy: HistoryRetentionPolicy) throws -> [ClipboardItem] { try base.fetchItems(expiredBy: policy) }
     func fetchItems(expiringBy date: Date) throws -> [ClipboardItem] { try base.fetchItems(expiringBy: date) }
     func nextExpiryDate() throws -> Date? { try base.nextExpiryDate() }
+    var fetchItemOverride: (@Sendable (ClipboardKind, String, String?) -> ClipboardItem?)? {
+        get { state.withLock { $0.fetchItemOverride } }
+        set { state.withLock { $0.fetchItemOverride = newValue } }
+    }
+
     func fetchItem(kind: ClipboardKind, contentKey: String, htmlDigest: String?) throws -> ClipboardItem? {
-        try base.fetchItem(kind: kind, contentKey: contentKey, htmlDigest: htmlDigest)
+        if let override = state.withLock({ $0.fetchItemOverride }),
+           let item = override(kind, contentKey, htmlDigest) {
+            return item
+        }
+        return try base.fetchItem(kind: kind, contentKey: contentKey, htmlDigest: htmlDigest)
     }
     func fetchStoredFilePaths() throws -> Set<String> { try base.fetchStoredFilePaths() }
+    func fetchTrashedAssetPaths() throws -> Set<String> { try base.fetchTrashedAssetPaths() }
 
     func fetchSearchTexts(
         for ids: [UUID],

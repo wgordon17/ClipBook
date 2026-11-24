@@ -190,9 +190,7 @@ nonisolated extension GRDBHistoryStore {
                     }
                 } catch {
                     let rolledBackAssets = self.takeWriteAssetContext()
-                    for writtenURL in rolledBackAssets.newlyWrittenURLs {
-                        ImageAssetStore.secureUnlink(at: writtenURL)
-                    }
+                    ImageAssetStore.secureUnlinkBatch(rolledBackAssets.newlyWrittenURLs)
                     throw error
                 }
                 committedAssets = self.takeWriteAssetContext()
@@ -205,9 +203,7 @@ nonisolated extension GRDBHistoryStore {
         }
 
         if isOutermostCommit {
-            for supersededURL in committedAssets.supersededManagedURLs {
-                ImageAssetStore.secureUnlink(at: supersededURL)
-            }
+            ImageAssetStore.secureUnlinkBatch(committedAssets.supersededManagedURLs)
             for evictedPath in committedAssets.evictedThumbnailPaths {
                 cacheHooks.removeThumbnailsForPath(evictedPath)
             }
@@ -1062,34 +1058,40 @@ nonisolated extension GRDBHistoryStore {
     }
 
     func unlinkOrScrubSupportEntry(at url: URL) {
-        if Self.sameInode(url, databaseURL) {
-            _ = Darwin.unlink(url.path)
-        } else {
-            ImageAssetStore.secureUnlink(at: url)
+        unlinkOrScrubSupportEntries([url])
+    }
+
+    func unlinkOrScrubSupportEntries<S: Sequence>(_ urls: S) where S.Element == URL {
+        var urlsToScrub: [URL] = []
+        for url in urls {
+            if Self.sameInode(url, databaseURL) {
+                _ = Darwin.unlink(url.path)
+            } else {
+                urlsToScrub.append(url)
+            }
         }
+        ImageAssetStore.secureUnlinkBatch(urlsToScrub)
     }
 
     private func sweepScrubbingDatabaseSidecars() {
-        let scrubbingCandidates: [URL] = [
+        var entriesToProcess: [URL] = [
             scrubbingDBURL,
             scrubbingWALURL,
             scrubbingSHMURL,
             scrubbingJournalURL,
-        ]
-        for candidate in scrubbingCandidates where Self.fileOrSymlinkExists(at: candidate) {
-            unlinkOrScrubSupportEntry(at: candidate)
-        }
+        ].filter { Self.fileOrSymlinkExists(at: $0) }
 
-        guard let dirContents = try? FileManager.default.contentsOfDirectory(
+        if let dirContents = try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil,
             options: []
-        ) else {
-            return
+        ) {
+            for entry in dirContents where entry.lastPathComponent.hasSuffix(".scrubbing") {
+                entriesToProcess.append(entry)
+            }
         }
-        for entry in dirContents where entry.lastPathComponent.hasSuffix(".scrubbing") {
-            unlinkOrScrubSupportEntry(at: entry)
-        }
+
+        unlinkOrScrubSupportEntries(entriesToProcess)
     }
 
     private func scanOverlappingManagedAssetDirectories() -> [OverlappingAssetDirectory] {
@@ -1108,13 +1110,14 @@ nonisolated extension GRDBHistoryStore {
 
         var visibleFiles: [URL] = []
         visibleFiles.reserveCapacity(entries.count)
+        var scrubbingEntries: [URL] = []
         var encStems: Set<String> = []
         var plainStems: Set<String> = []
 
         for entry in entries {
             let name = entry.lastPathComponent
             if name.hasSuffix(".scrubbing") {
-                ImageAssetStore.secureUnlink(at: entry)
+                scrubbingEntries.append(entry)
                 continue
             }
             if name.hasPrefix(".") {
@@ -1128,6 +1131,10 @@ nonisolated extension GRDBHistoryStore {
             } else {
                 plainStems.insert(stem)
             }
+        }
+
+        if !scrubbingEntries.isEmpty {
+            ImageAssetStore.secureUnlinkBatch(scrubbingEntries)
         }
 
         guard !encStems.isDisjoint(with: plainStems) else {
@@ -1228,6 +1235,7 @@ nonisolated extension GRDBHistoryStore {
             }
         }
 
+        var filesToUnlink: [URL] = []
         for file in directoryScan.files {
             let ext = file.pathExtension.lowercased()
             let stem = file.deletingPathExtension().lastPathComponent
@@ -1241,7 +1249,12 @@ nonisolated extension GRDBHistoryStore {
                     && !referenced.encrypted.contains(file.lastPathComponent)
             }
             if shouldUnlink {
-                ImageAssetStore.secureUnlink(at: file)
+                filesToUnlink.append(file)
+            }
+        }
+        if !filesToUnlink.isEmpty {
+            ImageAssetStore.secureUnlinkBatch(filesToUnlink)
+            for file in filesToUnlink {
                 cacheHooks.removeThumbnailsForPath(file.path)
             }
         }

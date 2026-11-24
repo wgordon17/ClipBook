@@ -461,7 +461,12 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 existingItem.imageDigest = item.imageDigest ?? existingItem.imageDigest
                 existingItem.imageWidth = item.imageWidth ?? existingItem.imageWidth
                 existingItem.imageHeight = item.imageHeight ?? existingItem.imageHeight
-                existingItem.assetPath = item.assetPath ?? existingItem.assetPath
+                if let incomingAssetPath = item.assetPath {
+                    let hasLiveExistingAsset = existingItem.assetPath.map { FileManager.default.fileExists(atPath: $0) } ?? false
+                    if !hasLiveExistingAsset || FileManager.default.fileExists(atPath: incomingAssetPath) {
+                        existingItem.assetPath = incomingAssetPath
+                    }
+                }
                 existingItem.filePaths = item.filePaths
                 existingItem.sourceAppName = item.sourceAppName
                 existingItem.sourceBundleIdentifier = item.sourceBundleIdentifier
@@ -975,6 +980,34 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
+    func fetchTrashedAssetPaths() throws -> Set<String> {
+        try withRead { db, keys in
+            let sql = """
+                SELECT id, isEncrypted, assetPath
+                FROM clips
+                WHERE deletedAt IS NOT NULL AND assetPath IS NOT NULL
+                """
+            let cursor = try Row.fetchCursor(db, sql: sql)
+            var paths: Set<String> = []
+            try Self.drainCursorInBatches(cursor) { row in
+                guard let idString: String = row["id"],
+                      let clipID = UUID(uuidString: idString) else {
+                    return
+                }
+                let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
+                if let assetPath = try? Self.decodeProtectedAssetPath(
+                    from: row,
+                    clipID: clipID,
+                    isEncrypted: isEncrypted,
+                    keys: keys
+                ) {
+                    paths.insert(assetPath)
+                }
+            }
+            return paths
+        }
+    }
+
     private nonisolated struct SearchTextQueryPlan {
         let tagIDsByClipID: [String: [Int]]
         let clipWhereClause: String
@@ -1185,41 +1218,54 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         return reconciledPath
     }
 
+    static func mapManagedAssetPaths(
+        on workingItem: inout ClipboardItem,
+        _ transform: (String, AssetRole) throws -> String?
+    ) rethrows {
+        if let currentAssetPath = workingItem.assetPath {
+            let updatedAssetPath = try transform(currentAssetPath, .image)
+            if updatedAssetPath != currentAssetPath {
+                workingItem.assetPath = updatedAssetPath
+            }
+        }
+
+        guard var details = workingItem.linkPreviewDetails else {
+            return
+        }
+        var detailsChanged = false
+        if let currentImagePath = details.imagePath {
+            let updatedImagePath = try transform(currentImagePath, .linkPreview)
+            if updatedImagePath != currentImagePath {
+                details.imagePath = updatedImagePath
+                detailsChanged = true
+            }
+        }
+        if let currentFaviconPath = details.faviconPath {
+            let updatedFaviconPath = try transform(currentFaviconPath, .linkFavicon)
+            if updatedFaviconPath != currentFaviconPath {
+                details.faviconPath = updatedFaviconPath
+                detailsChanged = true
+            }
+        }
+        if detailsChanged {
+            workingItem.linkPreviewDetails = details
+        }
+    }
+
     private func reconcileManagedAssetsForPersistence(
         _ workingItem: inout ClipboardItem,
         shouldEncrypt: Bool,
         keys: ClipBookDerivedKeys
     ) throws {
-        if let oldAssetPath = workingItem.assetPath {
-            workingItem.assetPath = try stageReconciledAssetPath(
-                oldAssetPath,
-                role: .image,
-                clipID: workingItem.id,
+        let clipID = workingItem.id
+        try Self.mapManagedAssetPaths(on: &workingItem) { oldPath, role in
+            try stageReconciledAssetPath(
+                oldPath,
+                role: role,
+                clipID: clipID,
                 shouldEncrypt: shouldEncrypt,
                 keys: keys
             )
-        }
-
-        if var details = workingItem.linkPreviewDetails {
-            if let oldImagePath = details.imagePath {
-                details.imagePath = try stageReconciledAssetPath(
-                    oldImagePath,
-                    role: .linkPreview,
-                    clipID: workingItem.id,
-                    shouldEncrypt: shouldEncrypt,
-                    keys: keys
-                )
-            }
-            if let oldFaviconPath = details.faviconPath {
-                details.faviconPath = try stageReconciledAssetPath(
-                    oldFaviconPath,
-                    role: .linkFavicon,
-                    clipID: workingItem.id,
-                    shouldEncrypt: shouldEncrypt,
-                    keys: keys
-                )
-            }
-            workingItem.linkPreviewDetails = details
         }
     }
 
@@ -1578,48 +1624,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         _ workingItem: inout ClipboardItem,
         keys: ClipBookDerivedKeys
     ) throws {
-        if let currentAssetPath = workingItem.assetPath {
-            let stagedAssetPath = try stageNonDestructiveEncryptedAssetIfNeeded(
-                path: currentAssetPath,
-                role: .image,
-                clipID: workingItem.id,
+        let clipID = workingItem.id
+        try Self.mapManagedAssetPaths(on: &workingItem) { currentPath, role in
+            try stageNonDestructiveEncryptedAssetIfNeeded(
+                path: currentPath,
+                role: role,
+                clipID: clipID,
                 keys: keys
             )
-            if stagedAssetPath != currentAssetPath {
-                workingItem.assetPath = stagedAssetPath
-            }
-        }
-
-        guard var details = workingItem.linkPreviewDetails else {
-            return
-        }
-        var detailsChanged = false
-        if let currentImagePath = details.imagePath {
-            let stagedImagePath = try stageNonDestructiveEncryptedAssetIfNeeded(
-                path: currentImagePath,
-                role: .linkPreview,
-                clipID: workingItem.id,
-                keys: keys
-            )
-            if stagedImagePath != currentImagePath {
-                details.imagePath = stagedImagePath
-                detailsChanged = true
-            }
-        }
-        if let currentFaviconPath = details.faviconPath {
-            let stagedFaviconPath = try stageNonDestructiveEncryptedAssetIfNeeded(
-                path: currentFaviconPath,
-                role: .linkFavicon,
-                clipID: workingItem.id,
-                keys: keys
-            )
-            if stagedFaviconPath != currentFaviconPath {
-                details.faviconPath = stagedFaviconPath
-                detailsChanged = true
-            }
-        }
-        if detailsChanged {
-            workingItem.linkPreviewDetails = details
         }
     }
 

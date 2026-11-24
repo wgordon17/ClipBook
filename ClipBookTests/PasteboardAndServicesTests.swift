@@ -3,6 +3,7 @@ import AppKit
 import CryptoKit
 import Darwin
 import Foundation
+import os
 import Testing
 
 @Suite
@@ -546,6 +547,28 @@ enum PasteboardAndServicesTests {
                     // Verify Images/<id>.enc on disk is still encrypted.
                     let afterDisk = try Data(contentsOf: encURL)
                     #expect(afterDisk == rawEnc)
+
+                    // Unverified pre-OCR .enc image (shouldEncryptAtRest == false) must still stamp ConcealedType.
+                    let unverifiedClipID = UUID()
+                    let unverifiedEncURL = try store.writeManagedAsset(
+                        pngData: pngData,
+                        role: .image,
+                        clipID: unverifiedClipID,
+                        encrypted: true
+                    )
+                    let unverifiedImageItem = ClipboardItem.fixture(
+                        id: unverifiedClipID,
+                        kind: .image,
+                        text: nil,
+                        assetPath: unverifiedEncURL.path,
+                        sensitivity: nil
+                    )
+                    #expect(!SensitiveContent.shouldEncryptAtRest(unverifiedImageItem))
+                    #expect(unverifiedImageItem.hasUnverifiedEncryptedImageAsset)
+                    try service.copy(unverifiedImageItem, variant: .standard)
+                    let unverifiedPB = try #require(pasteboard.pasteboardItems?.first)
+                    #expect(unverifiedPB.types.contains(PasteboardReader.concealedType))
+                    #expect(unverifiedPB.data(forType: .png) == pngData)
                 }
             }
         }
@@ -1082,6 +1105,469 @@ enum PasteboardAndServicesTests {
                     requiresEncryption: true
                 )
                 #expect(decrypted == pngData)
+            }
+        }
+
+        @Test
+        @MainActor
+        func recapturingImageDuringInFlightOCRPreservesDemotedPNGAndEnforcesDontSave() async throws {
+            let benignPNG = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 20, color: .systemTeal)
+            let ocrStartSem = DispatchSemaphore(value: 0)
+            let ocrReleaseSem = DispatchSemaphore(value: 0)
+
+            // 1. Re-copying during in-flight OCR must not discard pngData or overwrite demoted .png with deleted .enc.
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                },
+                recognizeImageData: { _ in
+                    ocrStartSem.signal()
+                    _ = ocrReleaseSem.wait(timeout: .now() + .seconds(10))
+                    return RecognizedImageContent(text: "Benign label", qrCodeText: nil)
+                }
+            ) { fixture in
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(benignPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+                // Flush Copy & Merge hold for the first capture so it enters SQLite as staged .enc with OCR in flight.
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let firstItem = try #require(fixture.delegate.items.first)
+                let stagedEncPath = try #require(firstItem.assetPath)
+                #expect(stagedEncPath.hasSuffix(".enc"))
+                #expect(ocrStartSem.wait(timeout: .now() + .seconds(5)) == .success)
+
+                // Re-copy the same image while OCR is still in flight (held by Copy & Merge).
+                fixture.clock.advance(by: 0.1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(benignPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                // Finish OCR and demote .enc -> .png before the held second copy flushes.
+                ocrReleaseSem.signal()
+                let outcome = try fixture.store.finalizeRecognizedImage(
+                    id: firstItem.id,
+                    content: RecognizedImageContent(text: "Benign label", qrCodeText: nil),
+                    sensitiveContentLifetime: ContentLifetime.keep
+                )
+                let demotedPNGPath = try #require(outcome.updated?.assetPath)
+                #expect(demotedPNGPath.hasSuffix(".png"))
+                #expect(FileManager.default.fileExists(atPath: demotedPNGPath))
+                #expect(!FileManager.default.fileExists(atPath: stagedEncPath))
+
+                // Flush the held second copy: it must adopt the live .png path rather than overwriting it with deleted .enc.
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let storedAfterRecopy = try #require(try fixture.store.fetchAll().first)
+                #expect(storedAfterRecopy.id == firstItem.id)
+                #expect(storedAfterRecopy.assetPath == demotedPNGPath)
+                #expect(FileManager.default.fileExists(atPath: demotedPNGPath))
+            }
+
+            // 2. When sensitiveContentLifetime == .dontSave and first image's OCR purges it, a concurrent re-copy is also not saved.
+            let secretToken = PasteboardAndServicesTests.makeRuntimeSecretToken(tag: "ocr-race")
+            let secretPNG = try TestSupport.makePNGData(pixelWidth: 26, pixelHeight: 22, color: .systemPink)
+            let secretStartSem = DispatchSemaphore(value: 0)
+            let secretReleaseSem = DispatchSemaphore(value: 0)
+
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                    $0.sensitiveContentLifetime = ContentLifetime.dontSave
+                },
+                recognizeImageData: { _ in
+                    secretStartSem.signal()
+                    _ = secretReleaseSem.wait(timeout: .now() + .seconds(10))
+                    return RecognizedImageContent(text: secretToken, qrCodeText: nil)
+                }
+            ) { fixture in
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(secretPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let firstItem = try #require(fixture.delegate.items.first)
+                #expect(secretStartSem.wait(timeout: .now() + .seconds(5)) == .success)
+
+                // Re-copy same image while first OCR is in flight.
+                fixture.clock.advance(by: 0.1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(secretPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                // First OCR detects secret and purges firstItem under dontSave.
+                secretReleaseSem.signal()
+                let purgeOutcome = try fixture.store.finalizeRecognizedImage(
+                    id: firstItem.id,
+                    content: RecognizedImageContent(text: secretToken, qrCodeText: nil),
+                    sensitiveContentLifetime: ContentLifetime.dontSave
+                )
+                #expect(purgeOutcome.purged)
+                #expect(try fixture.store.fetchAll().isEmpty)
+
+                // Flush held second copy: it stages from retained pngData (never a dangling .enc path) and runs OCR again.
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let secondItem = try #require(try fixture.store.fetchAll().first)
+                let secondPath = try #require(secondItem.assetPath)
+                #expect(FileManager.default.fileExists(atPath: secondPath))
+                #expect(secretStartSem.wait(timeout: .now() + .seconds(5)) == .success)
+                secretReleaseSem.signal()
+                #expect(await TestSupport.waitUntil {
+                    fixture.delegate.recognizedEvents.contains { $0.id == secondItem.id }
+                })
+                let secondPurge = try fixture.store.finalizeRecognizedImage(
+                    id: secondItem.id,
+                    content: RecognizedImageContent(text: secretToken, qrCodeText: nil),
+                    sensitiveContentLifetime: ContentLifetime.dontSave
+                )
+                #expect(secondPurge.purged)
+                #expect(try fixture.store.fetchAll().isEmpty)
+            }
+        }
+
+        @Test
+        @MainActor
+        func recapturingImageAndFileIgnoresCorruptPlaceholderFromFetchItem() async throws {
+            try await TestSupport.withTemporaryDirectory { tempDir in
+                let baseStore = GRDBHistoryStore(directory: tempDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { baseStore.close() }
+                let spyStore = SpyHistoryStore(base: baseStore)
+
+                let pngData = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20, color: .systemBlue)
+                let imageFileURL = tempDir.appendingPathComponent("corrupt-target.png", isDirectory: false)
+                try pngData.write(to: imageFileURL)
+
+                let corruptImageID = UUID()
+                let corruptFileID = UUID()
+                func makeCorruptPlaceholder(id: UUID, kind: ClipboardKind) -> ClipboardItem {
+                    ClipboardItem.fromStoredHeader(
+                        id: id,
+                        kind: kind,
+                        title: nil,
+                        textPreview: nil,
+                        characterCount: 0,
+                        containsPreviewSecret: true,
+                        containsRestSecret: true,
+                        hasRecognizedText: false,
+                        hasQRCodeText: false,
+                        isSVGText: false,
+                        hasFormatting: false,
+                        htmlDigest: nil,
+                        imageDigest: nil,
+                        imageWidth: nil,
+                        imageHeight: nil,
+                        assetPath: nil,
+                        filePaths: [],
+                        sourceAppName: nil,
+                        sourceBundleIdentifier: nil,
+                        copiedAt: Date(),
+                        firstCopiedAt: Date(),
+                        byteSize: 0,
+                        isFavorite: false,
+                        tags: [],
+                        copyCount: 1,
+                        linkPreviewDetails: nil,
+                        copySequenceID: nil,
+                        copySequenceOrder: nil,
+                        favoriteOrder: nil,
+                        sensitivity: .sensitive,
+                        expiresAt: nil,
+                        deletedAt: nil,
+                        storedContentKey: nil,
+                        isCorruptPlaceholder: true
+                    )
+                }
+                let corruptImagePlaceholder = makeCorruptPlaceholder(id: corruptImageID, kind: .image)
+                let corruptFilePlaceholder = makeCorruptPlaceholder(id: corruptFileID, kind: .file)
+                spyStore.fetchItemOverride = { kind, _, _ in
+                    switch kind {
+                    case .image:
+                        return corruptImagePlaceholder
+                    case .file:
+                        return corruptFilePlaceholder
+                    default:
+                        return nil
+                    }
+                }
+
+                let recognizedImageCalls = OSAllocatedUnfairLock(initialState: 0)
+                let recognizedFileCalls = OSAllocatedUnfairLock(initialState: 0)
+
+                try await TestSupport.withUniquePasteboard { pasteboard in
+                    let monitor = PasteboardMonitor(
+                        historyStore: spyStore,
+                        fileManager: .default,
+                        pasteboard: pasteboard,
+                        recognizeImageData: { _ in
+                            recognizedImageCalls.withLock { $0 += 1 }
+                            return RecognizedImageContent(text: "Fresh Image OCR", qrCodeText: nil)
+                        },
+                        recognizeImageFile: { _ in
+                            recognizedFileCalls.withLock { $0 += 1 }
+                            return RecognizedImageContent(text: "Fresh File OCR", qrCodeText: nil)
+                        }
+                    )
+                    let delegate = MockMonitorDelegate()
+                    monitor.delegate = delegate
+                    monitor.updatePreferences(AppPreferences())
+                    defer { monitor.stop() }
+
+                    pasteboard.clearContents()
+                    pasteboard.setData(pngData, forType: .png)
+                    await monitor.pollAndWaitForDelivery()
+
+                    let capturedImage = try #require(delegate.capturedHistory.last?.item)
+                    #expect(capturedImage.kind == .image)
+                    #expect(capturedImage.id != corruptImageID)
+                    #expect(capturedImage.assetPath?.hasSuffix("\(capturedImage.id.uuidString).enc") == true)
+                    #expect(await TestSupport.waitUntil { recognizedImageCalls.withLock { $0 == 1 } })
+
+                    pasteboard.clearContents()
+                    pasteboard.writeObjects([imageFileURL as NSURL])
+                    await monitor.pollAndWaitForDelivery()
+
+                    let capturedFile = try #require(delegate.capturedHistory.last?.item)
+                    #expect(capturedFile.kind == .file)
+                    #expect(capturedFile.id != corruptFileID)
+                    #expect(capturedFile.text == nil)
+                    #expect(await TestSupport.waitUntil { recognizedFileCalls.withLock { $0 == 1 } })
+                }
+            }
+        }
+
+        @Test
+        @MainActor
+        func resumePendingImageRecognitionsFiltersCandidatesAndDeduplicatesInFlight() async throws {
+            let pngData = try TestSupport.makePNGData(pixelWidth: 20, pixelHeight: 20, color: .systemIndigo)
+            let gateEnter = DispatchSemaphore(value: 0)
+            let gateRelease = DispatchSemaphore(value: 0)
+            let invokedCount = OSAllocatedUnfairLock(initialState: 0)
+
+            try await PasteboardAndServicesTests.withMonitor(
+                recognizeImageData: { _ in
+                    invokedCount.withLock { $0 += 1 }
+                    gateEnter.signal()
+                    _ = gateRelease.wait(timeout: .now() + .seconds(10))
+                    return RecognizedImageContent(text: "Resumed OCR", qrCodeText: nil)
+                }
+            ) { fixture in
+                let pendingID = UUID()
+                let recognizedID = UUID()
+                let qrOnlyID = UUID()
+                let sensitiveID = UUID()
+
+                let pendingURL = try fixture.store.writeManagedAsset(pngData: pngData, role: .image, clipID: pendingID, encrypted: true)
+                let recognizedURL = try fixture.store.writeManagedAsset(pngData: pngData, role: .image, clipID: recognizedID, encrypted: true)
+                let qrOnlyURL = try fixture.store.writeManagedAsset(pngData: pngData, role: .image, clipID: qrOnlyID, encrypted: true)
+                let sensitiveURL = try fixture.store.writeManagedAsset(pngData: pngData, role: .image, clipID: sensitiveID, encrypted: true)
+
+                let pendingItem = ClipboardItem.fixture(id: pendingID, kind: .image, text: nil, qrCodeText: nil, assetPath: pendingURL.path).unloadingContent()
+                let recognizedItem = ClipboardItem.fixture(id: recognizedID, kind: .image, text: "Already read", qrCodeText: nil, assetPath: recognizedURL.path).unloadingContent()
+                let qrOnlyItem = ClipboardItem.fixture(id: qrOnlyID, kind: .image, text: nil, qrCodeText: "https://example.com", assetPath: qrOnlyURL.path).unloadingContent()
+                let sensitiveItem = ClipboardItem.fixture(id: sensitiveID, kind: .image, text: nil, qrCodeText: nil, assetPath: sensitiveURL.path, sensitivity: .sensitive).unloadingContent()
+
+                #expect(pendingItem.needsPendingImageRecognition)
+                #expect(!recognizedItem.needsPendingImageRecognition)
+                #expect(!qrOnlyItem.needsPendingImageRecognition)
+                #expect(!sensitiveItem.needsPendingImageRecognition)
+
+                let candidates = [pendingItem, recognizedItem, qrOnlyItem, sensitiveItem]
+                fixture.monitor.resumePendingImageRecognitions(for: candidates)
+                #expect(fixture.monitor.isImageRecognitionPending(for: pendingID))
+                #expect(!fixture.monitor.isImageRecognitionPending(for: recognizedID))
+                #expect(!fixture.monitor.isImageRecognitionPending(for: qrOnlyID))
+                #expect(!fixture.monitor.isImageRecognitionPending(for: sensitiveID))
+
+                // Calling again while pendingID is in flight must not schedule a duplicate OCR job.
+                fixture.monitor.resumePendingImageRecognitions(for: candidates)
+                #expect(gateEnter.wait(timeout: .now() + .seconds(5)) == .success)
+                gateRelease.signal()
+
+                #expect(await TestSupport.waitUntil {
+                    fixture.delegate.recognizedEvents.contains { $0.id == pendingID && $0.content.text == "Resumed OCR" }
+                })
+                #expect(invokedCount.withLock { $0 } == 1)
+                #expect(!fixture.monitor.isImageRecognitionPending(for: pendingID))
+            }
+        }
+
+        @Test
+        @MainActor
+        func recapturingImageCoversPendingPNGDataNilBranchesSensitiveLifetimeAndInterruptedOCR() async throws {
+            // 1. pendingPNGData == nil: stored plain .png becomes .enc while held by Copy & Merge -> adopts live .enc path;
+            //    and if stored asset + row vanish while held -> capture aborts without persisting a dangling assetPath.
+            let samplePNG = try TestSupport.makePNGData(pixelWidth: 22, pixelHeight: 22, color: .systemCyan)
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                }
+            ) { fixture in
+                let clipID = UUID()
+                let plainURL = try fixture.store.writeManagedAsset(pngData: samplePNG, role: .image, clipID: clipID, encrypted: false)
+                let seeded = ClipboardItem.fixture(
+                    id: clipID,
+                    kind: .image,
+                    text: "Already recognized",
+                    assetPath: plainURL.path,
+                    imageDigest: fixture.store.computeImageDigest(forPNGData: samplePNG)
+                )
+                _ = try fixture.store.saveAndReconcileItem(seeded, convertingExternalAssets: false)
+
+                // Copy matches stored image -> PasteboardReader returns reusesStoredFile == true (pendingPNGData == nil).
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(samplePNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                // While held, mark item sensitive so plain .png is replaced by .enc on disk.
+                let upgraded = try #require(try fixture.store.setSensitivity(.sensitive, for: clipID))
+                let liveEncPath = try #require(upgraded.assetPath)
+                #expect(liveEncPath.hasSuffix(".enc"))
+                #expect(!FileManager.default.fileExists(atPath: plainURL.path))
+
+                // Flush held copy: adopts liveEncPath instead of writing stale plainURL.path.
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+                let afterAdopt = try #require(try fixture.store.fetchAll().first { $0.id == clipID })
+                #expect(afterAdopt.assetPath == liveEncPath)
+                #expect(afterAdopt.copyCount == seeded.copyCount + 1)
+
+                // Copy again (reusesStoredFile == true, pendingPNGData == nil), then delete row + asset before flush.
+                let capturesBeforeDelete = fixture.delegate.capturedHistory.count
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(samplePNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                try fixture.store.delete(clipID)
+                ImageAssetStore.secureUnlink(at: URL(fileURLWithPath: liveEncPath))
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+                #expect(fixture.delegate.capturedHistory.count == capturesBeforeDelete)
+                #expect(try fixture.store.fetchAll().isEmpty)
+            }
+
+            // 2. adoptExistingImageAsset enforces sensitiveContentLifetime (.dontSave suppresses; timed lifetime clamps expiresAt).
+            let secretToken = PasteboardAndServicesTests.makeRuntimeSecretToken(tag: "adopt-policy")
+            let secretPNG = try TestSupport.makePNGData(pixelWidth: 24, pixelHeight: 24, color: .systemYellow)
+            try await PasteboardAndServicesTests.withMonitor(
+                preferences: {
+                    $0.copyAndMergeEnabled = true
+                    $0.sensitiveContentLifetime = ContentLifetime.keep
+                }
+            ) { fixture in
+                let clipID = UUID()
+                let encURL = try fixture.store.writeManagedAsset(pngData: secretPNG, role: .image, clipID: clipID, encrypted: true)
+                let seeded = ClipboardItem.fixture(
+                    id: clipID,
+                    kind: .image,
+                    text: nil,
+                    assetPath: encURL.path,
+                    imageDigest: fixture.store.computeImageDigest(forPNGData: secretPNG)
+                )
+                _ = try fixture.store.saveAndReconcileItem(seeded, convertingExternalAssets: false)
+
+                // Poll while OCR has not populated text yet (pendingPNGData != nil), then finalize secret OCR before flush.
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(secretPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                _ = try fixture.store.finalizeRecognizedImage(
+                    id: clipID,
+                    content: RecognizedImageContent(text: secretToken, qrCodeText: nil),
+                    sensitiveContentLifetime: ContentLifetime.keep
+                )
+
+                var dontSavePrefs = AppPreferences()
+                dontSavePrefs.copyAndMergeEnabled = true
+                dontSavePrefs.sensitiveContentLifetime = ContentLifetime.dontSave
+                fixture.monitor.updatePreferences(dontSavePrefs)
+
+                let capturesBeforeDontSave = fixture.delegate.capturedHistory.count
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+                #expect(fixture.delegate.capturedHistory.count == capturesBeforeDontSave)
+
+                // Now seed a fresh unverified .enc image, poll with 60s timed lifetime while text == nil
+                // (so capturableItem leaves expiresAt == nil), finalize secret OCR before flush, and assert
+                // adoptExistingImageAsset clamps expiresAt to copyTime + 60s.
+                let timedPNG = try TestSupport.makePNGData(pixelWidth: 25, pixelHeight: 25, color: .systemMint)
+                let timedClipID = UUID()
+                let timedEncURL = try fixture.store.writeManagedAsset(pngData: timedPNG, role: .image, clipID: timedClipID, encrypted: true)
+                let timedSeeded = ClipboardItem.fixture(
+                    id: timedClipID,
+                    kind: .image,
+                    text: nil,
+                    assetPath: timedEncURL.path,
+                    imageDigest: fixture.store.computeImageDigest(forPNGData: timedPNG)
+                )
+                _ = try fixture.store.saveAndReconcileItem(timedSeeded, convertingExternalAssets: false)
+
+                var timedPrefs = AppPreferences()
+                timedPrefs.copyAndMergeEnabled = true
+                timedPrefs.sensitiveContentLifetime = 60
+                fixture.monitor.updatePreferences(timedPrefs)
+
+                fixture.clock.advance(by: 5)
+                let copyTime = fixture.clock.current
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(timedPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                _ = try fixture.store.finalizeRecognizedImage(
+                    id: timedClipID,
+                    content: RecognizedImageContent(text: secretToken, qrCodeText: nil),
+                    sensitiveContentLifetime: ContentLifetime.keep
+                )
+
+                fixture.clock.advance(by: 1)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                let clamped = try #require(fixture.delegate.capturedHistory.last?.item)
+                #expect(clamped.id == timedClipID)
+                let expiry = try #require(clamped.expiresAt)
+                #expect(abs(expiry.timeIntervalSince(copyTime) - 60) < 1)
+            }
+
+            // 3. Re-copying an interrupted unverified .enc image when OCR is NOT in flight keeps pendingRecognition active.
+            let interruptedPNG = try TestSupport.makePNGData(pixelWidth: 26, pixelHeight: 20, color: .systemBrown)
+            let ocrInvocations = OSAllocatedUnfairLock(initialState: 0)
+            try await PasteboardAndServicesTests.withMonitor(
+                recognizeImageData: { _ in
+                    ocrInvocations.withLock { $0 += 1 }
+                    return RecognizedImageContent(text: "Recovered interrupted OCR", qrCodeText: nil)
+                }
+            ) { fixture in
+                let clipID = UUID()
+                let encURL = try fixture.store.writeManagedAsset(pngData: interruptedPNG, role: .image, clipID: clipID, encrypted: true)
+                let interrupted = ClipboardItem.fixture(
+                    id: clipID,
+                    kind: .image,
+                    text: nil,
+                    qrCodeText: nil,
+                    assetPath: encURL.path,
+                    imageDigest: fixture.store.computeImageDigest(forPNGData: interruptedPNG)
+                )
+                _ = try fixture.store.saveAndReconcileItem(interrupted, convertingExternalAssets: false)
+                #expect(!fixture.monitor.isImageRecognitionPending(for: clipID))
+
+                fixture.clock.advance(by: 1)
+                fixture.pasteboard.clearContents()
+                fixture.pasteboard.setData(interruptedPNG, forType: .png)
+                await fixture.monitor.pollAndWaitForDelivery()
+
+                #expect(await TestSupport.waitUntil {
+                    ocrInvocations.withLock { $0 == 1 }
+                        && fixture.delegate.recognizedEvents.contains { $0.id == clipID && $0.content.text == "Recovered interrupted OCR" }
+                })
             }
         }
 
@@ -1770,6 +2256,71 @@ extension SharedProcessStateTests {
                     #expect(!jsonText.contains("canceled-secret.png"))
                 }
             }
+        }
+    }
+
+    @Suite
+    struct ImageTextRecognizerTests {
+        private static func makeTextPNGData(
+            text: String,
+            pixelWidth: Int,
+            pixelHeight: Int,
+            fontSize: CGFloat
+        ) throws -> Data {
+            let rep = try TestSupport.makeBitmap(pixelsWide: pixelWidth, pixelsHigh: pixelHeight)
+            rep.size = NSSize(width: pixelWidth, height: pixelHeight)
+
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSColor.white.setFill()
+            NSRect(origin: .zero, size: rep.size).fill()
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.boldSystemFont(ofSize: fontSize),
+                .foregroundColor: NSColor.black
+            ]
+            NSString(string: text).draw(
+                at: NSPoint(x: 24, y: (CGFloat(pixelHeight) - fontSize) / 2),
+                withAttributes: attributes
+            )
+            NSGraphicsContext.restoreGraphicsState()
+
+            return try #require(rep.representation(using: .png, properties: [:]))
+        }
+
+        @Test
+        func emptyAndInvalidPNGDataReturnEmpty() {
+            #expect(ImageTextRecognizer.recognizeContent(ofPNGData: Data()) == .empty)
+            #expect(ImageTextRecognizer.recognizeContent(ofPNGData: Data("not a png".utf8)) == .empty)
+        }
+
+        @Test
+        @MainActor
+        func recognizesRenderedTextInSmallPNG() throws {
+            TestSupport.ensureAppKitInitialized()
+            let pngData = try Self.makeTextPNGData(
+                text: "CLIPBOOK",
+                pixelWidth: 400,
+                pixelHeight: 120,
+                fontSize: 40
+            )
+            let result = ImageTextRecognizer.recognizeContent(ofPNGData: pngData)
+            let recognizedText = try #require(result.text)
+            #expect(recognizedText.localizedCaseInsensitiveContains("CLIPBOOK"))
+        }
+
+        @Test
+        @MainActor
+        func downsamplesLargePNGExceedingMaximumPixelSize() throws {
+            TestSupport.ensureAppKitInitialized()
+            let pngData = try Self.makeTextPNGData(
+                text: "DOWNSCALED",
+                pixelWidth: ImageTextRecognizer.maximumPixelSize + 200,
+                pixelHeight: 240,
+                fontSize: 72
+            )
+            let result = ImageTextRecognizer.recognizeContent(ofPNGData: pngData)
+            let recognizedText = try #require(result.text)
+            #expect(recognizedText.localizedCaseInsensitiveContains("DOWNSCALED"))
         }
     }
 }
