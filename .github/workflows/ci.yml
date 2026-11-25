@@ -21,7 +21,6 @@ concurrency:
 
 jobs:
   macos-test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -37,7 +36,15 @@ jobs:
         env:
           RESULT_BUNDLE_PATH: ${{ runner.temp }}/ClipBookTests.xcresult
           SNAPSHOT_EXPORT_DIR: ${{ runner.temp }}/exported-snapshots
+          PERF_SUMMARY_PATH: ${{ runner.temp }}/perf-summary.md
         run: ./test.sh
+
+      - name: Publish performance summary
+        if: always()
+        run: |
+          if [[ -s "${{ runner.temp }}/perf-summary.md" ]]; then
+            cat "${{ runner.temp }}/perf-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Smoke-test universal Release packaging and rcodesign signing
         if: github.event_name == 'pull_request'
@@ -135,19 +142,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require non-draft macOS CI success
+      - name: Require macOS CI success
         env:
           MACOS_RESULT: ${{ needs.macos-test.result }}
-          IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: |
           set -euo pipefail
           if [[ "$MACOS_RESULT" == "success" ]]; then
             printf 'macOS CI succeeded.\n'
             exit 0
-          fi
-          if [[ "$IS_DRAFT" == "true" ]]; then
-            printf 'Draft PR: macOS CI is deferred until marked Ready for review (macos-test=%s).\n' "$MACOS_RESULT" >&2
-            exit 1
           fi
           printf 'macOS CI did not succeed (macos-test=%s).\n' "$MACOS_RESULT" >&2
           exit 1

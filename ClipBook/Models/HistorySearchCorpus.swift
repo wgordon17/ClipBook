@@ -123,6 +123,9 @@ nonisolated final class HistorySearchCorpus: Sendable {
                             ?? secondaryDonor?.reusableText(for: header, tagNamesByID: tagNamesByID) {
                     texts[i] = reused
                     revisions[i] = header.searchRevision
+                } else if header.hasCompleteHeaderSearchText {
+                    texts[i] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                    revisions[i] = header.searchRevision
                 } else {
                     missingSlots.append((slotIndex: i, id: header.id))
                 }

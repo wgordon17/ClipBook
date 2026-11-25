@@ -602,12 +602,33 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         if hasFormatting && textPreview == nil {
             return false
         }
+        guard characterCount <= Self.textPreviewBodyLimit else {
+            return false
+        }
         guard let textPreview else {
             return characterCount == 0
+        }
+        let utf8Count = textPreview.utf8.count
+        guard utf8Count >= characterCount else {
+            return false
+        }
+        if utf8Count == characterCount,
+           let firstByte = textPreview.utf8.first,
+           firstByte >= 0x21,
+           firstByte < 0x7F,
+           textPreview.utf8.allSatisfy({ $0 < 0x80 && $0 != 0x0D }) {
+            return utf8Count < Self.textPreviewMaxUTF16Length - 2
         }
         return textPreview.first?.isWhitespace != true
             && textPreview.count == characterCount
             && textPreview.utf16.count < Self.textPreviewMaxUTF16Length - 2
+    }
+
+    var hasCompleteHeaderSearchText: Bool {
+        !isCorruptPlaceholder
+            && !hasQRCodeText
+            && !SensitiveContent.shouldEncryptAtRest(self)
+            && hasCompleteTextPreview
     }
 
     static func fromStoredHeader(
@@ -1347,7 +1368,17 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     }
 
     nonisolated func headerFallbackSearchText(tagNamesByID: [Tag.ID: String]) -> String {
-        Self.makeSearchText(
+        if title == nil,
+           linkPreviewDetails == nil,
+           tags.isEmpty,
+           (kind == .image || filePaths.isEmpty),
+           let textPreview {
+            if let sourceAppName {
+                return "\(textPreview)   \(sourceAppName)"
+            }
+            return "\(textPreview)  "
+        }
+        return Self.makeSearchText(
             title: title,
             text: textPreview,
             filePaths: kind == .image ? [] : filePaths,

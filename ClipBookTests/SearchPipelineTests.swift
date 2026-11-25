@@ -1571,12 +1571,12 @@ extension SharedProcessStateTests {
                 #expect(settled, "Search did not settle for query=\(query)")
             }
 
-            // (b) Active search: hydrates HistorySearchCorpus on searchQueue (matching 40 KB tail, decrypted isEncrypted == 1 secret,
-            //     and Unicode folding traps) and reuses cachedSearchCorpus with 0 extra fetchSearchTexts calls on prefix refinements!
+            // (b) Active search: resolves complete short headers in RAM and hydrates only incomplete/encrypted items
+            //     (40 KB body, >9 KB link, and isEncrypted == 1 secret) via fetchSearchTexts on searchQueue!
             spyStore.resetRecordedCalls()
             await runSearchAndWait(sentinel40KB)
             #expect(spyStore.fetchSearchTextsCalls.count == 1)
-            #expect(spyStore.fetchSearchTextsCalls[0].ids.count == 7)
+            #expect(Set(spyStore.fetchSearchTextsCalls[0].ids) == [item40KB.id, itemSecret.id, itemLink.id])
             #expect(!spyStore.fetchSearchTextsCalls[0].trashed)
             #expect(harness.model.filteredItems.map(\.id) == [item40KB.id])
             #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus != nil)
@@ -1650,7 +1650,7 @@ extension SharedProcessStateTests {
             #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[newlyCaptured.id]])
             #expect(harness.model.filteredItems.contains { $0.id == newlyCaptured.id })
 
-            // (c.4) Completing post-OCR didRecognize mid-search queries fetchSearchTexts for ONLY [ocrImgID] (1 ID)!
+            // (c.4) Completing post-OCR didRecognize mid-search with short non-sensitive text resolves in RAM (0 DB calls)!
             spyStore.resetRecordedCalls()
             harness.coordinator.pasteboardMonitor(
                 harness.clipboardMonitor,
@@ -1660,10 +1660,10 @@ extension SharedProcessStateTests {
             #expect(await TestSupport.waitUntil {
                 harness.model.searchResult?.revision == harness.model.sortedListRevision
             })
-            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[ocrImgID]])
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
             #expect(harness.model.filteredItems.contains { $0.id == ocrImgID })
 
-            // (c.5) Persisting a link preview mid-search queries fetchSearchTexts for ONLY [itemLink.id] (1 ID)!
+            // (c.5) Persisting a link preview on >9 KB URL mid-search queries fetchSearchTexts for ONLY [itemLink.id] (1 ID)!
             spyStore.resetRecordedCalls()
             harness.coordinator.updateLink(try #require(harness.currentItem(itemLink.id)))
             let linkPreviewRefreshed = await TestSupport.waitUntil(timeout: .seconds(5)) {
@@ -1675,7 +1675,7 @@ extension SharedProcessStateTests {
             #expect(harness.model.filteredItems.contains { $0.id == itemLink.id })
 
             // (c.6) Tag rename & delete (both via coordinator.updateTag/deleteTag AND direct model.tags mutation)
-            //       invalidate stale tag matches on tagged items while reusing all untagged donor entries!
+            //       invalidate stale tag matches on short tagged items in RAM (0 DB calls) while reusing all untagged donors!
             await runSearchAndWait("ProjectAlpha")
             #expect(harness.model.filteredItems.map(\.id) == [itemTagged.id])
 
@@ -1684,7 +1684,7 @@ extension SharedProcessStateTests {
             #expect(await TestSupport.waitUntil {
                 harness.model.searchResult?.revision == harness.model.sortedListRevision
             })
-            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemTagged.id]])
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
             #expect(harness.model.filteredItems.isEmpty, "Stale tag name ProjectAlpha must no longer match after rename")
 
             spyStore.resetRecordedCalls()
@@ -1692,7 +1692,7 @@ extension SharedProcessStateTests {
             #expect(spyStore.fetchSearchTextsCalls.isEmpty)
             #expect(harness.model.filteredItems.map(\.id) == [itemTagged.id])
 
-            // Direct model.tags mutation also invalidates tagNamesByID on tagged items while reusing untagged donors!
+            // Direct model.tags mutation also invalidates tagNamesByID on tagged items in RAM while reusing untagged donors!
             spyStore.resetRecordedCalls()
             harness.model.tags = [
                 ClipBook.Tag(id: tagAlpha.id, name: "DirectMutatedTag", color: tagAlpha.color),
@@ -1701,10 +1701,10 @@ extension SharedProcessStateTests {
             #expect(await TestSupport.waitUntil {
                 harness.model.searchResult?.revision == harness.model.sortedListRevision
             })
-            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemTagged.id]])
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
             #expect(harness.model.filteredItems.isEmpty)
 
-            // Sync DB tag name and delete the tag mid-search: queries ONLY [itemTagged.id] and clears match!
+            // Sync DB tag name and delete the tag mid-search: resolves in RAM and clears match!
             _ = try spyStore.updateTag(id: tagAlpha.id, name: "DirectMutatedTag", color: tagAlpha.color)
             await runSearchAndWait("DirectMutatedTag")
             #expect(harness.model.filteredItems.map(\.id) == [itemTagged.id])
@@ -1715,11 +1715,11 @@ extension SharedProcessStateTests {
             #expect(await TestSupport.waitUntil {
                 harness.model.searchResult?.revision == harness.model.sortedListRevision
             })
-            #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[itemTagged.id]])
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
             #expect(harness.model.filteredItems.isEmpty)
 
-            // (c.7) Degraded fallback corpus (fetchSearchTexts throw) sets hasCompleteTexts == false and revisions[slot] == 0,
-            //       never caches as complete, and re-hydrates cleanly once fetchSearchTexts succeeds again!
+            // (c.7) Degraded fallback corpus (fetchSearchTexts throw) sets hasCompleteTexts == false and revisions[slot] == 0
+            //       for every unhydrated item, never caches as complete, and re-hydrates cleanly once fetchSearchTexts succeeds again!
             controller.clearSearchAfterHiddenInterval()
             #expect(harness.model.searchQuery.isEmpty)
 
@@ -1728,7 +1728,8 @@ extension SharedProcessStateTests {
             await runSearchAndWait(sentinel40KB)
             let degradedResult = try #require(harness.model.searchResult)
             #expect(!degradedResult.corpus.hasCompleteTexts)
-            #expect(degradedResult.corpus.revisions.allSatisfy { $0 == 0 })
+            let degraded40KBSlot = try #require(degradedResult.indexByID[item40KB.id])
+            #expect(degradedResult.corpus.revisions[degraded40KBSlot] == 0)
             #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
             #expect(harness.model.filteredItems.isEmpty, "Header fallback lacks >8 KB tail sentinel while store throws")
             #expect(await TestSupport.waitUntil { listPaneView.items.isEmpty && listTableView.numberOfRows == 0 })
@@ -1777,7 +1778,7 @@ extension SharedProcessStateTests {
             #expect(await TestSupport.waitUntil {
                 harness.model.searchResult?.revision == harness.model.sortedListRevision
             })
-            #expect(spyStore.fetchSearchTextsCalls.contains { $0.trashed && $0.ids.contains(itemTrashed.id) })
+            #expect(spyStore.fetchSearchTextsCalls.isEmpty)
             #expect(harness.model.filteredItems.map(\.id) == [itemTrashed.id])
 
             harness.model.selectedHistoryFilterContentTypes = []
@@ -1793,12 +1794,13 @@ extension SharedProcessStateTests {
             #expect(harness.model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
 
             // Advance sortedListRevision while idle (Favorite toggle) and search again: because lastCompletedSearchResult
-            // was also cleared, ALL active items must be fetched fresh rather than donated from a leaked result!
+            // was also cleared, ALL incomplete/encrypted active items must be fetched fresh rather than donated!
             harness.coordinator.toggleFavorite(try #require(harness.currentItem(item40KB.id)))
             spyStore.resetRecordedCalls()
             await runSearchAndWait("confi")
             #expect(spyStore.fetchSearchTextsCalls.count == 1)
-            #expect(spyStore.fetchSearchTextsCalls[0].ids.count == harness.model.items.count)
+            let expectedIncompleteIDs = Set(harness.model.items.filter { !$0.hasCompleteHeaderSearchText }.map(\.id))
+            #expect(Set(spyStore.fetchSearchTextsCalls[0].ids) == expectedIncompleteIDs)
 
             controller.clearSearchAfterHiddenInterval()
             #expect(harness.model.searchQuery.isEmpty)
@@ -1833,6 +1835,7 @@ extension SharedProcessStateTests {
                 var cumulativeHTMLUTF8Bytes: Int64 = 0
                 var expectedTailSentinelIDs = Set<UUID>()
                 var expectedEncryptedSentinelIDs = Set<UUID>()
+                var perfSummaryRows: [String] = []
 
                 for milestone in [5_000, 25_000, 100_000] {
                     let batchStats = try Self.bulkInsertSyntheticV5Rows(
@@ -1924,7 +1927,9 @@ extension SharedProcessStateTests {
                         toolbar.delegate = controller
                         controller.attachToolbar(toolbar)
 
-                        // 3. Cold first-keystroke fetchSearchTexts + HistorySearchJob.run + synchronous flushPendingSearch()!
+                        // 3. Cold first-keystroke fetchSearchTexts (incomplete/encrypted rows only) + HistorySearchJob.run + flush!
+                        let expectedSQLiteFetchCount = headers.filter { !$0.hasCompleteHeaderSearchText }.count
+                        #expect(expectedSQLiteFetchCount < milestone)
                         spyStore.resetRecordedCalls()
                         let query = "scale_needle"
                         let firstKeystrokeStart = ContinuousClock.now
@@ -1934,7 +1939,7 @@ extension SharedProcessStateTests {
 
                         #expect(firstKeystrokeElapsed < .seconds(20), "Cold first-keystroke took \(firstKeystrokeElapsed) at \(milestone) rows")
                         #expect(spyStore.fetchSearchTextsCalls.count == 1)
-                        #expect(spyStore.fetchSearchTextsCalls[0].ids.count == milestone)
+                        #expect(spyStore.fetchSearchTextsCalls[0].ids.count == expectedSQLiteFetchCount)
 
                         let searchResult = try #require(model.searchResult)
                         #expect(searchResult.corpus.hasCompleteTexts)
@@ -1966,12 +1971,110 @@ extension SharedProcessStateTests {
                         }
                         #expect(mismatchCount == 0, "Found \(mismatchCount) Foundation parity mismatches at \(milestone) rows")
 
+                        // 4. Warm prefix refinement + single-item 40 KB hydration + capture latency metrics.
+                        let warmStart = ContinuousClock.now
+                        controller.historyToolbar(toolbar, didChangeSearchQuery: "scale_needle_tail")
+                        controller.selectHistoryItemOnOpen()
+                        let warmElapsed = ContinuousClock.now - warmStart
+
                         controller.clearSearchAfterHiddenInterval()
                         #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
                         #expect(model.searchResult == nil)
+
+                        var hydrate40KBMS = 0.0
+                        if let richHeader = headers.first(where: { $0.kind == .richText }) {
+                            let hydrateStart = ContinuousClock.now
+                            let loaded = try spyStore.loadingContent(of: richHeader, scope: .full)
+                            hydrate40KBMS = Self.durationMilliseconds(ContinuousClock.now - hydrateStart)
+                            #expect(loaded.html != nil)
+                        }
+
+                        var capturePlainMedMS: Double?
+                        var captureSecretMedMS: Double?
+                        if milestone == 100_000 {
+                            var plainTimes: [Double] = []
+                            for i in 0..<20 {
+                                let item = ClipboardItem(
+                                    kind: .text,
+                                    text: "Perf plain capture #\(i) \(UUID().uuidString)",
+                                    sourceAppName: "ScaleApp",
+                                    sourceBundleIdentifier: "com.example.scale"
+                                )
+                                let t0 = ContinuousClock.now
+                                _ = try spyStore.capture(item, updatesCopySequence: false)
+                                plainTimes.append(Self.durationMilliseconds(ContinuousClock.now - t0))
+                            }
+                            plainTimes.sort()
+                            capturePlainMedMS = plainTimes[10]
+
+                            let tokenPrefix = ["sk", "-perf-"].joined()
+                            var secretTimes: [Double] = []
+                            for i in 0..<20 {
+                                let item = ClipboardItem(
+                                    kind: .text,
+                                    text: "Bearer \(tokenPrefix)\(i)-\(UUID().uuidString)",
+                                    sourceAppName: "ScaleApp",
+                                    sourceBundleIdentifier: "com.example.scale",
+                                    sensitivity: .sensitive
+                                )
+                                let t0 = ContinuousClock.now
+                                _ = try spyStore.capture(item, updatesCopySequence: false)
+                                secretTimes.append(Self.durationMilliseconds(ContinuousClock.now - t0))
+                            }
+                            secretTimes.sort()
+                            captureSecretMedMS = secretTimes[10]
+                        }
+
+                        let dbSizeMB = Double(Self.sqliteDiskBytes(in: supportDir)) / (1024.0 * 1024.0)
+                        let fetchMS = Self.durationMilliseconds(fetchElapsed)
+                        let ramDeltaMB = Double(headerFootprintDelta) / (1024.0 * 1024.0)
+                        let coldMS = Self.durationMilliseconds(firstKeystrokeElapsed)
+                        let warmMS = Self.durationMilliseconds(warmElapsed)
+                        let capSummary = if let p = capturePlainMedMS, let s = captureSecretMedMS {
+                            String(format: "%.2f / %.2f ms", p, s)
+                        } else {
+                            "—"
+                        }
+                        perfSummaryRows.append(String(
+                            format: "| %dk | %.1f MB | %.1f ms | %.1f MB | %.1f ms (%d DB rows) | %.1f ms | %.2f ms | %@ |",
+                            milestone / 1_000, dbSizeMB, fetchMS, ramDeltaMB, coldMS, expectedSQLiteFetchCount, warmMS, hydrate40KBMS, capSummary
+                        ))
                     }
                 }
+
+                if let summaryPath = ProcessInfo.processInfo.environment["PERF_SUMMARY_PATH"],
+                   !summaryPath.isEmpty {
+                    let markdown = ([
+                        "### Persistence & Search Scale Metrics (Debug Test Build)",
+                        "",
+                        "| Rows | DB Size | Startup `fetchAll()` | Idle RAM Δ (`phys_footprint`) | Cold 1st-Keystroke Search | Warm Prefix Refinement | Hydrate 40 KB Row | Capture (plain / secret med) |",
+                        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+                    ] + perfSummaryRows + [""]).joined(separator: "\n")
+                    let summaryURL = URL(fileURLWithPath: summaryPath)
+                    try FileManager.default.createDirectory(
+                        at: summaryURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try Data(markdown.utf8).write(to: summaryURL, options: .atomic)
+                }
             }
+        }
+
+        private nonisolated static func durationMilliseconds(_ duration: Duration) -> Double {
+            Double(duration.components.seconds) * 1000.0 + Double(duration.components.attoseconds) / 1e15
+        }
+
+        private nonisolated static func sqliteDiskBytes(in directory: URL) -> Int64 {
+            let fileManager = FileManager.default
+            var total: Int64 = 0
+            for fileName in ["History.sqlite", "History.sqlite-wal", "History.sqlite-shm"] {
+                let path = directory.appendingPathComponent(fileName).path
+                if let attrs = try? fileManager.attributesOfItem(atPath: path),
+                   let size = attrs[.size] as? NSNumber {
+                    total += size.int64Value
+                }
+            }
+            return total
         }
 
         private nonisolated static func currentPhysFootprintBytes() -> Int64 {

@@ -31,35 +31,25 @@ DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$ROOT_DIR/DerivedData/Release}"
 REPO="wgordon17/ClipBook"
 PREVIOUS_BUILD=""
 OUTPUT_DIR="$ROOT_DIR/Releases/fork"
-APP_ARCHS_EXPLICIT=0
-if [[ -n "${APP_ARCHS+x}" ]]; then
-  APP_ARCHS_EXPLICIT=1
-fi
 APP_ARCHS="${APP_ARCHS:-arm64 x86_64}"
 SMOKE_TEST=0
-SIGN_AND_VERIFY_APP=""
 SPARKLE_CACHE_STAGE_DIR=""
-VERIFY_SCRATCH_DIR=""
 
 cleanup_release_fork() {
   if [[ -n "${SPARKLE_CACHE_STAGE_DIR:-}" ]]; then
     rm -rf "$SPARKLE_CACHE_STAGE_DIR"
-  fi
-  if [[ -n "${VERIFY_SCRATCH_DIR:-}" ]]; then
-    rm -rf "$VERIFY_SCRATCH_DIR"
   fi
 }
 trap cleanup_release_fork EXIT
 
 usage() {
   printf '%s\n' "Usage: ./scripts/release-fork.sh --run-number N [options]"
-  printf '%s\n' "       ./scripts/release-fork.sh --sign-and-verify-app PATH [options]"
   printf '%s\n' ""
   printf '%s\n' "Builds, signs (Hardened Runtime, inside-out), packages (.dmg), and generates"
   printf '%s\n' "an Ed25519-signed Sparkle appcast.xml for the ClipBook fork."
   printf '%s\n' ""
   printf '%s\n' "Options:"
-  printf '%s\n' "  --run-number N               Positive integer CI/release run number (required for release builds; omitted with --sign-and-verify-app)."
+  printf '%s\n' "  --run-number N               Required positive integer CI/release run number."
   printf '%s\n' "  --upstream-version X.Y.Z     Upstream version baseline (default: FORK_UPSTREAM_VERSION)."
   printf '%s\n' "  --signing-identity ID        macOS codesign identity (default: ClipBook Fork Code Signing)."
   printf '%s\n' "  --keychain PATH              Optional keychain passed to macOS codesign."
@@ -72,7 +62,6 @@ usage() {
   printf '%s\n' "  --previous-build INT         Optional monotonic CFBundleVersion floor."
   printf '%s\n' "  --output-dir DIR             Output root directory (default: Releases/fork)."
   printf '%s\n' "  --arch-list \"arm64 x86_64\"   Space-separated architectures to archive."
-  printf '%s\n' "  --sign-and-verify-app PATH   Sign and verify an existing ClipBook.app bundle in place (supports --signing-identity/--keychain, SIGNING_IDENTITY=- ad-hoc, and --p12-file modes; cannot be combined with --run-number or --ed-key-file)."
   printf '%s\n' "  --smoke-test                 Unprivileged verification mode (ephemeral Ed25519; ad-hoc unless --p12-file is set)."
   printf '%s\n' "  -h, --help                   Show this help."
 }
@@ -150,12 +139,6 @@ while [[ $# -gt 0 ]]; do
     --arch-list)
       require_option_arg "$@"
       APP_ARCHS="$2"
-      APP_ARCHS_EXPLICIT=1
-      shift 2
-      ;;
-    --sign-and-verify-app)
-      require_option_arg "$@"
-      SIGN_AND_VERIFY_APP="$2"
       shift 2
       ;;
     --smoke-test)
@@ -297,70 +280,6 @@ run_rcodesign() {
 }
 
 # Normalize paths, validate version/run-number, enforce monotonic build floor, prepare workspace.
-if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
-  unset FALLBACK_ED_PRIVKEY
-
-  if [[ -n "$RUN_NUMBER" || -n "$ED_KEY_FILE" ]]; then
-    printf 'Error: --sign-and-verify-app cannot be combined with --run-number or --ed-key-file.\n' >&2
-    exit 1
-  fi
-  if [[ ! -d "$SIGN_AND_VERIFY_APP" ]]; then
-    printf 'Error: --sign-and-verify-app bundle directory does not exist: %s\n' "$SIGN_AND_VERIFY_APP" >&2
-    exit 1
-  fi
-  APP_PATH="$(cd "$SIGN_AND_VERIFY_APP" && pwd)"
-  if [[ ! -f "$APP_PATH/Contents/MacOS/$APP_NAME" ]]; then
-    printf 'Error: --sign-and-verify-app bundle is missing Contents/MacOS/%s: %s\n' "$APP_NAME" "$APP_PATH" >&2
-    exit 1
-  fi
-
-  normalize_signing_cli_paths
-
-  if [[ ! -f "$ENTITLEMENTS_PATH" ]]; then
-    printf 'Error: Release entitlements file not found: %s\n' "$ENTITLEMENTS_PATH" >&2
-    exit 1
-  fi
-
-  require_tool xcrun
-  require_tool otool
-  require_tool ditto
-
-  if [[ "$APP_ARCHS_EXPLICIT" -eq 0 ]]; then
-    APP_ARCHS="$(xcrun lipo -archs "$APP_PATH/Contents/MacOS/$APP_NAME")"
-  fi
-  parse_and_validate_arch_list
-
-  VERIFY_SCRATCH_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/var/tmp}/clipbook-verify.XXXXXXXXXX")"
-  chmod 700 "$VERIFY_SCRATCH_DIR"
-  WORK_DIR="$VERIFY_SCRATCH_DIR"
-  STAGING_PATH="$VERIFY_SCRATCH_DIR/dmg-staging"
-  mkdir -p "$STAGING_PATH"
-
-  SMOKE_PUBLIC_ED_KEY=""
-  EFFECTIVE_SIGNING_IDENTITY="$SIGNING_IDENTITY"
-  USES_ADHOC_SIGNING=0
-  LEAF_SHA1=""
-  REPO_CERT_SHA1=""
-  EXPECTED_AUTHORITY="$SIGNING_IDENTITY"
-
-  if [[ -n "$P12_FILE" ]]; then
-    extract_and_verify_p12_leaf 3600
-  else
-    if [[ "$SMOKE_TEST" -eq 1 ]]; then
-      EFFECTIVE_SIGNING_IDENTITY="-"
-    fi
-    if [[ -z "$EFFECTIVE_SIGNING_IDENTITY" ]]; then
-      printf 'Error: --signing-identity cannot be empty.\n' >&2
-      exit 1
-    fi
-    if [[ "$EFFECTIVE_SIGNING_IDENTITY" == "-" ]]; then
-      USES_ADHOC_SIGNING=1
-    elif [[ -f "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" && -x /usr/bin/openssl ]]; then
-      REPO_RAW_FP="$(/usr/bin/openssl x509 -in "$ROOT_DIR/scripts/ClipBookForkCodeSigning.crt" -noout -fingerprint -sha1 2>/dev/null || true)"
-      REPO_CERT_SHA1="$(printf '%s' "${REPO_RAW_FP#*=}" | tr -d ':\r\n[:space:]' | tr '[:upper:]' '[:lower:]')"
-    fi
-  fi
-else
 mkdir -p "$OUTPUT_DIR" "$DERIVED_DATA_PATH"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 DERIVED_DATA_PATH="$(cd "$DERIVED_DATA_PATH" && pwd)"
@@ -615,7 +534,6 @@ if [[ "$SMOKE_TEST" -eq 1 ]]; then
 fi
 if [[ "$REPO" != "wgordon17/ClipBook" ]]; then
   /usr/libexec/PlistBuddy -c "Set :SUFeedURL https://github.com/${REPO}/releases/latest/download/appcast.xml" "$APP_PATH/Contents/Info.plist"
-fi
 fi
 
 # Inside-out Hardened Runtime signing across all 6 targets (never codesign --deep).
@@ -1051,10 +969,6 @@ assert_plist_value() {
 }
 
 assert_plist_value "CFBundleIdentifier" "com.ikryanov.clipbook.v2"
-if [[ -n "$SIGN_AND_VERIFY_APP" ]]; then
-  printf 'Signed and verified app bundle: %s\n' "$APP_PATH"
-  exit 0
-fi
 assert_plist_value "CFBundleShortVersionString" "$MARKETING_VERSION"
 assert_plist_value "CFBundleVersion" "$BUILD_NUMBER"
 assert_plist_value "SUFeedURL" "https://github.com/${REPO}/releases/latest/download/appcast.xml"

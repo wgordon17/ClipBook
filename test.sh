@@ -31,6 +31,8 @@ usage() {
   printf '%s\n' "                           must not exist yet."
   printf '%s\n' "  SNAPSHOT_EXPORT_DIR=PATH Export rendered PNGs for recorded, failed, or"
   printf '%s\n' "                           unrecorded-OS view snapshots under PATH/macOS-<major>/."
+  printf '%s\n' "  PERF_SUMMARY_PATH=PATH   Write Markdown persistence/search performance metrics"
+  printf '%s\n' "                           from SearchPipelineTests to PATH."
   printf '%s\n' "  -h, --help               Show this help."
 }
 
@@ -100,6 +102,15 @@ if [[ -n "${SNAPSHOT_EXPORT_DIR:-}" ]]; then
     *) SNAPSHOT_EXPORT_DIR="$PWD/$SNAPSHOT_EXPORT_DIR" ;;
   esac
   export TEST_RUNNER_SNAPSHOT_EXPORT_DIR="$SNAPSHOT_EXPORT_DIR"
+fi
+
+unset TEST_RUNNER_PERF_SUMMARY_PATH
+if [[ -n "${PERF_SUMMARY_PATH:-}" ]]; then
+  case "$PERF_SUMMARY_PATH" in
+    /*) ;;
+    *) PERF_SUMMARY_PATH="$PWD/$PERF_SUMMARY_PATH" ;;
+  esac
+  export TEST_RUNNER_PERF_SUMMARY_PATH="$PERF_SUMMARY_PATH"
 fi
 
 for pattern in ${FILTER_PATTERNS[@]+"${FILTER_PATTERNS[@]}"}; do

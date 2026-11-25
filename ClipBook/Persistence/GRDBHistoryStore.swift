@@ -11,6 +11,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     static let defaultMigratedTagColor = "#3B85ED"
     static let walJournalSizeLimit = 4_194_304
     static let searchInClauseBatchLimit = 500
+    static let searchInClauseChunkedMaxIDs = 25_000
     static let migrationBatchSize = 500
     static let dontSaveContentLifetime = 0
 
@@ -1008,51 +1009,19 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
     }
 
-    private nonisolated struct SearchTextQueryPlan {
-        let tagIDsByClipID: [String: [Int]]
-        let clipWhereClause: String
-        let clipArguments: StatementArguments
-    }
-
-    private static func prepareSearchTextQueryPlan(
+    private static func fetchSearchTextBatch(
         in db: Database,
-        idCount: Int,
+        clipWhereClause: String,
+        clipArguments: StatementArguments,
+        tagSQL: String,
+        tagArguments: StatementArguments,
         indicesByIDString: [String: [Int]],
-        trashed: Bool,
+        tagNamesByID: [Tag.ID: String],
+        keys: ClipBookDerivedKeys,
+        decoder: JSONDecoder,
+        results: inout [String?],
         isCancelled: () -> Bool
-    ) throws -> SearchTextQueryPlan? {
-        let deletedFilter = trashed ? "IS NOT NULL" : "IS NULL"
-        let tagSQL: String
-        let tagArguments: StatementArguments
-        let clipWhereClause: String
-        let clipArguments: StatementArguments
-
-        if idCount <= searchInClauseBatchLimit {
-            let idStrings = Array(indicesByIDString.keys)
-            let placeholders = Array(repeating: "?", count: idStrings.count).joined(separator: ", ")
-            let arguments = StatementArguments(idStrings)
-            tagSQL = """
-                SELECT ct.clipId, ct.tagId
-                FROM clip_tags ct
-                JOIN tags t ON t.id = ct.tagId
-                WHERE ct.clipId IN (\(placeholders))
-                ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
-                """
-            tagArguments = arguments
-            clipWhereClause = "c.id IN (\(placeholders)) AND c.deletedAt \(deletedFilter)"
-            clipArguments = arguments
-        } else {
-            tagSQL = """
-                SELECT ct.clipId, ct.tagId
-                FROM clip_tags ct
-                JOIN tags t ON t.id = ct.tagId
-                ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
-                """
-            tagArguments = StatementArguments()
-            clipWhereClause = "c.deletedAt \(deletedFilter)"
-            clipArguments = StatementArguments()
-        }
-
+    ) throws -> Bool {
         let tagCursor = try Row.fetchCursor(db, sql: tagSQL, arguments: tagArguments)
         var tagIDsByClipID: [String: [Int]] = [:]
         let completedTags = try drainCursorInBatches(tagCursor, isCancelled: isCancelled) { tagRow in
@@ -1064,14 +1033,34 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             tagIDsByClipID[clipIDString, default: []].append(tagID)
         }
         guard completedTags, !isCancelled() else {
-            return nil
+            return false
         }
 
-        return SearchTextQueryPlan(
-            tagIDsByClipID: tagIDsByClipID,
-            clipWhereClause: clipWhereClause,
-            clipArguments: clipArguments
-        )
+        let clipSQL = """
+            SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
+                   cc.text, cc.qrCodeText
+            FROM clips c
+            LEFT JOIN clip_contents cc ON cc.clipId = c.id
+            WHERE \(clipWhereClause)
+            """
+        let cursor = try Row.fetchCursor(db, sql: clipSQL, arguments: clipArguments)
+        return try drainCursorInBatches(cursor, isCancelled: isCancelled) { row in
+            guard let idString: String = row["id"],
+                  let targetIndices = indicesByIDString[idString] else {
+                return
+            }
+            let searchText = decodeSearchTextForRow(
+                row,
+                idString: idString,
+                tagIDs: tagIDsByClipID[idString] ?? [],
+                tagNamesByID: tagNamesByID,
+                keys: keys,
+                decoder: decoder
+            )
+            for index in targetIndices {
+                results[index] = searchText
+            }
+        }
     }
 
     func fetchSearchTexts(
@@ -1093,45 +1082,72 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             indicesByIDString[id.uuidString, default: []].append(index)
         }
 
+        let deletedFilter = trashed ? "IS NOT NULL" : "IS NULL"
         return try withRead { db, keys in
-            guard !isCancelled(),
-                  let plan = try Self.prepareSearchTextQueryPlan(
-                      in: db,
-                      idCount: ids.count,
-                      indicesByIDString: indicesByIDString,
-                      trashed: trashed,
-                      isCancelled: isCancelled
-                  ) else {
+            guard !isCancelled() else {
                 return nil
             }
-
             var results = [String?](repeating: nil, count: ids.count)
             let decoder = Self.makeJSONDecoder()
-            let clipSQL = """
-                SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
-                       cc.text, cc.qrCodeText
-                FROM clips c
-                LEFT JOIN clip_contents cc ON cc.clipId = c.id
-                WHERE \(plan.clipWhereClause)
-                """
-            let cursor = try Row.fetchCursor(db, sql: clipSQL, arguments: plan.clipArguments)
-            let completed = try Self.drainCursorInBatches(cursor, isCancelled: isCancelled) { row in
-                guard let idString: String = row["id"],
-                      let targetIndices = indicesByIDString[idString] else {
-                    return
+            let uniqueIDStrings = Array(indicesByIDString.keys)
+
+            if uniqueIDStrings.count <= Self.searchInClauseChunkedMaxIDs {
+                var offset = 0
+                while offset < uniqueIDStrings.count {
+                    guard !isCancelled() else {
+                        return nil
+                    }
+                    let end = min(offset + Self.searchInClauseBatchLimit, uniqueIDStrings.count)
+                    let chunk = Array(uniqueIDStrings[offset..<end])
+                    let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
+                    let arguments = StatementArguments(chunk)
+                    let tagSQL = """
+                        SELECT ct.clipId, ct.tagId
+                        FROM clip_tags ct
+                        JOIN tags t ON t.id = ct.tagId
+                        WHERE ct.clipId IN (\(placeholders))
+                        ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
+                        """
+                    let completed = try Self.fetchSearchTextBatch(
+                        in: db,
+                        clipWhereClause: "c.id IN (\(placeholders)) AND c.deletedAt \(deletedFilter)",
+                        clipArguments: arguments,
+                        tagSQL: tagSQL,
+                        tagArguments: arguments,
+                        indicesByIDString: indicesByIDString,
+                        tagNamesByID: tagNamesByID,
+                        keys: keys,
+                        decoder: decoder,
+                        results: &results,
+                        isCancelled: isCancelled
+                    )
+                    guard completed else {
+                        return nil
+                    }
+                    offset = end
                 }
-                let searchText = Self.decodeSearchTextForRow(
-                    row,
-                    idString: idString,
-                    tagIDs: plan.tagIDsByClipID[idString] ?? [],
-                    tagNamesByID: tagNamesByID,
-                    keys: keys,
-                    decoder: decoder
-                )
-                for index in targetIndices {
-                    results[index] = searchText
-                }
+                return results
             }
+
+            let tagSQL = """
+                SELECT ct.clipId, ct.tagId
+                FROM clip_tags ct
+                JOIN tags t ON t.id = ct.tagId
+                ORDER BY t.name COLLATE NOCASE ASC, t.id ASC
+                """
+            let completed = try Self.fetchSearchTextBatch(
+                in: db,
+                clipWhereClause: "c.deletedAt \(deletedFilter)",
+                clipArguments: StatementArguments(),
+                tagSQL: tagSQL,
+                tagArguments: StatementArguments(),
+                indicesByIDString: indicesByIDString,
+                tagNamesByID: tagNamesByID,
+                keys: keys,
+                decoder: decoder,
+                results: &results,
+                isCancelled: isCancelled
+            )
             return completed ? results : nil
         }
     }
