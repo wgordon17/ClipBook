@@ -22,7 +22,7 @@ KEY_HEX="$(security find-generic-password \
   -w ~/Library/Keychains/login.keychain-db)"
 ```
 
-**Headless / SSH session** (native `SecItemAdd` items omit `apple-tool:` from the partition list, so `security find-generic-password -w` fails with `errSecInteractionNotAllowed` until `apple-tool:` is added; omit `-k` so `security` prompts on the TTY rather than exposing your keychain password in `ps`):
+**Headless / SSH session** (native `SecItemAdd` items omit `apple-tool:` from the partition list, so `security find-generic-password -w` fails with `errSecInteractionNotAllowed` until `apple-tool:` is added; `-S` replaces the item's entire partition list, so keep `unsigned:` for self-signed Fork builds — and include `teamid:<TEAMID>` if using an Apple Developer ID build — and omit `-k` so `security` prompts on the TTY rather than exposing your keychain password in `ps`):
 ```bash
 security unlock-keychain ~/Library/Keychains/login.keychain-db
 security set-generic-password-partition-list \
@@ -55,11 +55,11 @@ All `AES-256-GCM` ciphertexts use CryptoKit's `combined` layout: `nonce (12 B) |
   - **Asset AAD:** `0x01 || uint8(len(role)) || role_utf8 || clip_uuid_16bytes`, where `role` is `"image"`, `"link-preview"`, or `"link-favicon"`.
 
 ### Passphrase-Encrypted `.clipbookarchive` (`formatVersion = 2`)
-- **Passphrase KDF:** Unicode NFC passphrase → `PBKDF2-HMAC-SHA256(salt=base64(manifest.encryption.saltBase64), iterations=manifest.encryption.iterations, length=32)` → `archiveMasterKey`
+- **Passphrase KDF:** Unicode NFC passphrase → `PBKDF2-HMAC-SHA256(salt=base64_decode(manifest.encryption.saltBase64), iterations=manifest.encryption.iterations, length=32)` → `archiveMasterKey`
 - **HKDF-SHA256 salt:** `manifest.encryption.archiveID.lower()` (UTF-8)
 - **AEAD key:** info = `clipbook.archive.aes256gcm.v2` (32 bytes)
 - **Encrypted entries** (`tags.json.enc`, `history.json.enc`, `assets/**/*.enc`), sealed with `b"CBARC02\x00" || combined`:
-  - **Entry AAD:** `0x02 || archive_uuid_16bytes || sha256(raw manifest.json bytes) || uint16_be(len(relativePath)) || relativePath_utf8` (e.g. `"history.json"`, `"tags.json"`, `"assets/Images/<file>"`).
+  - **Entry AAD:** `0x02 || archive_uuid_16bytes || sha256(raw manifest.json bytes) || uint16_be(len(relativePath)) || relativePath_utf8`, where `relativePath` is the on-disk encrypted path including `.enc` (e.g. `"tags.json.enc"`, `"history.json.enc"`, `"assets/images/<id>.enc"`, `"assets/link-previews/<id>-preview.enc"`).
 
 ---
 
@@ -79,8 +79,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 support = pathlib.Path(os.environ["SUPPORT_DIR"])
 out = pathlib.Path(os.environ["OUT_DIR"])
-out.mkdir(parents=True, exist_ok=True)
-(out / "assets").mkdir(exist_ok=True)
+os.umask(0o077)
+out.mkdir(parents=True, exist_ok=True, mode=0o700)
+(out / "assets").mkdir(exist_ok=True, mode=0o700)
 master = bytes.fromhex(os.environ["KEY_HEX"].strip())
 salt = b"com.ikryanov.clipbook.v2.hkdf.v1"
 db_key = AESGCM(HKDF(hashes.SHA256(), 32, salt, b"clipbook.db.column.aes256gcm.v1").derive(master))
@@ -115,15 +116,19 @@ with tempfile.TemporaryDirectory() as tmp:
 items = []
 for cid, kind, copied_at, enc, title, asset_path, fp_data, text, qr, html in rows:
     uid = uuid.UUID(bytes=cid) if isinstance(cid, bytes) else uuid.UUID(cid)
-    dec = lambda v, t, col: (b := open_col(v, t, col, uid, enc)) and b.decode("utf-8", "replace")
+    dec = lambda v, t, col: None if (b := open_col(v, t, col, uid, enc)) is None else b.decode("utf-8", "replace")
     ap = dec(asset_path, "clips", "assetPath")
     out_asset = None
-    if ap and pathlib.Path(ap).is_file():
-        data = open_asset(ap, "image", uid)
-        ext = ".png" if data.startswith(b"\x89PNG") else (pathlib.Path(ap).suffix if not ap.endswith(".enc") else ".bin")
-        dest = out / "assets" / f"{uid}{ext}"
-        dest.write_bytes(data)
-        out_asset = str(dest)
+    if ap:
+        asset_src = pathlib.Path(ap)
+        if not asset_src.is_file():
+            asset_src = support / "Images" / asset_src.name
+        if asset_src.is_file():
+            data = open_asset(asset_src, "image", uid)
+            ext = ".png" if data.startswith(b"\x89PNG") else (asset_src.suffix if not asset_src.name.endswith(".enc") else ".bin")
+            dest = out / "assets" / f"{uid}{ext}"
+            dest.write_bytes(data)
+            out_asset = str(dest)
     items.append({
         "id": str(uid), "kind": kind, "copiedAt": copied_at,
         "title": dec(title, "clips", "title"), "text": dec(text, "clip_contents", "text"),
@@ -152,7 +157,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 src = pathlib.Path(os.environ["ARCHIVE_DIR"])
 out = pathlib.Path(os.environ["OUT_DIR"])
-out.mkdir(parents=True, exist_ok=True)
+os.umask(0o077)
+out.mkdir(parents=True, exist_ok=True, mode=0o700)
 manifest_raw = (src / "manifest.json").read_bytes()
 manifest = json.loads(manifest_raw)
 enc = manifest["encryption"]
@@ -163,22 +169,22 @@ pw = unicodedata.normalize("NFC", getpass.getpass("Archive passphrase: ")).encod
 master = hashlib.pbkdf2_hmac("sha256", pw, base64.b64decode(enc["saltBase64"]), enc["iterations"], 32)
 aead = AESGCM(HKDF(hashes.SHA256(), 32, str(archive_id).lower().encode(), b"clipbook.archive.aes256gcm.v2").derive(master))
 
-def open_entry(rel_plain, enc_path):
+def open_entry(rel_enc, enc_path):
     raw = enc_path.read_bytes()
     assert raw.startswith(b"CBARC02\x00"), f"bad magic: {enc_path}"
-    p = rel_plain.encode("utf-8")
+    p = rel_enc.encode("utf-8")
     aad = bytes([2]) + archive_id.bytes + manifest_sha + struct.pack(">H", len(p)) + p
     return aead.decrypt(raw[8:20], raw[20:], aad)
 
 for name in ("tags.json", "history.json"):
-    (out / name).write_bytes(open_entry(name, src / f"{name}.enc"))
+    (out / name).write_bytes(open_entry(f"{name}.enc", src / f"{name}.enc"))
 assets_dir = src / "assets"
 if assets_dir.is_dir():
     for enc_file in assets_dir.rglob("*.enc"):
-        rel = enc_file.relative_to(src).as_posix()[:-4]  # strip .enc
-        dest = out / rel
+        rel_enc = enc_file.relative_to(src).as_posix()
+        dest = out / rel_enc[:-4]  # strip .enc for plaintext output
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(open_entry(rel, enc_file))
+        dest.write_bytes(open_entry(rel_enc, enc_file))
 print(f"Decrypted archive to {out}")
 PY
 ```

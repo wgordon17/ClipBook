@@ -12,6 +12,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
     static let walJournalSizeLimit = 4_194_304
     static let searchInClauseBatchLimit = 500
     static let searchInClauseChunkedMaxIDs = 25_000
+    private static let fullSearchInClausePlaceholders = Array(
+        repeating: "?",
+        count: searchInClauseBatchLimit
+    ).joined(separator: ", ")
     static let migrationBatchSize = 500
     static let dontSaveContentLifetime = 0
 
@@ -1015,6 +1019,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         clipArguments: StatementArguments,
         tagSQL: String,
         tagArguments: StatementArguments,
+        useCachedStatements: Bool,
         indicesByIDString: [String: [Int]],
         tagNamesByID: [Tag.ID: String],
         keys: ClipBookDerivedKeys,
@@ -1022,18 +1027,23 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         results: inout [String?],
         isCancelled: () -> Bool
     ) throws -> Bool {
-        let tagCursor = try Row.fetchCursor(db, sql: tagSQL, arguments: tagArguments)
         var tagIDsByClipID: [String: [Int]] = [:]
-        let completedTags = try drainCursorInBatches(tagCursor, isCancelled: isCancelled) { tagRow in
-            let clipIDString: String = tagRow["clipId"]
-            guard indicesByIDString[clipIDString] != nil else {
-                return
+        if !tagNamesByID.isEmpty {
+            let tagStmt = useCachedStatements
+                ? try db.cachedStatement(sql: tagSQL)
+                : try db.makeStatement(sql: tagSQL)
+            let tagCursor = try Row.fetchCursor(tagStmt, arguments: tagArguments)
+            let completedTags = try drainCursorInBatches(tagCursor, isCancelled: isCancelled) { tagRow in
+                let clipIDString: String = tagRow["clipId"]
+                guard indicesByIDString[clipIDString] != nil else {
+                    return
+                }
+                let tagID: Int = tagRow["tagId"]
+                tagIDsByClipID[clipIDString, default: []].append(tagID)
             }
-            let tagID: Int = tagRow["tagId"]
-            tagIDsByClipID[clipIDString, default: []].append(tagID)
-        }
-        guard completedTags, !isCancelled() else {
-            return false
+            guard completedTags, !isCancelled() else {
+                return false
+            }
         }
 
         let clipSQL = """
@@ -1043,7 +1053,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             LEFT JOIN clip_contents cc ON cc.clipId = c.id
             WHERE \(clipWhereClause)
             """
-        let cursor = try Row.fetchCursor(db, sql: clipSQL, arguments: clipArguments)
+        let clipStmt = useCachedStatements
+            ? try db.cachedStatement(sql: clipSQL)
+            : try db.makeStatement(sql: clipSQL)
+        let cursor = try Row.fetchCursor(clipStmt, arguments: clipArguments)
         return try drainCursorInBatches(cursor, isCancelled: isCancelled) { row in
             guard let idString: String = row["id"],
                   let targetIndices = indicesByIDString[idString] else {
@@ -1099,7 +1112,10 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                     }
                     let end = min(offset + Self.searchInClauseBatchLimit, uniqueIDStrings.count)
                     let chunk = Array(uniqueIDStrings[offset..<end])
-                    let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
+                    let isFullBatch = chunk.count == Self.searchInClauseBatchLimit
+                    let placeholders = isFullBatch
+                        ? Self.fullSearchInClausePlaceholders
+                        : Array(repeating: "?", count: chunk.count).joined(separator: ", ")
                     let arguments = StatementArguments(chunk)
                     let tagSQL = """
                         SELECT ct.clipId, ct.tagId
@@ -1114,6 +1130,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                         clipArguments: arguments,
                         tagSQL: tagSQL,
                         tagArguments: arguments,
+                        useCachedStatements: isFullBatch,
                         indicesByIDString: indicesByIDString,
                         tagNamesByID: tagNamesByID,
                         keys: keys,
@@ -1141,6 +1158,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 clipArguments: StatementArguments(),
                 tagSQL: tagSQL,
                 tagArguments: StatementArguments(),
+                useCachedStatements: true,
                 indicesByIDString: indicesByIDString,
                 tagNamesByID: tagNamesByID,
                 keys: keys,
@@ -1538,6 +1556,7 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         )
 
         workingItem.storedContentKey = hmacKey
+        workingItem.isStoredEncrypted = shouldEncrypt
         return workingItem
     }
 

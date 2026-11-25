@@ -959,6 +959,49 @@ enum SQLiteHistoryStoreAndArchiveTests {
                 )
                 #expect(midScanCancelled == nil)
                 #expect(cancelCheckCount >= 3)
+
+                // 4. > searchInClauseChunkedMaxIDs (25,001 unique IDs) exercises the full-table scan fallback
+                //    with positional alignment, trashed: true/false filtering, and cancellation.
+                let fullScanCount = GRDBHistoryStore.searchInClauseChunkedMaxIDs + 1
+                var fullScanIDs = (0..<(fullScanCount - 3)).map { _ in UUID() }
+                fullScanIDs.insert(bulkIDs[0], at: 0)
+                fullScanIDs.insert(bulkIDs[500], at: 12_500)
+                fullScanIDs.insert(trashedItem.id, at: fullScanCount - 1)
+                #expect(fullScanIDs.count == fullScanCount)
+
+                let fullScanActive = try #require(
+                    try store.fetchSearchTexts(
+                        for: fullScanIDs,
+                        trashed: false,
+                        tagNamesByID: tagNamesByID,
+                        isCancelled: { false }
+                    )
+                )
+                #expect(fullScanActive.count == fullScanCount)
+                #expect(try #require(fullScanActive[0]).contains("BULK_SECRET_0_990011223344"))
+                #expect(try #require(fullScanActive[0]).contains("BulkTag"))
+                #expect(try #require(fullScanActive[12_500]).contains("BULK_SECRET_500_990011223344"))
+                #expect(fullScanActive[1] == nil)
+                #expect(fullScanActive[fullScanCount - 1] == nil)
+
+                let fullScanTrashed = try #require(
+                    try store.fetchSearchTexts(
+                        for: fullScanIDs,
+                        trashed: true,
+                        tagNamesByID: tagNamesByID,
+                        isCancelled: { false }
+                    )
+                )
+                #expect(fullScanTrashed[0] == nil)
+                #expect(try #require(fullScanTrashed[fullScanCount - 1]).contains("Trashed Searchable Note"))
+
+                let fullScanCancelled = try store.fetchSearchTexts(
+                    for: fullScanIDs,
+                    trashed: false,
+                    tagNamesByID: tagNamesByID,
+                    isCancelled: { true }
+                )
+                #expect(fullScanCancelled == nil)
             }
         }
 

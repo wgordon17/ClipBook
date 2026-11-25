@@ -440,7 +440,8 @@ nonisolated extension GRDBHistoryStore {
             sensitivity: metadata.sensitivity,
             expiresAt: metadata.expiresAt,
             deletedAt: metadata.deletedAt,
-            storedContentKey: metadata.storedContentKey
+            storedContentKey: metadata.storedContentKey,
+            isStoredEncrypted: metadata.isEncrypted
         )
     }
 

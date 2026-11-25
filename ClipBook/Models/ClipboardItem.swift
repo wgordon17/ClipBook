@@ -200,6 +200,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     private(set) var hasQRCodeText: Bool = false
     private(set) var isSVGText: Bool = false
     private(set) var isCorruptPlaceholder: Bool = false
+    var isStoredEncrypted: Bool = false
     var storedContentKey: Data? = nil
     private(set) var searchRevision: UInt64
 
@@ -322,6 +323,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         hasQRCodeText: Bool,
         isSVGText: Bool,
         isCorruptPlaceholder: Bool = false,
+        isStoredEncrypted: Bool = false,
         storedContentKey: Data?,
         searchRevision: UInt64
     ) {
@@ -366,6 +368,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         self.hasQRCodeText = hasQRCodeText
         self.isSVGText = isSVGText
         self.isCorruptPlaceholder = isCorruptPlaceholder
+        self.isStoredEncrypted = isStoredEncrypted
         self.storedContentKey = storedContentKey
         self.searchRevision = searchRevision
     }
@@ -626,6 +629,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
 
     var hasCompleteHeaderSearchText: Bool {
         !isCorruptPlaceholder
+            && !isStoredEncrypted
             && !hasQRCodeText
             && !SensitiveContent.shouldEncryptAtRest(self)
             && hasCompleteTextPreview
@@ -666,7 +670,8 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         expiresAt: Date?,
         deletedAt: Date?,
         storedContentKey: Data?,
-        isCorruptPlaceholder: Bool = false
+        isCorruptPlaceholder: Bool = false,
+        isStoredEncrypted: Bool = false
     ) -> ClipboardItem {
         ClipboardItem(
             rawID: id,
@@ -710,6 +715,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             hasQRCodeText: hasQRCodeText,
             isSVGText: isSVGText,
             isCorruptPlaceholder: isCorruptPlaceholder,
+            isStoredEncrypted: isStoredEncrypted,
             storedContentKey: storedContentKey,
             searchRevision: Self.nextSearchRevision()
         )
@@ -758,6 +764,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             hasQRCodeText: hasQRCodeText,
             isSVGText: isSVGText,
             isCorruptPlaceholder: isCorruptPlaceholder,
+            isStoredEncrypted: isStoredEncrypted,
             storedContentKey: storedContentKey,
             searchRevision: searchRevision
         )
@@ -860,6 +867,7 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             hasQRCodeText: recomputesDerivedMetadata ? Self.computeHasNonWhitespaceText(qrCodeText) : hasQRCodeText,
             isSVGText: isSVGText,
             isCorruptPlaceholder: isCorruptPlaceholder,
+            isStoredEncrypted: isStoredEncrypted,
             storedContentKey: storedContentKey,
             searchRevision: searchRevision
         )
@@ -1368,21 +1376,12 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
     }
 
     nonisolated func headerFallbackSearchText(tagNamesByID: [Tag.ID: String]) -> String {
-        if title == nil,
-           linkPreviewDetails == nil,
-           tags.isEmpty,
-           (kind == .image || filePaths.isEmpty),
-           let textPreview {
-            if let sourceAppName {
-                return "\(textPreview)   \(sourceAppName)"
-            }
-            return "\(textPreview)  "
-        }
-        return Self.makeSearchText(
+        Self.buildSearchText(
             title: title,
             text: textPreview,
             filePaths: kind == .image ? [] : filePaths,
-            tagNames: tags.compactMap { tagNamesByID[$0] },
+            tagIDs: tags,
+            tagNamesByID: tagNamesByID,
             sourceAppName: sourceAppName,
             linkPreviewDetails: linkPreviewDetails
         )
@@ -1400,18 +1399,79 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         linkPreviewDetails: LinkPreviewDetails? = nil,
         qrCodeText: String? = nil
     ) -> String {
-        [
-            title,
-            text,
-            qrCodeText,
-            linkPreviewDetails?.title,
-            linkPreviewDetails?.description,
-            filePaths.joined(separator: " "),
-            tagNames.joined(separator: " "),
-            sourceAppName
-        ]
-            .compactMap { $0 }
-            .joined(separator: " ")
+        buildSearchText(
+            title: title,
+            text: text,
+            filePaths: filePaths,
+            tagNames: tagNames,
+            sourceAppName: sourceAppName,
+            linkPreviewDetails: linkPreviewDetails,
+            qrCodeText: qrCodeText
+        )
+    }
+
+    private static func buildSearchText(
+        title: String?,
+        text: String?,
+        filePaths: [String],
+        tagNames: [String]? = nil,
+        tagIDs: [Tag.ID]? = nil,
+        tagNamesByID: [Tag.ID: String]? = nil,
+        sourceAppName: String?,
+        linkPreviewDetails: LinkPreviewDetails? = nil,
+        qrCodeText: String? = nil
+    ) -> String {
+        var result = ""
+        let estimatedLength = (title?.utf8.count ?? 0)
+            + (text?.utf8.count ?? 0)
+            + (qrCodeText?.utf8.count ?? 0)
+            + (linkPreviewDetails?.title?.utf8.count ?? 0)
+            + (linkPreviewDetails?.description?.utf8.count ?? 0)
+            + (sourceAppName?.utf8.count ?? 0)
+            + 8
+        result.reserveCapacity(estimatedLength)
+
+        var hasField = false
+        func appendOptional(_ value: String?) {
+            guard let value else { return }
+            if hasField { result.append(" ") }
+            result.append(value)
+            hasField = true
+        }
+
+        appendOptional(title)
+        appendOptional(text)
+        appendOptional(qrCodeText)
+        appendOptional(linkPreviewDetails?.title)
+        appendOptional(linkPreviewDetails?.description)
+
+        // filePaths.joined(separator: " ") is always non-nil ("" when empty).
+        if hasField { result.append(" ") }
+        hasField = true
+        for (index, path) in filePaths.enumerated() {
+            if index > 0 { result.append(" ") }
+            result.append(path)
+        }
+
+        // tagNames.joined(separator: " ") is always non-nil ("" when empty).
+        result.append(" ")
+        if let tagNames {
+            for (index, name) in tagNames.enumerated() {
+                if index > 0 { result.append(" ") }
+                result.append(name)
+            }
+        } else if let tagIDs, let tagNamesByID {
+            var wroteTag = false
+            for tagID in tagIDs {
+                guard let name = tagNamesByID[tagID] else { continue }
+                if wroteTag { result.append(" ") }
+                result.append(name)
+                wroteTag = true
+            }
+        }
+
+        appendOptional(sourceAppName)
+        return result
     }
 
     static func normalizedLinkContentKey(for url: URL) -> String {

@@ -1,6 +1,7 @@
 @testable import ClipBook
 import AppKit
 import Foundation
+import SQLite3
 import Testing
 
 @Suite
@@ -341,7 +342,7 @@ enum AppModelAndLocalizationTests {
         @Test
         @MainActor
         func unloadedHeaderInsertionTagMutationInvalidationAndStoreAwareCorpusDonorReuse() throws {
-            try TestSupport.withTemporaryHistoryStore { baseStore, _ in
+            try TestSupport.withTemporaryHistoryStore { baseStore, directory in
                 let spyStore = SpyHistoryStore(base: baseStore)
                 let model = AppModel()
 
@@ -373,11 +374,21 @@ enum AppModelAndLocalizationTests {
                     ),
                     convertingExternalAssets: true
                 )
+                let qrSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .image,
+                        text: "QR badge",
+                        qrCodeText: "QR_PAYLOAD_TOKEN_987",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_250)
+                    ),
+                    convertingExternalAssets: true
+                )
 
                 // AppModel.insert, insertIntoTrash, restore, and replace strip body + formatting while preserving header flags.
                 model.insert(richSaved)
                 model.insert(plainSaved)
-                #expect(model.items.count == 2)
+                model.insert(qrSaved)
+                #expect(model.items.count == 3)
                 #expect(model.items.allSatisfy { !$0.isContentLoaded && !$0.isFormattingLoaded && $0.searchText.isEmpty })
 
                 let richInModel = try #require(model.items.first { $0.id == richSaved.id })
@@ -399,12 +410,14 @@ enum AppModelAndLocalizationTests {
                 // Idle: cachedSearchCorpus is nil until a search corpus is built.
                 #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
 
-                // First makeSearchCorpus(using:) hydrates all 2 unloaded items and caches complete corpus.
+                // First makeSearchCorpus(using:) resolves complete short headers in RAM and hydrates only incomplete/QR items from SQLite.
                 spyStore.resetRecordedCalls()
                 let corpus1 = model.makeSearchCorpus(using: spyStore)
                 #expect(corpus1.hasCompleteTexts)
                 #expect(spyStore.fetchSearchTextsCalls.count == 1)
-                #expect(Set(spyStore.fetchSearchTextsCalls[0].ids) == [richSaved.id, plainSaved.id])
+                #expect(Set(spyStore.fetchSearchTextsCalls[0].ids) == [richSaved.id, qrSaved.id])
+                #expect(corpus1.texts.contains { $0.contains("Plain untagged note") })
+                #expect(corpus1.texts.contains { $0.contains("QR_PAYLOAD_TOKEN_987") })
                 #expect(model.prepareSearchCorpusDescriptor().cachedCorpus === corpus1)
 
                 // Repeat makeSearchCorpus(using:) at same sortedListRevision returns cached corpus with 0 DB calls.
@@ -437,10 +450,10 @@ enum AppModelAndLocalizationTests {
                 #expect(spyStore.fetchSearchTextsCalls[0].ids == [richSaved.id])
                 #expect(corpusAfterDirectTagMutation.texts.contains { $0.contains("RenamedSecOps") && $0.contains("TAIL_SENTINEL_AT_40KB") })
 
-                // Unpersisted header fallback sets hasCompleteTexts == false, revision slot == 0, and does NOT cache.
+                // Unpersisted incomplete (>8 KB) header fallback sets hasCompleteTexts == false, revision slot == 0, and does NOT cache.
                 let unpersisted = ClipboardItem.fixture(
                     kind: .text,
-                    text: "Transient unpersisted clip",
+                    text: "Transient unpersisted clip " + String(repeating: "u", count: 9_000),
                     copiedAt: Date(timeIntervalSince1970: 1_700_000_300)
                 )
                 model.insert(unpersisted)
@@ -451,6 +464,43 @@ enum AppModelAndLocalizationTests {
                 #expect(degradedCorpus.revisions[unpersistedSlot] == 0)
                 #expect(degradedCorpus.texts[unpersistedSlot].contains("Transient unpersisted clip"))
                 #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                // Downgrading unsealed sensitivity columns while tampering clip_contents.text on an isEncrypted=1 row
+                // must NOT bypass AEAD verification via RAM header resolution (isStoredEncrypted stays true).
+                let secretToken = ["sk", "-live-tamper-", "99887766554433221100aabb"].joined()
+                let secretSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .text,
+                        text: "Bearer \(secretToken)",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_400)
+                    ),
+                    convertingExternalAssets: true
+                )
+                #expect(secretSaved.isStoredEncrypted)
+                #expect(!secretSaved.hasCompleteHeaderSearchText)
+
+                // Flip unsealed clips.containsRestSecret=0 and corrupt clip_contents.text directly in SQLite.
+                let dbURL = directory.appendingPathComponent("History.sqlite")
+                var rawDB: OpaquePointer?
+                #expect(sqlite3_open_v2(dbURL.path, &rawDB, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+                defer { sqlite3_close(rawDB) }
+                let tamperSQL = """
+                    UPDATE clips SET containsRestSecret = 0, sensitivity = 'notSensitive' WHERE id = '\(secretSaved.id.uuidString)';
+                    UPDATE clip_contents SET text = X'DEADBEEF' WHERE clipId = '\(secretSaved.id.uuidString)';
+                    """
+                #expect(sqlite3_exec(rawDB, tamperSQL, nil, nil, nil) == SQLITE_OK)
+
+                let fetchedAfterTamper = try spyStore.fetchAll()
+                let tamperedHeader = try #require(fetchedAfterTamper.first { $0.id == secretSaved.id })
+                #expect(tamperedHeader.isStoredEncrypted)
+                #expect(!tamperedHeader.hasCompleteHeaderSearchText)
+
+                let tamperModel = AppModel()
+                tamperModel.items = [tamperedHeader]
+                spyStore.resetRecordedCalls()
+                let tamperCorpus = tamperModel.makeSearchCorpus(using: spyStore)
+                #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[secretSaved.id]])
+                #expect(tamperCorpus.texts == [""])
             }
         }
     }

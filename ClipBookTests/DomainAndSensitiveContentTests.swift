@@ -588,6 +588,103 @@ enum DomainAndSensitiveContentTests {
             #expect(unloadedSizedImage.imageDimensions?.width == 1440)
             #expect(unloadedSizedImage.imageDimensions?.height == 900)
 
+            // hasCompleteTextPreview edge cases: CR/CRLF, leading space/tab, nil+hasFormatting, utf8Count < characterCount
+            let unloadedCRLF = ClipboardItem.fixture(kind: .text, text: "a\r\nb").unloadingContent()
+            #expect(unloadedCRLF.hasCompleteTextPreview)
+            #expect(unloadedCRLF.hasCompleteHeaderSearchText)
+
+            let unloadedCR = ClipboardItem.fixture(kind: .text, text: "a\rb").unloadingContent()
+            #expect(unloadedCR.hasCompleteTextPreview)
+
+            let unloadedLeadingSpace = ClipboardItem.fixture(kind: .text, text: " leadingSpace").unloadingContent()
+            #expect(!unloadedLeadingSpace.hasCompleteTextPreview)
+            #expect(!unloadedLeadingSpace.hasCompleteHeaderSearchText)
+
+            let unloadedLeadingTab = ClipboardItem.fixture(kind: .text, text: "\tleadingTab").unloadingContent()
+            #expect(!unloadedLeadingTab.hasCompleteTextPreview)
+
+            let unloadedNilPlain = ClipboardItem.fromStoredHeader(
+                id: UUID(), kind: .text, title: nil, textPreview: nil, characterCount: 0,
+                containsPreviewSecret: false, containsRestSecret: false, hasRecognizedText: false,
+                hasQRCodeText: false, isSVGText: false, hasFormatting: false, htmlDigest: nil,
+                imageDigest: nil, imageWidth: nil, imageHeight: nil, assetPath: nil, filePaths: [],
+                sourceAppName: nil, sourceBundleIdentifier: nil, copiedAt: Date(), firstCopiedAt: Date(),
+                byteSize: 0, isFavorite: false, tags: [], copyCount: 1, linkPreviewDetails: nil,
+                copySequenceID: nil, copySequenceOrder: nil, favoriteOrder: nil, sensitivity: nil,
+                expiresAt: nil, deletedAt: nil, storedContentKey: nil
+            )
+            #expect(unloadedNilPlain.hasCompleteTextPreview)
+            #expect(unloadedNilPlain.hasCompleteHeaderSearchText)
+
+            let unloadedNilFormatted = ClipboardItem.fromStoredHeader(
+                id: UUID(), kind: .richText, title: nil, textPreview: nil, characterCount: 0,
+                containsPreviewSecret: false, containsRestSecret: false, hasRecognizedText: false,
+                hasQRCodeText: false, isSVGText: false, hasFormatting: true, htmlDigest: nil,
+                imageDigest: nil, imageWidth: nil, imageHeight: nil, assetPath: nil, filePaths: [],
+                sourceAppName: nil, sourceBundleIdentifier: nil, copiedAt: Date(), firstCopiedAt: Date(),
+                byteSize: 0, isFavorite: false, tags: [], copyCount: 1, linkPreviewDetails: nil,
+                copySequenceID: nil, copySequenceOrder: nil, favoriteOrder: nil, sensitivity: nil,
+                expiresAt: nil, deletedAt: nil, storedContentKey: nil
+            )
+            #expect(!unloadedNilFormatted.hasCompleteTextPreview)
+
+            let mismatchedCharCount = ClipboardItem.fromStoredHeader(
+                id: UUID(), kind: .text, title: nil, textPreview: "abc", characterCount: 10,
+                containsPreviewSecret: false, containsRestSecret: false, hasRecognizedText: false,
+                hasQRCodeText: false, isSVGText: false, hasFormatting: false, htmlDigest: nil,
+                imageDigest: nil, imageWidth: nil, imageHeight: nil, assetPath: nil, filePaths: [],
+                sourceAppName: nil, sourceBundleIdentifier: nil, copiedAt: Date(), firstCopiedAt: Date(),
+                byteSize: 3, isFavorite: false, tags: [], copyCount: 1, linkPreviewDetails: nil,
+                copySequenceID: nil, copySequenceOrder: nil, favoriteOrder: nil, sensitivity: nil,
+                expiresAt: nil, deletedAt: nil, storedContentKey: nil
+            )
+            #expect(!mismatchedCharCount.hasCompleteTextPreview)
+
+            // hasCompleteHeaderSearchText guards: hasQRCodeText, isCorruptPlaceholder, and sensitive items must return false
+            #expect(!imageWithOCRAndQR.hasCompleteHeaderSearchText)
+            let corruptHeader = ClipboardItem.fromStoredHeader(
+                id: UUID(), kind: .text, title: nil, textPreview: nil, characterCount: 0,
+                containsPreviewSecret: false, containsRestSecret: false, hasRecognizedText: false,
+                hasQRCodeText: false, isSVGText: false, hasFormatting: false, htmlDigest: nil,
+                imageDigest: nil, imageWidth: nil, imageHeight: nil, assetPath: nil, filePaths: [],
+                sourceAppName: nil, sourceBundleIdentifier: nil, copiedAt: Date(), firstCopiedAt: Date(),
+                byteSize: 0, isFavorite: false, tags: [], copyCount: 1, linkPreviewDetails: nil,
+                copySequenceID: nil, copySequenceOrder: nil, favoriteOrder: nil, sensitivity: nil,
+                expiresAt: nil, deletedAt: nil, storedContentKey: nil, isCorruptPlaceholder: true
+            )
+            #expect(!corruptHeader.hasCompleteHeaderSearchText)
+            let sensitiveShort = ClipboardItem.fixture(
+                kind: .text, text: "short secret", sensitivity: .sensitive
+            ).unloadingContent()
+            #expect(!sensitiveShort.hasCompleteHeaderSearchText)
+
+            // headerFallbackSearchText vs makeSearchText parity across plain, tagged, image, link, and nil-source combinations
+            let tagMap = [1: "Alpha", 2: "Beta"]
+            let parityCases: [ClipboardItem] = [
+                ClipboardItem.fixture(kind: .text, text: "plain", sourceAppName: nil).unloadingContent(),
+                ClipboardItem.fixture(kind: .text, text: "plain", sourceAppName: "Notes").unloadingContent(),
+                ClipboardItem.fixture(kind: .text, title: "Title", text: "body", sourceAppName: "Safari", tags: [1, 2]).unloadingContent(),
+                ClipboardItem.fixture(kind: .file, text: nil, filePaths: ["/tmp/a.txt", "/tmp/b.txt"], sourceAppName: "Finder").unloadingContent(),
+                ClipboardItem.fixture(kind: .image, text: "ocr", filePaths: ["/tmp/ignored.png"], sourceAppName: "Preview").unloadingContent(),
+                ClipboardItem.fixture(
+                    kind: .link,
+                    text: "https://example.com",
+                    sourceAppName: "Arc",
+                    linkPreviewDetails: LinkPreviewDetails(url: "https://example.com", title: "Example", description: "Desc", fetchedAt: Date())
+                ).unloadingContent(),
+            ]
+            for item in parityCases {
+                let expected = ClipboardItem.makeSearchText(
+                    title: item.title,
+                    text: item.textPreview,
+                    filePaths: item.kind == .image ? [] : item.filePaths,
+                    tagNames: item.tags.compactMap { tagMap[$0] },
+                    sourceAppName: item.sourceAppName,
+                    linkPreviewDetails: item.linkPreviewDetails
+                )
+                #expect(item.headerFallbackSearchText(tagNamesByID: tagMap) == expected)
+            }
+
             // Non-colliding hasSameContent(as:) on two unloaded 20 KB .text items sharing 8,097-char prefix
             let sharedPrefix = String(repeating: "k", count: 8_097)
             var unloaded20kOne = ClipboardItem.fixture(
