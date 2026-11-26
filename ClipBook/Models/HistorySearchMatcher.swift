@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 
@@ -6,6 +7,9 @@ nonisolated struct HistorySearchTerms: Equatable, Sendable {
     struct ASCIITerm: Sendable {
         let lowercasedBytes: [UInt8]
         let containsDigit: Bool
+        let anchorIndex: Int
+        let anchorLower: UInt8
+        let anchorUpper: UInt8?
     }
 
     let values: [String]
@@ -25,14 +29,27 @@ nonisolated struct HistorySearchTerms: Equatable, Sendable {
             var lowered: [UInt8] = []
             lowered.reserveCapacity(term.utf8.count)
             var hasDigit = false
+            var nonLetterAnchorIndex: Int?
             for byte in term.utf8 {
                 if byte >= 0x30 && byte <= 0x39 {
                     hasDigit = true
                 }
                 let lowerByte = (byte >= 0x41 && byte <= 0x5A) ? (byte | 0x20) : byte
+                if nonLetterAnchorIndex == nil, !(lowerByte >= 0x61 && lowerByte <= 0x7A) {
+                    nonLetterAnchorIndex = lowered.count
+                }
                 lowered.append(lowerByte)
             }
-            return ASCIITerm(lowercasedBytes: lowered, containsDigit: hasDigit)
+            let anchorIndex = nonLetterAnchorIndex ?? 0
+            let anchorLower = lowered[anchorIndex]
+            let anchorUpper: UInt8? = (anchorLower >= 0x61 && anchorLower <= 0x7A) ? (anchorLower & ~0x20) : nil
+            return ASCIITerm(
+                lowercasedBytes: lowered,
+                containsDigit: hasDigit,
+                anchorIndex: anchorIndex,
+                anchorLower: anchorLower,
+                anchorUpper: anchorUpper
+            )
         }
     }
 
@@ -203,59 +220,196 @@ nonisolated enum HistorySearchMatcher {
     }
 
     @inline(__always)
-    private static func asciiLower(_ byte: UInt8) -> UInt8 {
-        (byte >= 0x41 && byte <= 0x5A) ? (byte | 0x20) : byte
+    private static func isPrintableASCIIWord(_ word: UInt64) -> Bool {
+        ((word | (word &+ 0x0101_0101_0101_0101) | (word &- 0x2020_2020_2020_2020)) & 0x8080_8080_8080_8080) == 0
     }
 
     @inline(__always)
-    private static func isAllASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        for byte in bytes where byte < 0x09 || (byte > 0x0D && byte < 0x20) || byte == 0x7F || byte >= 0x80 {
-            return false
+    private static func isAllowedASCIIByte(_ byte: UInt8) -> Bool {
+        !(byte < 0x09 || (byte > 0x0D && byte < 0x20) || byte == 0x7F || byte >= 0x80)
+    }
+
+    @inline(__always)
+    private static func areAllAllowedASCIIBytes(in word: UInt64) -> Bool {
+        if isPrintableASCIIWord(word) {
+            return true
+        }
+        var remaining = word
+        for _ in 0..<8 {
+            if !isAllowedASCIIByte(UInt8(truncatingIfNeeded: remaining)) {
+                return false
+            }
+            remaining >>= 8
         }
         return true
     }
 
-    @inline(__always)
+    static func isAllASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        let count = bytes.count
+        guard count > 0, let base = bytes.baseAddress else {
+            return true
+        }
+        var offset = 0
+        let misalign = Int(bitPattern: base) & 7
+        if misalign != 0 {
+            let lead = min(count, 8 &- misalign)
+            while offset < lead {
+                if !isAllowedASCIIByte(base[offset]) {
+                    return false
+                }
+                offset &+= 1
+            }
+        }
+        let wordCount = (count &- offset) >> 3
+        if wordCount > 0 {
+            let alignedByteBase = base.advanced(by: offset)
+            let ok = alignedByteBase.withMemoryRebound(to: UInt64.self, capacity: wordCount) { words -> Bool in
+                var wordIndex = 0
+                let stride4Limit = wordCount &- 4
+                while wordIndex <= stride4Limit {
+                    let w0 = words[wordIndex]
+                    let w1 = words[wordIndex &+ 1]
+                    let w2 = words[wordIndex &+ 2]
+                    let w3 = words[wordIndex &+ 3]
+                    let combined = (w0 | (w0 &+ 0x0101_0101_0101_0101) | (w0 &- 0x2020_2020_2020_2020))
+                        | (w1 | (w1 &+ 0x0101_0101_0101_0101) | (w1 &- 0x2020_2020_2020_2020))
+                        | (w2 | (w2 &+ 0x0101_0101_0101_0101) | (w2 &- 0x2020_2020_2020_2020))
+                        | (w3 | (w3 &+ 0x0101_0101_0101_0101) | (w3 &- 0x2020_2020_2020_2020))
+                    if (combined & 0x8080_8080_8080_8080) != 0 {
+                        if !areAllAllowedASCIIBytes(in: w0)
+                            || !areAllAllowedASCIIBytes(in: w1)
+                            || !areAllAllowedASCIIBytes(in: w2)
+                            || !areAllAllowedASCIIBytes(in: w3) {
+                            return false
+                        }
+                    }
+                    wordIndex &+= 4
+                }
+                while wordIndex < wordCount {
+                    if !areAllAllowedASCIIBytes(in: words[wordIndex]) {
+                        return false
+                    }
+                    wordIndex &+= 1
+                }
+                return true
+            }
+            if !ok {
+                return false
+            }
+            offset &+= wordCount << 3
+        }
+        while offset < count {
+            if !isAllowedASCIIByte(base[offset]) {
+                return false
+            }
+            offset &+= 1
+        }
+        return true
+    }
+
     private static func containsASCIICaseInsensitive(
         haystack: UnsafeBufferPointer<UInt8>,
-        needle: [UInt8]
+        term: HistorySearchTerms.ASCIITerm
     ) -> Bool {
         let haystackCount = haystack.count
+        let needle = term.lowercasedBytes
         let needleCount = needle.count
-        guard needleCount > 0, haystackCount >= needleCount else {
+        guard needleCount > 0, haystackCount >= needleCount, let haystackBase = haystack.baseAddress else {
             return needleCount == 0
         }
-        let first = needle[0]
-        let lastStart = haystackCount - needleCount
-        var index = 0
-        while index <= lastStart {
-            if asciiLower(haystack[index]) == first {
-                var offset = 1
-                while offset < needleCount && asciiLower(haystack[index + offset]) == needle[offset] {
-                    offset += 1
+
+        let anchorIndex = term.anchorIndex
+        let anchorLower = Int32(term.anchorLower)
+        let anchorUpper = term.anchorUpper.map(Int32.init)
+        let windowEndOffset = haystackCount &- (needleCount &- anchorIndex)
+        var searchOffset = anchorIndex
+        // Next known position of each anchor case at or after searchOffset; -1 means
+        // not yet searched and Int.max means absent from the rest of the haystack.
+        // Remembering both keeps the scan linear when one case is rare or missing.
+        var nextLowerOffset = -1
+        var nextUpperOffset = anchorUpper == nil ? Int.max : -1
+
+        return needle.withUnsafeBufferPointer { needleBuffer in
+            guard let needleBase = needleBuffer.baseAddress else {
+                return false
+            }
+            let rawBase = UnsafeRawPointer(haystackBase)
+            while searchOffset <= windowEndOffset {
+                let remaining = windowEndOffset &- searchOffset &+ 1
+                let curPtr = rawBase.advanced(by: searchOffset)
+                if nextLowerOffset < searchOffset {
+                    nextLowerOffset = Darwin.memchr(curPtr, anchorLower, remaining)
+                        .map { UnsafeRawPointer($0) - rawBase } ?? Int.max
                 }
-                if offset == needleCount {
+                if let anchorUpper, nextUpperOffset < searchOffset {
+                    nextUpperOffset = Darwin.memchr(curPtr, anchorUpper, remaining)
+                        .map { UnsafeRawPointer($0) - rawBase } ?? Int.max
+                }
+                let matchedAnchorOffset = min(nextLowerOffset, nextUpperOffset)
+                if matchedAnchorOffset == Int.max {
+                    return false
+                }
+                if needleCount == 1 {
                     return true
                 }
+                let candidateStart = matchedAnchorOffset &- anchorIndex
+                var matched = true
+                var i = 0
+                while i < needleCount {
+                    if i != anchorIndex {
+                        let b = haystackBase[candidateStart &+ i]
+                        let lowered = (b >= 0x41 && b <= 0x5A) ? (b | 0x20) : b
+                        if lowered != needleBase[i] {
+                            matched = false
+                            break
+                        }
+                    }
+                    i &+= 1
+                }
+                if matched {
+                    return true
+                }
+                searchOffset = matchedAnchorOffset &+ 1
             }
-            index += 1
+            return false
         }
-        return false
     }
 
     static func matches(
         _ text: String,
         _ terms: HistorySearchTerms,
         locale: Locale = .current,
-        allowsPrefilter: Bool? = nil
+        allowsPrefilter: Bool? = nil,
+        knownAllASCII: Bool? = nil
+    ) -> Bool {
+        var ignoredASCII = false
+        return matchesRecordingASCII(
+            text,
+            terms,
+            locale: locale,
+            allowsPrefilter: allowsPrefilter,
+            knownAllASCII: knownAllASCII,
+            isAllASCIIOut: &ignoredASCII
+        )
+    }
+
+    static func matchesRecordingASCII(
+        _ text: String,
+        _ terms: HistorySearchTerms,
+        locale: Locale = .current,
+        allowsPrefilter: Bool? = nil,
+        knownAllASCII: Bool? = nil,
+        isAllASCIIOut: inout Bool
     ) -> Bool {
         let values = terms.values
         guard !values.isEmpty else {
+            isAllASCIIOut = knownAllASCII ?? false
             return true
         }
 
         let canUsePrefilter = allowsPrefilter ?? allowsASCIIPrefilter(for: locale)
         guard canUsePrefilter else {
+            isAllASCIIOut = knownAllASCII ?? false
             for term in values {
                 if text.range(of: term, options: Self.compareOptions, range: nil, locale: locale) == nil {
                     return false
@@ -267,7 +421,8 @@ nonisolated enum HistorySearchMatcher {
         let original = text
         var contiguous = text
         return contiguous.withUTF8 { haystack in
-            let asciiHaystack = isAllASCII(haystack)
+            let asciiHaystack = knownAllASCII ?? isAllASCII(haystack)
+            isAllASCIIOut = asciiHaystack
             var scannedScalars = false
             var hasFoldLetters = false
             var hasFoldDigits = false
@@ -284,7 +439,7 @@ nonisolated enum HistorySearchMatcher {
 
                 let foundBytes = containsASCIICaseInsensitive(
                     haystack: haystack,
-                    needle: asciiTerm.lowercasedBytes
+                    term: asciiTerm
                 )
                 if asciiHaystack {
                     if !foundBytes {

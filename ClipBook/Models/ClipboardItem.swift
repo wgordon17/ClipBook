@@ -615,12 +615,41 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
         guard utf8Count >= characterCount else {
             return false
         }
-        if utf8Count == characterCount,
-           let firstByte = textPreview.utf8.first,
-           firstByte >= 0x21,
-           firstByte < 0x7F,
-           textPreview.utf8.allSatisfy({ $0 < 0x80 && $0 != 0x0D }) {
-            return utf8Count < Self.textPreviewMaxUTF16Length - 2
+        if utf8Count == characterCount {
+            var previewCopy = textPreview
+            let isSafeASCII = previewCopy.withUTF8 { buffer -> Bool in
+                guard let base = buffer.baseAddress, buffer.count > 0 else {
+                    return false
+                }
+                let firstByte = base[0]
+                guard firstByte >= 0x21, firstByte < 0x7F else {
+                    return false
+                }
+                let raw = UnsafeRawPointer(base)
+                let count = buffer.count
+                var offset = 0
+                let limit8 = count &- 8
+                while offset <= limit8 {
+                    let w = raw.loadUnaligned(fromByteOffset: offset, as: UInt64.self)
+                    let crXor = w ^ 0x0D0D_0D0D_0D0D_0D0D
+                    let hasCR = (crXor &- 0x0101_0101_0101_0101) & ~crXor & 0x8080_8080_8080_8080
+                    if ((w & 0x8080_8080_8080_8080) | hasCR) != 0 {
+                        return false
+                    }
+                    offset &+= 8
+                }
+                while offset < count {
+                    let b = base[offset]
+                    if b >= 0x80 || b == 0x0D {
+                        return false
+                    }
+                    offset &+= 1
+                }
+                return true
+            }
+            if isSafeASCII {
+                return utf8Count < Self.textPreviewMaxUTF16Length - 2
+            }
         }
         return textPreview.first?.isWhitespace != true
             && textPreview.count == characterCount
@@ -1404,6 +1433,28 @@ nonisolated struct ClipboardItem: Identifiable, Codable, Hashable, Sendable {
             text: text,
             filePaths: filePaths,
             tagNames: tagNames,
+            sourceAppName: sourceAppName,
+            linkPreviewDetails: linkPreviewDetails,
+            qrCodeText: qrCodeText
+        )
+    }
+
+    static func makeSearchText(
+        title: String?,
+        text: String?,
+        filePaths: [String],
+        tagIDs: [Tag.ID],
+        tagNamesByID: [Tag.ID: String],
+        sourceAppName: String?,
+        linkPreviewDetails: LinkPreviewDetails? = nil,
+        qrCodeText: String? = nil
+    ) -> String {
+        buildSearchText(
+            title: title,
+            text: text,
+            filePaths: filePaths,
+            tagIDs: tagIDs,
+            tagNamesByID: tagNamesByID,
             sourceAppName: sourceAppName,
             linkPreviewDetails: linkPreviewDetails,
             qrCodeText: qrCodeText

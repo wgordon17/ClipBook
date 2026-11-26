@@ -85,15 +85,13 @@ nonisolated extension GRDBHistoryStore {
         return value
     }
 
-    static func decodeDataColumn(
-        from row: Row,
-        rowColumn: String? = nil,
+    private static func decodeDataValue(
+        _ dbValue: DatabaseValue,
         column: SealedColumn,
         clipID: UUID,
         isEncrypted: Bool,
         keys: ClipBookDerivedKeys
     ) throws -> Data? {
-        let dbValue: DatabaseValue = row[rowColumn ?? column.aadColumn]
         switch dbValue.storage {
         case .null:
             return nil
@@ -116,6 +114,113 @@ nonisolated extension GRDBHistoryStore {
         case .int64, .double:
             throw HistoryStoreError.authenticationFailed
         }
+    }
+
+    static func decodeUTF8String(_ data: Data) throws -> String {
+        guard let decoded = String(data: data, encoding: .utf8) else {
+            throw HistoryStoreError.authenticationFailed
+        }
+        return decoded
+    }
+
+    private static func decodeStringValue(
+        _ dbValue: DatabaseValue,
+        column: SealedColumn,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: ClipBookDerivedKeys
+    ) throws -> String? {
+        switch dbValue.storage {
+        case .null:
+            return nil
+        case .string(let string):
+            if isEncrypted {
+                throw HistoryStoreError.authenticationFailed
+            }
+            return string
+        case .blob(let data):
+            let plaintext: Data
+            if isEncrypted {
+                plaintext = try HistoryCrypto.openColumn(
+                    data,
+                    table: column.aadTable,
+                    column: column.aadColumn,
+                    clipID: clipID,
+                    keys: keys
+                )
+            } else {
+                plaintext = data
+            }
+            return try decodeUTF8String(plaintext)
+        case .int64, .double:
+            throw HistoryStoreError.authenticationFailed
+        }
+    }
+
+    private static func decodeUnencryptedString(from row: Row, atIndex index: Int) throws -> String? {
+        try row.withUnsafeData(atIndex: index) { data in
+            guard let data else {
+                return nil
+            }
+            return try decodeUTF8String(data)
+        }
+    }
+
+    private static func decodeUnencryptedFilePaths(
+        from row: Row,
+        atIndex index: Int,
+        decoder: JSONDecoder
+    ) throws -> [String] {
+        try row.withUnsafeData(atIndex: index) { data in
+            guard let jsonData = data else {
+                throw HistoryStoreError.authenticationFailed
+            }
+            if jsonData.count == 2,
+               jsonData[jsonData.startIndex] == 0x5B,
+               jsonData[jsonData.index(after: jsonData.startIndex)] == 0x5D {
+                return []
+            }
+            do {
+                return try decoder.decode([String].self, from: jsonData)
+            } catch {
+                throw HistoryStoreError.authenticationFailed
+            }
+        }
+    }
+
+    private static func decodeUnencryptedLinkPreview(
+        from row: Row,
+        atIndex index: Int,
+        decoder: JSONDecoder
+    ) throws -> LinkPreviewDetails? {
+        try row.withUnsafeData(atIndex: index) { data in
+            guard let jsonData = data else {
+                return nil
+            }
+            do {
+                return try decoder.decode(LinkPreviewDetails.self, from: jsonData)
+            } catch {
+                throw HistoryStoreError.authenticationFailed
+            }
+        }
+    }
+
+    static func decodeDataColumn(
+        from row: Row,
+        rowColumn: String? = nil,
+        column: SealedColumn,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: ClipBookDerivedKeys
+    ) throws -> Data? {
+        let dbValue: DatabaseValue = row[rowColumn ?? column.aadColumn]
+        return try decodeDataValue(
+            dbValue,
+            column: column,
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            keys: keys
+        )
     }
 
     static func decodeRequiredDataColumn(
@@ -147,20 +252,14 @@ nonisolated extension GRDBHistoryStore {
         isEncrypted: Bool,
         keys: ClipBookDerivedKeys
     ) throws -> String? {
-        guard let data = try decodeDataColumn(
-            from: row,
-            rowColumn: rowColumn,
+        let dbValue: DatabaseValue = row[rowColumn ?? column.aadColumn]
+        return try decodeStringValue(
+            dbValue,
             column: column,
             clipID: clipID,
             isEncrypted: isEncrypted,
             keys: keys
-        ) else {
-            return nil
-        }
-        guard let string = String(data: data, encoding: .utf8) else {
-            throw HistoryStoreError.authenticationFailed
-        }
-        return string
+        )
     }
 
     private static func hasEncryptedAssetExtension(_ path: String) -> Bool {
@@ -198,31 +297,13 @@ nonisolated extension GRDBHistoryStore {
         keys: ClipBookDerivedKeys,
         decoder: JSONDecoder
     ) throws -> LinkPreviewDetails? {
-        guard let jsonData = try decodeDataColumn(
-            from: row,
-            rowColumn: rowColumn,
-            column: .clip(.linkPreviewData),
+        try decodeProtectedLinkPreviewValue(
+            row[rowColumn],
             clipID: clipID,
             isEncrypted: isEncrypted,
-            keys: keys
-        ) else {
-            return nil
-        }
-        let details: LinkPreviewDetails
-        do {
-            details = try decoder.decode(LinkPreviewDetails.self, from: jsonData)
-        } catch {
-            throw HistoryStoreError.authenticationFailed
-        }
-        if isEncrypted {
-            if let imagePath = details.imagePath, !hasEncryptedAssetExtension(imagePath) {
-                throw HistoryStoreError.authenticationFailed
-            }
-            if let faviconPath = details.faviconPath, !hasEncryptedAssetExtension(faviconPath) {
-                throw HistoryStoreError.authenticationFailed
-            }
-        }
-        return details
+            keys: keys,
+            decoder: decoder
+        )
     }
 
     static func decodeProtectedFilePaths(
@@ -233,24 +314,13 @@ nonisolated extension GRDBHistoryStore {
         keys: ClipBookDerivedKeys,
         decoder: JSONDecoder
     ) throws -> [String] {
-        let jsonData = try decodeRequiredDataColumn(
-            from: row,
-            rowColumn: rowColumn,
-            column: .clip(.filePathsData),
+        try decodeProtectedFilePathsValue(
+            row[rowColumn],
             clipID: clipID,
             isEncrypted: isEncrypted,
-            keys: keys
+            keys: keys,
+            decoder: decoder
         )
-        if jsonData.count == 2,
-           jsonData[jsonData.startIndex] == 0x5B,
-           jsonData[jsonData.index(after: jsonData.startIndex)] == 0x5D {
-            return []
-        }
-        do {
-            return try decoder.decode([String].self, from: jsonData)
-        } catch {
-            throw HistoryStoreError.authenticationFailed
-        }
     }
 
     nonisolated struct UnsealedClipHeaderMetadata {
@@ -566,64 +636,146 @@ nonisolated extension GRDBHistoryStore {
         )
     }
 
+    private static func decodeProtectedLinkPreviewValue(
+        _ dbValue: DatabaseValue,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: ClipBookDerivedKeys,
+        decoder: JSONDecoder
+    ) throws -> LinkPreviewDetails? {
+        guard let jsonData = try decodeDataValue(
+            dbValue,
+            column: .clip(.linkPreviewData),
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            keys: keys
+        ) else {
+            return nil
+        }
+        let details: LinkPreviewDetails
+        do {
+            details = try decoder.decode(LinkPreviewDetails.self, from: jsonData)
+        } catch {
+            throw HistoryStoreError.authenticationFailed
+        }
+        if isEncrypted {
+            if let imagePath = details.imagePath, !hasEncryptedAssetExtension(imagePath) {
+                throw HistoryStoreError.authenticationFailed
+            }
+            if let faviconPath = details.faviconPath, !hasEncryptedAssetExtension(faviconPath) {
+                throw HistoryStoreError.authenticationFailed
+            }
+        }
+        return details
+    }
+
+    private static func decodeProtectedFilePathsValue(
+        _ dbValue: DatabaseValue,
+        clipID: UUID,
+        isEncrypted: Bool,
+        keys: ClipBookDerivedKeys,
+        decoder: JSONDecoder
+    ) throws -> [String] {
+        guard let jsonData = try decodeDataValue(
+            dbValue,
+            column: .clip(.filePathsData),
+            clipID: clipID,
+            isEncrypted: isEncrypted,
+            keys: keys
+        ) else {
+            throw HistoryStoreError.authenticationFailed
+        }
+        if jsonData.count == 2,
+           jsonData[jsonData.startIndex] == 0x5B,
+           jsonData[jsonData.index(after: jsonData.startIndex)] == 0x5D {
+            return []
+        }
+        do {
+            return try decoder.decode([String].self, from: jsonData)
+        } catch {
+            throw HistoryStoreError.authenticationFailed
+        }
+    }
+
+    // Positional column layout matching fetchSearchTextBatch's SELECT:
+    // 0: id, 1: kind, 2: isEncrypted, 3: sourceAppName, 4: title,
+    // 5: filePathsData, 6: linkPreviewData, 7: text, 8: qrCodeText,
+    // 9: whether any of columns 4...8 holds an INTEGER or REAL value.
     static func decodeSearchTextForRow(
         _ row: Row,
-        idString: String,
+        clipID: UUID,
         tagIDs: [Int],
         tagNamesByID: [Tag.ID: String],
         keys: ClipBookDerivedKeys,
         decoder: JSONDecoder
     ) -> String {
-        guard let clipID = UUID(uuidString: idString) else {
-            return ""
-        }
-        let kindRaw: String = row["kind"] ?? ClipboardKind.text.rawValue
+        let kindRaw: String = row[1] ?? ClipboardKind.text.rawValue
         let kind = ClipboardKind(rawValue: kindRaw) ?? .text
-        let isEncrypted = ((row["isEncrypted"] as Int?) ?? 0) != 0
-        let sourceAppName: String? = row["sourceAppName"]
+        let isEncrypted = ((row[2] as Int?) ?? 0) != 0
+        let sourceAppName: String? = row[3]
 
         do {
-            let title = try decodeStringColumn(
-                from: row,
-                column: .clip(.title),
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
-            let filePaths = try decodeProtectedFilePaths(
-                from: row,
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys,
-                decoder: decoder
-            )
-            let linkPreviewDetails = try decodeProtectedLinkPreview(
-                from: row,
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys,
-                decoder: decoder
-            )
-            let text = try decodeStringColumn(
-                from: row,
-                column: .clipContent(.text),
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
-            let qrCodeText = try decodeStringColumn(
-                from: row,
-                column: .clipContent(.qrCodeText),
-                clipID: clipID,
-                isEncrypted: isEncrypted,
-                keys: keys
-            )
-            let tagNames = tagIDs.compactMap { tagNamesByID[$0] }
+            let title: String?
+            let filePaths: [String]
+            let linkPreviewDetails: LinkPreviewDetails?
+            let text: String?
+            let qrCodeText: String?
+
+            if isEncrypted {
+                title = try decodeStringValue(
+                    row[4],
+                    column: .clip(.title),
+                    clipID: clipID,
+                    isEncrypted: true,
+                    keys: keys
+                )
+                filePaths = try decodeProtectedFilePathsValue(
+                    row[5],
+                    clipID: clipID,
+                    isEncrypted: true,
+                    keys: keys,
+                    decoder: decoder
+                )
+                linkPreviewDetails = try decodeProtectedLinkPreviewValue(
+                    row[6],
+                    clipID: clipID,
+                    isEncrypted: true,
+                    keys: keys,
+                    decoder: decoder
+                )
+                text = try decodeStringValue(
+                    row[7],
+                    column: .clipContent(.text),
+                    clipID: clipID,
+                    isEncrypted: true,
+                    keys: keys
+                )
+                qrCodeText = try decodeStringValue(
+                    row[8],
+                    column: .clipContent(.qrCodeText),
+                    clipID: clipID,
+                    isEncrypted: true,
+                    keys: keys
+                )
+            } else {
+                // The zero-copy reads below would let SQLite render a numeric
+                // value as digits, so a row holding one is rejected up front.
+                if ((row[9] as Int?) ?? 0) != 0 {
+                    throw HistoryStoreError.authenticationFailed
+                }
+                title = try decodeUnencryptedString(from: row, atIndex: 4)
+                filePaths = try decodeUnencryptedFilePaths(from: row, atIndex: 5, decoder: decoder)
+                linkPreviewDetails = try decodeUnencryptedLinkPreview(from: row, atIndex: 6, decoder: decoder)
+                text = try decodeUnencryptedString(from: row, atIndex: 7)
+                qrCodeText = try decodeUnencryptedString(from: row, atIndex: 8)
+            }
+
             return ClipboardItem.makeSearchText(
                 title: title,
                 text: text,
                 filePaths: kind == .image ? [] : filePaths,
-                tagNames: tagNames,
+                tagIDs: tagIDs,
+                tagNamesByID: tagNamesByID,
                 sourceAppName: sourceAppName,
                 linkPreviewDetails: linkPreviewDetails,
                 qrCodeText: qrCodeText

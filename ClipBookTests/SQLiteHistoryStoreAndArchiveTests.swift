@@ -779,6 +779,108 @@ enum SQLiteHistoryStoreAndArchiveTests {
         }
 
         @Test
+        func fetchSearchTextsRejectsNumericColumnsAndStoredUTF8DecodingMatchesFoundation() throws {
+            // Stored UTF-8 decoding must agree with Foundation on every edge case, whichever
+            // implementation the running OS selects.
+            let utf8Samples: [[UInt8]] = [
+                [],
+                Array("plain ascii".utf8),
+                Array("Café Straße 東京 🚀".utf8),
+                [0xEF, 0xBB, 0xBF, 0x41],
+                [0x41, 0xEF, 0xBB, 0xBF, 0x42],
+                [0x41, 0x00, 0x42],
+                [0x00],
+                [0xFF],
+                [0x41, 0x80],
+                [0xC3],
+                [0xC3, 0x28],
+                [0xC0, 0xAF],
+                [0xE0, 0x80, 0xAF],
+                [0xED, 0xA0, 0x80],
+                [0xED, 0xBF, 0xBF],
+                [0xF4, 0x90, 0x80, 0x80],
+                [0xF0, 0x9F, 0x9A],
+                [0xF0, 0x9F, 0x9A, 0x80],
+                [0xEF, 0xBF, 0xBE],
+                [0xEF, 0xBF, 0xBF],
+                [0x65, 0xCC, 0x81],
+            ]
+            for bytes in utf8Samples {
+                let data = Data(bytes)
+                let expected = String(data: data, encoding: .utf8)
+                let actual = try? GRDBHistoryStore.decodeUTF8String(data)
+                #expect(actual == expected, "UTF-8 decoding differs for bytes \(bytes)")
+                if let actual, let expected {
+                    #expect(Array(actual.utf8) == Array(expected.utf8), "UTF-8 bytes differ for \(bytes)")
+                }
+            }
+
+            // A numeric value in a text or blob column of a plain row yields no search text.
+            try TestSupport.withTemporaryHistoryStore { store, directory in
+                let columns = [
+                    ("clips", "title", "id"),
+                    ("clips", "filePathsData", "id"),
+                    ("clips", "linkPreviewData", "id"),
+                    ("clip_contents", "text", "clipId"),
+                    ("clip_contents", "qrCodeText", "clipId"),
+                ]
+                var tamperedIDs: [UUID] = []
+                for (index, _) in columns.enumerated() {
+                    let item = ClipboardItem.fixture(
+                        kind: .text,
+                        title: "NumericTamperTitle\(index)",
+                        text: "NumericTamperBody\(index)",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_100_000 + Double(index))
+                    )
+                    try store.upsert(item)
+                    tamperedIDs.append(item.id)
+                }
+                let intact = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "NumericTamperIntactBody",
+                    copiedAt: Date(timeIntervalSince1970: 1_700_100_100)
+                )
+                try store.upsert(intact)
+
+                let before = try #require(
+                    try store.fetchSearchTexts(
+                        for: tamperedIDs + [intact.id],
+                        trashed: false,
+                        tagNamesByID: [:],
+                        isCancelled: { false }
+                    )
+                )
+                for index in tamperedIDs.indices {
+                    #expect(before[index]?.contains("NumericTamperBody\(index)") == true)
+                }
+
+                var rawDB: OpaquePointer?
+                let dbPath = directory.appendingPathComponent("History.sqlite").path
+                #expect(sqlite3_open_v2(dbPath, &rawDB, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+                for (index, column) in columns.enumerated() {
+                    let value = index % 2 == 0 ? "424242" : "42.5"
+                    let sql = "UPDATE \(column.0) SET \(column.1) = \(value) WHERE \(column.2) = '\(tamperedIDs[index].uuidString)';"
+                    #expect(sqlite3_exec(rawDB, sql, nil, nil, nil) == SQLITE_OK, "Failed: \(sql)")
+                    #expect(sqlite3_changes(rawDB) == 1, "No row changed: \(sql)")
+                }
+                sqlite3_close(rawDB)
+
+                let after = try #require(
+                    try store.fetchSearchTexts(
+                        for: tamperedIDs + [intact.id],
+                        trashed: false,
+                        tagNamesByID: [:],
+                        isCancelled: { false }
+                    )
+                )
+                for index in tamperedIDs.indices {
+                    #expect(after[index] == "", "Numeric \(columns[index].1) produced search text \(String(reflecting: after[index]))")
+                }
+                #expect(after[tamperedIDs.count]?.contains("NumericTamperIntactBody") == true)
+            }
+        }
+
+        @Test
         func fetchSearchTextsPositionalAlignmentCursorScanEncryptionAndCancellation() throws {
             try TestSupport.withTemporaryHistoryStore { store, directory in
                 let fileManager = FileManager.default

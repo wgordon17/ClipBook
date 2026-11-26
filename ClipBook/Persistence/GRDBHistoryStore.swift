@@ -1021,7 +1021,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         tagSQL: String,
         tagArguments: StatementArguments,
         useCachedStatements: Bool,
-        indicesByIDString: [String: [Int]],
+        ids: [UUID],
+        firstIndexByIDString: [String: Int],
+        duplicateIndicesByIDString: [String: [Int]],
         tagNamesByID: [Tag.ID: String],
         keys: ClipBookDerivedKeys,
         decoder: JSONDecoder,
@@ -1035,11 +1037,11 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 : try db.makeStatement(sql: tagSQL)
             let tagCursor = try Row.fetchCursor(tagStmt, arguments: tagArguments)
             let completedTags = try drainCursorInBatches(tagCursor, isCancelled: isCancelled) { tagRow in
-                let clipIDString: String = tagRow["clipId"]
-                guard indicesByIDString[clipIDString] != nil else {
+                let clipIDString: String = tagRow[0]
+                guard firstIndexByIDString[clipIDString] != nil else {
                     return
                 }
-                let tagID: Int = tagRow["tagId"]
+                let tagID: Int = tagRow[1]
                 tagIDsByClipID[clipIDString, default: []].append(tagID)
             }
             guard completedTags, !isCancelled() else {
@@ -1049,7 +1051,12 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
 
         let clipSQL = """
             SELECT c.id, c.kind, c.isEncrypted, c.sourceAppName, c.title, c.filePathsData, c.linkPreviewData,
-                   cc.text, cc.qrCodeText
+                   cc.text, cc.qrCodeText,
+                   (typeof(c.title) IN ('integer', 'real')
+                    OR typeof(c.filePathsData) IN ('integer', 'real')
+                    OR typeof(c.linkPreviewData) IN ('integer', 'real')
+                    OR typeof(cc.text) IN ('integer', 'real')
+                    OR typeof(cc.qrCodeText) IN ('integer', 'real'))
             FROM clips c
             LEFT JOIN clip_contents cc ON cc.clipId = c.id
             WHERE \(clipWhereClause)
@@ -1058,21 +1065,26 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             ? try db.cachedStatement(sql: clipSQL)
             : try db.makeStatement(sql: clipSQL)
         let cursor = try Row.fetchCursor(clipStmt, arguments: clipArguments)
+        let hasTags = !tagIDsByClipID.isEmpty
+        let hasDuplicates = !duplicateIndicesByIDString.isEmpty
         return try drainCursorInBatches(cursor, isCancelled: isCancelled) { row in
-            guard let idString: String = row["id"],
-                  let targetIndices = indicesByIDString[idString] else {
+            guard let idString: String = row[0],
+                  let firstIndex = firstIndexByIDString[idString] else {
                 return
             }
             let searchText = decodeSearchTextForRow(
                 row,
-                idString: idString,
-                tagIDs: tagIDsByClipID[idString] ?? [],
+                clipID: ids[firstIndex],
+                tagIDs: hasTags ? (tagIDsByClipID[idString] ?? []) : [],
                 tagNamesByID: tagNamesByID,
                 keys: keys,
                 decoder: decoder
             )
-            for index in targetIndices {
-                results[index] = searchText
+            results[firstIndex] = searchText
+            if hasDuplicates, let extraIndices = duplicateIndicesByIDString[idString] {
+                for index in extraIndices {
+                    results[index] = searchText
+                }
             }
         }
     }
@@ -1090,10 +1102,19 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             return []
         }
 
-        var indicesByIDString: [String: [Int]] = [:]
-        indicesByIDString.reserveCapacity(ids.count)
+        var firstIndexByIDString: [String: Int] = [:]
+        firstIndexByIDString.reserveCapacity(ids.count)
+        var duplicateIndicesByIDString: [String: [Int]] = [:]
+        var uniqueIDStrings: [String] = []
+        uniqueIDStrings.reserveCapacity(ids.count)
         for (index, id) in ids.enumerated() {
-            indicesByIDString[id.uuidString, default: []].append(index)
+            let idString = id.uuidString
+            if firstIndexByIDString[idString] == nil {
+                firstIndexByIDString[idString] = index
+                uniqueIDStrings.append(idString)
+            } else {
+                duplicateIndicesByIDString[idString, default: []].append(index)
+            }
         }
 
         let deletedFilter = trashed ? "IS NOT NULL" : "IS NULL"
@@ -1103,7 +1124,6 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
             }
             var results = [String?](repeating: nil, count: ids.count)
             let decoder = Self.makeJSONDecoder()
-            let uniqueIDStrings = Array(indicesByIDString.keys)
 
             if uniqueIDStrings.count <= Self.searchInClauseChunkedMaxIDs {
                 var offset = 0
@@ -1132,7 +1152,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                         tagSQL: tagSQL,
                         tagArguments: arguments,
                         useCachedStatements: isFullBatch,
-                        indicesByIDString: indicesByIDString,
+                        ids: ids,
+                        firstIndexByIDString: firstIndexByIDString,
+                        duplicateIndicesByIDString: duplicateIndicesByIDString,
                         tagNamesByID: tagNamesByID,
                         keys: keys,
                         decoder: decoder,
@@ -1160,7 +1182,9 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 tagSQL: tagSQL,
                 tagArguments: StatementArguments(),
                 useCachedStatements: true,
-                indicesByIDString: indicesByIDString,
+                ids: ids,
+                firstIndexByIDString: firstIndexByIDString,
+                duplicateIndicesByIDString: duplicateIndicesByIDString,
                 tagNamesByID: tagNamesByID,
                 keys: keys,
                 decoder: decoder,

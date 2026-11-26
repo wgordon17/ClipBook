@@ -158,6 +158,294 @@ struct SearchPipelineTests {
     }
 
     @Test
+    func matcherSWARASCIICheckMemchrAnchorsAndCorpusASCIIFlagReuse() {
+        // Exhaustively verify SWAR isAllASCII across all 256 byte values, all 8 pointer alignments,
+        // and positions spanning lead, 32-byte, 8-byte, and tail paths.
+        var storage = [UInt8](repeating: 0x41, count: 80)
+        var swarMismatch: String?
+        let sliceLength = 47
+        let targetPositions = [0, 1, 7, 8, 15, 31, 32, 39, 40, sliceLength - 1]
+        storage.withUnsafeMutableBufferPointer { fullBuffer in
+            let base = fullBuffer.baseAddress!
+            for startAlignment in 0..<8 {
+                let sliceBase = base.advanced(by: startAlignment)
+                let slice = UnsafeBufferPointer(start: sliceBase, count: sliceLength)
+                for byteValue in 0...255 {
+                    let byte = UInt8(byteValue)
+                    let expectedAllowed = !(byte < 0x09 || (byte > 0x0D && byte < 0x20) || byte == 0x7F || byte >= 0x80)
+                    for targetPos in targetPositions {
+                        sliceBase[targetPos] = byte
+                        let actual = HistorySearchMatcher.isAllASCII(slice)
+                        sliceBase[targetPos] = 0x41
+                        if actual != expectedAllowed, swarMismatch == nil {
+                            swarMismatch = "SWAR mismatch for byte=\(byteValue) align=\(startAlignment) pos=\(targetPos): got \(actual), expected \(expectedAllowed)"
+                        }
+                    }
+                }
+            }
+        }
+        #expect(swarMismatch == nil, "\(swarMismatch ?? "")")
+
+        // Verify memchr anchor scanning across non-letter anchors, all-letter upper/lower ordering,
+        // single-character needles, repeated anchor false positives, and exact boundary positions.
+        let locale = Locale(identifier: "en_US")
+        let boundaryCases: [(haystack: String, query: String, expected: Bool)] = [
+            ("x", "x", true),
+            ("X", "x", true),
+            ("_", "_", true),
+            ("a", "_", false),
+            ("scale_needle", "scale_needle", true),
+            ("SCALE_NEEDLE", "scale_needle", true),
+            ("_____Scale_Needle", "scale_needle", true),
+            ("_____scale_needl", "scale_needle", false),
+            ("prefix_tail", "_tail", true),
+            ("prefix_tai", "_tail", false),
+            ("head_", "head_", true),
+            ("ead_", "head_", false),
+            ("zzzzUpperCaseLowercase", "uppercase", true),
+            ("zzzzlowercaseUppercase", "UPPERCASE", true),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbZ", "z", true),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbz", "Z", true),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "z", false),
+        ]
+        for entry in boundaryCases {
+            let actual = HistorySearchMatcher.matches(
+                entry.haystack,
+                HistorySearchTerms(query: entry.query),
+                locale: locale
+            )
+            #expect(
+                actual == entry.expected,
+                "Anchor mismatch for haystack=\(entry.haystack) query=\(entry.query): got \(actual), expected \(entry.expected)"
+            )
+        }
+
+        // Verify corpus-level cached ASCII flags preserve exact Foundation parity on warm prefix refinement
+        // across pure-ASCII, diacritic/ligature non-ASCII, and embedded NUL control-character rows.
+        let corpusTexts = [
+            "Ordinary ASCII filler without target",
+            "Pure ASCII needle_tail match",
+            "Café résumé naïve",
+            "Straße gross",
+            "ab\0cd control byte",
+        ]
+        let corpus = HistorySearchCorpus(
+            revision: 1,
+            ids: corpusTexts.map { _ in UUID() },
+            texts: corpusTexts,
+            hasCompleteTexts: true
+        )
+        let firstTerms = HistorySearchTerms(query: "a")
+        let firstResult = HistorySearchJob().run(corpus: corpus, terms: firstTerms, locale: locale)
+        #expect(firstResult != nil)
+        for query in ["ab", "abcd", "af", "as", "ass"] {
+            let refinedTerms = HistorySearchTerms(query: query)
+            let refined = HistorySearchJob().run(
+                corpus: corpus,
+                terms: refinedTerms,
+                locale: locale,
+                previous: firstResult
+            )
+            #expect(refined != nil)
+            if let refined {
+                for (index, text) in corpusTexts.enumerated() {
+                    let expected = text.range(
+                        of: query,
+                        options: [.caseInsensitive, .diacriticInsensitive],
+                        range: nil,
+                        locale: locale
+                    ) != nil
+                    #expect(
+                        refined.matches[index] == expected,
+                        "Warm refinement parity mismatch for text=\(String(reflecting: text)) query=\(query)"
+                    )
+                }
+            }
+        }
+    }
+
+    private struct SeededGenerator {
+        var state: UInt64
+
+        mutating func next(below bound: Int) -> Int {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Int((state >> 33) % UInt64(bound))
+        }
+    }
+
+    private static func referenceContainsASCIICaseInsensitive(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
+        func lower(_ byte: UInt8) -> UInt8 {
+            (byte >= 0x41 && byte <= 0x5A) ? (byte | 0x20) : byte
+        }
+        guard !needle.isEmpty, haystack.count >= needle.count else {
+            return needle.isEmpty
+        }
+        var index = 0
+        while index <= haystack.count - needle.count {
+            var offset = 0
+            while offset < needle.count, lower(haystack[index + offset]) == lower(needle[offset]) {
+                offset += 1
+            }
+            if offset == needle.count {
+                return true
+            }
+            index += 1
+        }
+        return false
+    }
+
+    @Test
+    func matcherFuzzAgreesWithByteLoopReferenceAndFoundation() {
+        var generator = SeededGenerator(state: 0x5EED_C11B_00C0_FFEE)
+        let enUS = Locale(identifier: "en_US")
+
+        // ASCII haystacks: the result is decided by the byte scan alone, so it must equal
+        // a plain byte-by-byte loop, whatever the caller already knows about the text.
+        let asciiAlphabet: [UInt8] = Array("aAbBeEzZ_9[ .\n\t".utf8)
+        let asciiNeedleAlphabet: [UInt8] = Array("aAbBeEzZ_9[.".utf8)
+        var asciiMismatch: String?
+        for _ in 0..<20_000 {
+            let haystackLength = generator.next(below: 4) == 0 ? generator.next(below: 400) : generator.next(below: 48)
+            var haystack = [UInt8]()
+            haystack.reserveCapacity(haystackLength)
+            for _ in 0..<haystackLength {
+                haystack.append(asciiAlphabet[generator.next(below: asciiAlphabet.count)])
+            }
+            let needleLength = 1 + generator.next(below: 5)
+            var needle = [UInt8]()
+            for _ in 0..<needleLength {
+                needle.append(asciiNeedleAlphabet[generator.next(below: asciiNeedleAlphabet.count)])
+            }
+            let haystackString = String(decoding: haystack, as: UTF8.self)
+            let terms = HistorySearchTerms(values: [String(decoding: needle, as: UTF8.self)])
+            let expected = Self.referenceContainsASCIICaseInsensitive(haystack, needle)
+            let unknown = HistorySearchMatcher.matches(haystackString, terms, locale: enUS)
+            let knownASCII = HistorySearchMatcher.matches(haystackString, terms, locale: enUS, knownAllASCII: true)
+            let assumedNonASCII = HistorySearchMatcher.matches(haystackString, terms, locale: enUS, knownAllASCII: false)
+            var recordedASCII = false
+            let recording = HistorySearchMatcher.matchesRecordingASCII(
+                haystackString,
+                terms,
+                locale: enUS,
+                isAllASCIIOut: &recordedASCII
+            )
+            if asciiMismatch == nil,
+               unknown != expected || knownASCII != expected || assumedNonASCII != expected
+                || recording != expected || !recordedASCII {
+                asciiMismatch = "haystack=\(String(reflecting: haystackString)) needle=\(String(reflecting: terms.values[0])) expected=\(expected) unknown=\(unknown) knownASCII=\(knownASCII) assumedNonASCII=\(assumedNonASCII) recording=\(recording) recordedASCII=\(recordedASCII)"
+            }
+        }
+        #expect(asciiMismatch == nil, "\(asciiMismatch ?? "")")
+
+        // Mixed Unicode haystacks: the full matcher must equal Foundation's search.
+        let unicodeAlphabet = [
+            "a", "A", "b", "E", "e", "s", "S", "i", "I", "f", " ", "_", "9",
+            "é", "É", "ß", "ﬁ", "İ", "ı", "å", "e\u{301}", "\u{00AD}", "東", "🚀",
+        ]
+        let unicodeNeedleAlphabet = ["a", "b", "e", "s", "i", "f", "_", "9", "E", "S"]
+        let locales = [enUS, Locale(identifier: "tr_TR"), Locale(identifier: "da_DK"), Locale(identifier: "de_DE")]
+        var unicodeMismatch: String?
+        for _ in 0..<6_000 {
+            let haystackLength = generator.next(below: 40)
+            var haystack = ""
+            for _ in 0..<haystackLength {
+                haystack += unicodeAlphabet[generator.next(below: unicodeAlphabet.count)]
+            }
+            let needleLength = 1 + generator.next(below: 3)
+            var needle = ""
+            for _ in 0..<needleLength {
+                needle += unicodeNeedleAlphabet[generator.next(below: unicodeNeedleAlphabet.count)]
+            }
+            let locale = locales[generator.next(below: locales.count)]
+            let terms = HistorySearchTerms(values: [needle])
+            let expected = haystack.range(
+                of: needle,
+                options: HistorySearchMatcher.compareOptions,
+                range: nil,
+                locale: locale
+            ) != nil
+            let actual = HistorySearchMatcher.matches(haystack, terms, locale: locale)
+            let assumedNonASCII = HistorySearchMatcher.matches(haystack, terms, locale: locale, knownAllASCII: false)
+            if unicodeMismatch == nil, actual != expected || assumedNonASCII != expected {
+                unicodeMismatch = "locale=\(locale.identifier) haystack=\(String(reflecting: haystack)) needle=\(needle) expected=\(expected) actual=\(actual) assumedNonASCII=\(assumedNonASCII)"
+            }
+        }
+        #expect(unicodeMismatch == nil, "\(unicodeMismatch ?? "")")
+    }
+
+    @Test
+    func matcherScanStaysLinearWhenOneAnchorCaseIsMissingOrFarAhead() {
+        let locale = Locale(identifier: "en_US")
+        let size = 4_000_000
+        let upperOnly = String(repeating: "E", count: size)
+        let lowerOnly = String(repeating: "e", count: size)
+        let upperThenLower = upperOnly + "e"
+        let lowerThenUpperMatch = lowerOnly + "EX"
+
+        let start = ContinuousClock.now
+        #expect(!HistorySearchMatcher.matches(upperOnly, HistorySearchTerms(values: ["ex"]), locale: locale))
+        #expect(!HistorySearchMatcher.matches(lowerOnly, HistorySearchTerms(values: ["EX"]), locale: locale))
+        #expect(!HistorySearchMatcher.matches(upperThenLower, HistorySearchTerms(values: ["ex"]), locale: locale))
+        #expect(HistorySearchMatcher.matches(lowerThenUpperMatch, HistorySearchTerms(values: ["ex"]), locale: locale))
+        let elapsed = ContinuousClock.now - start
+        #expect(elapsed < .seconds(10), "Anchor scan over \(size) repeated bytes took \(elapsed)")
+    }
+
+    @Test
+    func hasCompleteTextPreviewMatchesScalarReferenceForEverySpecialBytePosition() {
+        func reference(_ item: ClipboardItem) -> Bool {
+            if item.isContentLoaded {
+                return true
+            }
+            if item.hasFormatting && item.textPreview == nil {
+                return false
+            }
+            guard item.characterCount <= ClipboardItem.textPreviewBodyLimit else {
+                return false
+            }
+            guard let preview = item.textPreview else {
+                return item.characterCount == 0
+            }
+            let utf8Count = preview.utf8.count
+            guard utf8Count >= item.characterCount else {
+                return false
+            }
+            if utf8Count == item.characterCount,
+               let firstByte = preview.utf8.first,
+               firstByte >= 0x21,
+               firstByte < 0x7F,
+               preview.utf8.allSatisfy({ $0 < 0x80 && $0 != 0x0D }) {
+                return utf8Count < ClipboardItem.textPreviewMaxUTF16Length - 2
+            }
+            return preview.first?.isWhitespace != true
+                && preview.count == item.characterCount
+                && preview.utf16.count < ClipboardItem.textPreviewMaxUTF16Length - 2
+        }
+
+        let specials = ["\r", "\n", "\t", " ", "\0", "\u{7F}", "é", "\r\n", "🚀"]
+        var mismatch: String?
+        var checked = 0
+        for length in [1, 2, 7, 8, 9, 15, 16, 17, 31, 40] {
+            for special in specials {
+                for position in 0...length {
+                    var characters = [String](repeating: "a", count: length)
+                    if position < length {
+                        characters[position] = special
+                    }
+                    let text = characters.joined()
+                    let item = ClipboardItem.fixture(kind: .text, text: text).unloadingContent()
+                    checked += 1
+                    if mismatch == nil, item.hasCompleteTextPreview != reference(item) {
+                        mismatch = "text=\(String(reflecting: text)) got \(item.hasCompleteTextPreview), expected \(reference(item))"
+                    }
+                }
+            }
+        }
+        #expect(checked > 500)
+        #expect(mismatch == nil, "\(mismatch ?? "")")
+    }
+
+    @Test
     func matcherAndHighlighterAgreeAcrossMultiWordAndDiacriticQueries() {
         let font = NSFont.systemFont(ofSize: 13)
         let baseColor = NSColor.labelColor
