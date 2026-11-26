@@ -147,8 +147,12 @@ enum ServicesAndUtilitiesTests {
 
             let htmlWrappedSVG = "<div><svg xmlns=\"http://www.w3.org/2000/svg\"></svg></div>"
             let unclosedSVG = "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/>"
+            let prologueSVG = "<?xml version=\"1.0\"?>\n<!-- comment -->\n<!DOCTYPE svg>\n<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"
+            let adversarialPrologue = "<!--x-->" + String(repeating: " ", count: 256) + "<div></svg>"
             #expect(!SVGImageRenderer.isSVGMarkup(htmlWrappedSVG))
             #expect(!SVGImageRenderer.isSVGMarkup(unclosedSVG))
+            #expect(SVGImageRenderer.isSVGMarkup(prologueSVG))
+            #expect(!SVGImageRenderer.isSVGMarkup(adversarialPrologue))
 
             let renderer = SVGImageRenderer()
             let item = ClipboardItem.fixture(kind: .text, text: validSVG)
@@ -712,6 +716,36 @@ extension SharedProcessStateTests {
                 ImageDragFiles.removeCopies(forSupportDirectory: support1)
                 #expect(!FileManager.default.fileExists(atPath: dragURL1.path))
                 #expect(FileManager.default.fileExists(atPath: dragURL2.path), "Support drag cleanup must preserve Support2 drag copies")
+
+                // Simulate a pre-crash leftover drag file on disk inside support1's partition (not in in-memory tracking).
+                let partition1Name = ContentDigest.sha256(
+                    Data(ImageAssetStore.canonicalDirectoryURL(support1).path.utf8)
+                )
+                let orphanFolder = ImageDragFiles.directory
+                    .appendingPathComponent(partition1Name, isDirectory: true)
+                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: orphanFolder, withIntermediateDirectories: true)
+                let orphanFile = orphanFolder.appendingPathComponent("crash-leftover.png")
+                try samplePNG.write(to: orphanFile)
+                #expect(FileManager.default.fileExists(atPath: orphanFile.path))
+
+                ImageDragFiles.removeCopies(forSupportDirectory: support1)
+                #expect(!FileManager.default.fileExists(atPath: orphanFile.path), "Support drag cleanup must scrub untracked pre-crash leftovers in its partition")
+                #expect(FileManager.default.fileExists(atPath: dragURL2.path), "Pre-crash partition cleanup must still preserve Support2 drag copies")
+
+                // Legacy flat <UUID> folder directly under Dragged Images is scrubbed on expiry while active partitioned copies survive.
+                let legacyFlatFolder = ImageDragFiles.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: legacyFlatFolder, withIntermediateDirectories: true)
+                let legacyFlatFile = legacyFlatFolder.appendingPathComponent("legacy.png")
+                try samplePNG.write(to: legacyFlatFile)
+                let twoHoursAgo = Date().addingTimeInterval(-7_200)
+                try FileManager.default.setAttributes(
+                    [.creationDate: twoHoursAgo, .modificationDate: twoHoursAgo],
+                    ofItemAtPath: legacyFlatFolder.path
+                )
+                ImageDragFiles.removeExpiredCopies(now: Date())
+                #expect(!FileManager.default.fileExists(atPath: legacyFlatFile.path), "Expired legacy flat UUID drag folder must be scrubbed")
+                #expect(FileManager.default.fileExists(atPath: dragURL2.path), "Active partitioned drag copy must survive expiry sweep")
             }
         }
     }

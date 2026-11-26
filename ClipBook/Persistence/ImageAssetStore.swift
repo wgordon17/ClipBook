@@ -127,12 +127,15 @@ nonisolated final class ImageAssetStore: Sendable {
         self.supportDirectory = supportDirectory
     }
 
+    private static let allowedPlainAssetExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "ico",
+        "tif", "tiff", "bmp", "heic", "heif", "avif", "icns",
+    ]
+
     static func plainAssetExtension(preferred: String? = nil, magicBytes data: Data) -> String {
         if let preferred {
             let normalized = preferred.lowercased()
-            if normalized != "enc",
-               (1...8).contains(normalized.utf8.count),
-               normalized.utf8.allSatisfy({ ($0 >= 0x61 && $0 <= 0x7A) || ($0 >= 0x30 && $0 <= 0x39) }) {
+            if allowedPlainAssetExtensions.contains(normalized) {
                 return normalized
             }
         }

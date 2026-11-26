@@ -454,9 +454,44 @@ final class SVGImageRenderer: @unchecked Sendable {
       return false
     }
 
-    let prologue = String(content.prefix(prologueCharacterLimit))
-    let pattern = #"^(?:\s+|<\?xml[^>]*>|<!--[\s\S]*?-->|<!DOCTYPE[^>]*>)*<svg[\s>]"#
-    return prologue.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+    let prologue = content.prefix(prologueCharacterLimit)
+    var index = prologue.startIndex
+    while index < prologue.endIndex {
+      while index < prologue.endIndex && prologue[index].isWhitespace {
+        index = prologue.index(after: index)
+      }
+      guard index < prologue.endIndex else {
+        return false
+      }
+
+      let remainder = prologue[index...]
+      if let match = remainder.range(of: "<?xml", options: [.anchored, .caseInsensitive]) {
+        guard let close = prologue[match.upperBound...].firstIndex(of: ">") else {
+          return false
+        }
+        index = prologue.index(after: close)
+      } else if remainder.hasPrefix("<!--") {
+        let commentStart = prologue.index(index, offsetBy: 4)
+        guard let close = prologue[commentStart...].range(of: "-->") else {
+          return false
+        }
+        index = close.upperBound
+      } else if let match = remainder.range(of: "<!DOCTYPE", options: [.anchored, .caseInsensitive]) {
+        guard let close = prologue[match.upperBound...].firstIndex(of: ">") else {
+          return false
+        }
+        index = prologue.index(after: close)
+      } else if let match = remainder.range(of: "<svg", options: [.anchored, .caseInsensitive]) {
+        guard match.upperBound < prologue.endIndex else {
+          return false
+        }
+        let next = prologue[match.upperBound]
+        return next.isWhitespace || next == ">"
+      } else {
+        return false
+      }
+    }
+    return false
   }
 
   private nonisolated static func render(_ text: String) -> Rendering? {

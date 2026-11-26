@@ -1460,11 +1460,13 @@ extension SharedProcessStateTests {
         func lazySearchLifecyclePrefixReuseIncrementalDonorReuseFallbackAndTrashIsolation() async throws {
             TestSupport.ensureAppKitInitialized()
 
-            URLProtocol.registerClass(SearchTestLinkPreviewURLProtocol.self)
-            defer { URLProtocol.unregisterClass(SearchTestLinkPreviewURLProtocol.self) }
-
             let (harness, spyStore, _) = try TestSupport.makeSpiedTestCoordinator()
             defer { harness.cleanup() }
+            let stubConfig = URLSessionConfiguration.ephemeral
+            stubConfig.protocolClasses = [SearchTestLinkPreviewURLProtocol.self]
+            let stubSession = URLSession(configuration: stubConfig)
+            defer { stubSession.invalidateAndCancel() }
+            harness.coordinator.linkPreviewFetcher = LinkPreviewFetcher(session: stubSession)
 
             let baseTime = Date(timeIntervalSince1970: 1_710_300_000)
             let tagAlpha = try spyStore.createTag(name: "ProjectAlpha", color: "#3B85ED")

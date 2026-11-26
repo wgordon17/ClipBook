@@ -263,8 +263,8 @@ nonisolated enum SensitiveContent {
         guard let text, !text.isEmpty else {
             return false
         }
-        let utf16Count = text.utf16.count
-        if utf16Count > maxEncryptionScanUTF16Length {
+        if text.utf8.count > maxEncryptionScanUTF16Length,
+           text.utf16.count > maxEncryptionScanUTF16Length {
             return true
         }
         guard SensitiveContentDetector.mayContainSecret(in: text) else {

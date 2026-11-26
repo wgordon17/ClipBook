@@ -221,7 +221,21 @@ nonisolated final class LinkPreviewFetcher: Sendable {
   private static let maximumFaviconBytes = 512 * 1024
   private static let requestTimeout: TimeInterval = 10
 
-  init() {}
+  private static func makeDefaultSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    return URLSession(configuration: configuration)
+  }
+
+  private static let defaultSession: URLSession = makeDefaultSession()
+  let session: URLSession
+
+  init(session: URLSession = LinkPreviewFetcher.defaultSession) {
+    self.session = session
+  }
 
   @concurrent
   func fetchPreview(for url: URL) async -> LinkPreview? {
@@ -254,7 +268,11 @@ nonisolated final class LinkPreviewFetcher: Sendable {
       return nil
     }
 
-    return await Self.fetchImage(at: url, maximumByteCount: Self.maximumPreviewImageBytes)
+    return await Self.fetchImage(
+      at: url,
+      session: session,
+      maximumByteCount: Self.maximumPreviewImageBytes
+    )
   }
 
   private func fetchHTML(for url: URL) async -> String? {
@@ -270,6 +288,7 @@ nonisolated final class LinkPreviewFetcher: Sendable {
     do {
       guard let (data, _) = try await Self.fetchBoundedData(
         for: request,
+        session: session,
         maximumByteCount: Self.maximumHTMLBytes,
         truncateAtLimit: true
       ),
@@ -289,7 +308,11 @@ nonisolated final class LinkPreviewFetcher: Sendable {
         return nil
       }
 
-      if let image = await Self.fetchImage(at: url, maximumByteCount: maximumByteCount) {
+      if let image = await Self.fetchImage(
+        at: url,
+        session: session,
+        maximumByteCount: maximumByteCount
+      ) {
         return image
       }
     }
@@ -297,7 +320,11 @@ nonisolated final class LinkPreviewFetcher: Sendable {
     return nil
   }
 
-  private static func fetchImage(at url: URL, maximumByteCount: Int) async -> FetchedImagePayload? {
+  private static func fetchImage(
+    at url: URL,
+    session: URLSession,
+    maximumByteCount: Int
+  ) async -> FetchedImagePayload? {
     guard url.scheme == "http" || url.scheme == "https" else {
       return nil
     }
@@ -309,6 +336,7 @@ nonisolated final class LinkPreviewFetcher: Sendable {
     do {
       guard let (data, _) = try await fetchBoundedData(
         for: request,
+        session: session,
         maximumByteCount: maximumByteCount,
         truncateAtLimit: false
       ),
@@ -370,7 +398,7 @@ nonisolated final class LinkPreviewFetcher: Sendable {
   @concurrent
   private nonisolated static func fetchBoundedData(
     for request: URLRequest,
-    session: URLSession = .shared,
+    session: URLSession = defaultSession,
     maximumByteCount: Int,
     truncateAtLimit: Bool
   ) async throws -> (Data, HTTPURLResponse)? {

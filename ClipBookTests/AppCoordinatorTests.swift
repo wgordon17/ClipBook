@@ -2712,13 +2712,16 @@ extension SharedProcessStateTests {
         @Test
         @MainActor
         func mutationsDuringPendingLinkPreviewFlushPreserveLinkPreviewAndApplyMutations() async throws {
-            URLProtocol.registerClass(StubLinkPreviewURLProtocol.self)
-            defer { URLProtocol.unregisterClass(StubLinkPreviewURLProtocol.self) }
-
             let harness = try TestSupport.makeTestCoordinator(configureInitialPreferences: {
                 $0.showPreviewForLinks = true
             })
             defer { harness.cleanup() }
+            let stubConfig = URLSessionConfiguration.ephemeral
+            stubConfig.protocolClasses = [StubLinkPreviewURLProtocol.self]
+            let stubSession = URLSession(configuration: stubConfig)
+            defer { stubSession.invalidateAndCancel() }
+            harness.coordinator.linkPreviewFetcher = LinkPreviewFetcher(session: stubSession)
+            harness.coordinator.linkPreviewModelUpdateCoalescingDelayForTesting = .seconds(60)
 
             let workTag = try #require(harness.coordinator.createTag(name: "Reading", color: .systemBlue))
             let linkA = ClipboardItem.fixture(
@@ -2743,7 +2746,7 @@ extension SharedProcessStateTests {
                     == "Fetched Preview Title"
             })
             let pendingHeaderA = try #require(harness.model.items.first { $0.id == seededA.id })
-            #expect(pendingHeaderA.linkPreviewDetails == nil, "Test must mutate within the 150ms coalescing window")
+            #expect(pendingHeaderA.linkPreviewDetails == nil, "Test must mutate before the coalescing flush fires")
 
             harness.coordinator.toggleFavorite(pendingHeaderA)
             let afterFavoriteA = try #require(harness.model.items.first { $0.id == seededA.id })
@@ -2757,11 +2760,11 @@ extension SharedProcessStateTests {
                     == "Fetched Preview Title"
             })
             let pendingHeaderB = try #require(harness.model.items.first { $0.id == seededB.id })
-            #expect(pendingHeaderB.linkPreviewDetails == nil, "Test must mutate linkB within the 150ms coalescing window")
+            #expect(pendingHeaderB.linkPreviewDetails == nil, "Test must mutate linkB before the coalescing flush fires")
             harness.coordinator.setSensitive(false, for: pendingHeaderB)
 
-            // Wait past the 150ms coalescing window so any stale pending flush would have fired.
-            try await Task.sleep(for: .milliseconds(250))
+            // Flush any remaining pending updates deterministically instead of sleeping past 150ms.
+            harness.coordinator.flushPendingLinkPreviewModelUpdatesForTesting()
 
             let modelA = try #require(harness.model.items.first { $0.id == seededA.id })
             #expect(modelA.isFavorite)
@@ -2782,6 +2785,34 @@ extension SharedProcessStateTests {
             let storedB = try #require(try harness.historyStore.fetchAll().first { $0.id == seededB.id })
             #expect(storedB.sensitivity == .notSensitive)
             #expect(storedB.linkPreviewDetails?.title == "Fetched Preview Title")
+        }
+
+        @Test
+        @MainActor
+        func startScrubsPreCrashImageDragFilesForSupportDirectory() throws {
+            let harness = try TestSupport.makeTestCoordinator(configureInitialPreferences: {
+                $0.hasCompletedOnboarding = true
+                $0.showMainWindowAtStartup = false
+            })
+            defer {
+                harness.cleanup()
+                ImageDragFiles.removeCopies(forSupportDirectory: harness.supportDirectory)
+            }
+
+            let pngData = try TestSupport.makePNGData(pixelWidth: 16, pixelHeight: 16)
+            let partitionName = ContentDigest.sha256(
+                Data(ImageAssetStore.canonicalDirectoryURL(harness.supportDirectory).path.utf8)
+            )
+            let preCrashFolder = ImageDragFiles.directory
+                .appendingPathComponent(partitionName, isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: preCrashFolder, withIntermediateDirectories: true)
+            let preCrashFile = preCrashFolder.appendingPathComponent("sensitive-leftover.png")
+            try pngData.write(to: preCrashFile)
+            #expect(FileManager.default.fileExists(atPath: preCrashFile.path))
+
+            harness.coordinator.start()
+            #expect(!FileManager.default.fileExists(atPath: preCrashFile.path), "AppCoordinator.start must scrub pre-crash drag copies for its support directory")
         }
     }
 }

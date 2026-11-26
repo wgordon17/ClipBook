@@ -856,23 +856,22 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
         }
 
         return try withRead { db, keys in
-            let conditions = cutoffs.map { _ in "(c.kind = ? AND c.copiedAt < ?)" }.joined(separator: " OR ")
-            var arguments: [any DatabaseValueConvertible] = []
-            arguments.reserveCapacity(cutoffs.count * 2)
-            for (kind, cutoff) in cutoffs {
-                arguments.append(kind.rawValue)
-                arguments.append(cutoff.timeIntervalSince1970)
-            }
-
             let protectedClause = policy.keepsFavoritesAndTaggedItems
                 ? " AND c.isFavorite = 0 AND NOT EXISTS (SELECT 1 FROM clip_tags ct WHERE ct.clipId = c.id)"
                 : ""
             let sql = """
                 \(Self.clipBatchSelectClause)
-                WHERE c.deletedAt IS NULL AND (\(conditions))\(protectedClause)
-                ORDER BY c.copiedAt DESC
+                WHERE c.deletedAt IS NULL AND c.kind = ? AND c.copiedAt < ?\(protectedClause)
                 """
-            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+            let statement = try db.cachedStatement(sql: sql)
+            var rows: [Row] = []
+            for (kind, cutoff) in cutoffs {
+                let kindRows = try Row.fetchAll(
+                    statement,
+                    arguments: [kind.rawValue, cutoff.timeIntervalSince1970]
+                )
+                rows.append(contentsOf: kindRows)
+            }
             guard !rows.isEmpty else {
                 return []
             }
@@ -885,12 +884,14 @@ nonisolated final class GRDBHistoryStore: HistoryStore, Sendable {
                 tagAttachments = try self.fetchTagAttachments(in: db, forClipIDStrings: matchedIDs)
             }
 
-            return try self.decodeFetchedBatchRows(
+            var items = try self.decodeFetchedBatchRows(
                 rows,
                 tagAttachments: tagAttachments,
                 keys: keys,
                 where: policy.isExpired
             )
+            items.sort { $0.copiedAt > $1.copiedAt }
+            return items
         }
     }
 

@@ -46,10 +46,11 @@ final class AppCoordinator: ObservableObject {
   private static let v1PreferencesDomain = "com.ikryanov.clipbook"
   private static let v1LicenseKeyPreferenceKey = "license_key"
   #endif
-  private let linkPreviewFetcher = LinkPreviewFetcher()
+  var linkPreviewFetcher = LinkPreviewFetcher()
   private var linkPreviewTasksByItemID: [UUID: Task<Void, Never>] = [:]
   private var pendingLinkPreviewModelUpdatesByItemID: [UUID: ClipboardItem] = [:]
   private var linkPreviewModelUpdateTask: Task<Void, Never>?
+  var linkPreviewModelUpdateCoalescingDelayForTesting: Duration = .milliseconds(150)
   private let soundService = SoundService()
   @Published var settingsSection: SettingsSection = .general
   private var historyWindow: HistoryWindow?
@@ -146,6 +147,7 @@ final class AppCoordinator: ObservableObject {
   }
 
   func start() {
+    ImageDragFiles.removeCopies(forSupportDirectory: supportDirectory)
     loadAndReconcilePreferences()
     #if DEBUG
     applyDebugTrialDates()
@@ -2131,6 +2133,7 @@ final class AppCoordinator: ObservableObject {
   /// may cancel it, nor while an archive is being imported, since its items
   /// are checked once it is in.
   private func applyRetention() {
+    ImageDragFiles.removeExpiredCopies()
     guard !isRetentionPromptPresented,
           !isHistoryArchiveOperationRunning,
           historyStore.isOpen,
@@ -3102,15 +3105,21 @@ final class AppCoordinator: ObservableObject {
   private func scheduleLinkPreviewModelUpdate(_ item: ClipboardItem) {
     pendingLinkPreviewModelUpdatesByItemID[item.id] = item
     linkPreviewModelUpdateTask?.cancel()
+    let delay = linkPreviewModelUpdateCoalescingDelayForTesting
 
     linkPreviewModelUpdateTask = Task { [weak self] in
-      try? await Task.sleep(nanoseconds: 150_000_000)
+      try? await Task.sleep(for: delay)
       guard !Task.isCancelled else {
         return
       }
 
       self?.applyPendingLinkPreviewModelUpdates()
     }
+  }
+
+  func flushPendingLinkPreviewModelUpdatesForTesting() {
+    linkPreviewModelUpdateTask?.cancel()
+    applyPendingLinkPreviewModelUpdates()
   }
 
   private func applyPendingLinkPreviewModelUpdates() {

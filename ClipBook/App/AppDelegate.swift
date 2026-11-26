@@ -37,10 +37,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   // clipboard monitor and menu bar item.
   nonisolated static let isRunningTests: Bool = RuntimeSigningEnvironment.isRunningTests
 
-  override init() {
+  override convenience init() {
     let fileManager = FileManager.default
     let supportDirectory: URL
     let userDefaults: UserDefaults
+    let testSupportDirectory: URL?
+    let testDefaultsSuiteName: String?
     if Self.isRunningTests {
       // The Debug build has a bundle identifier of its own, and a test run still
       // keeps its preferences and history apart from the Debug build a developer
@@ -57,8 +59,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       testSupportDirectory = nil
       testDefaultsSuiteName = nil
     }
+    self.init(
+      supportDirectory: supportDirectory,
+      userDefaults: userDefaults,
+      keyProvider: nil,
+      testSupportDirectory: testSupportDirectory,
+      testDefaultsSuiteName: testDefaultsSuiteName
+    )
+  }
+
+  #if DEBUG
+  convenience init(supportDirectory: URL, userDefaults: UserDefaults, keyProvider: any DatabaseKeyProvider) {
+    self.init(
+      supportDirectory: supportDirectory,
+      userDefaults: userDefaults,
+      keyProvider: keyProvider,
+      testSupportDirectory: nil,
+      testDefaultsSuiteName: nil
+    )
+  }
+  #endif
+
+  private init(
+    supportDirectory: URL,
+    userDefaults: UserDefaults,
+    keyProvider: (any DatabaseKeyProvider)?,
+    testSupportDirectory: URL?,
+    testDefaultsSuiteName: String?
+  ) {
+    let fileManager = FileManager.default
+    self.testSupportDirectory = testSupportDirectory
+    self.testDefaultsSuiteName = testDefaultsSuiteName
     preferencesStore = PreferencesStore(userDefaults: userDefaults)
-    historyStore = GRDBHistoryStore(directory: supportDirectory)
+    historyStore = keyProvider.map { GRDBHistoryStore(directory: supportDirectory, keyProvider: $0) }
+      ?? GRDBHistoryStore(directory: supportDirectory)
     model = AppModel()
     pasteService = PasteService { [historyStore] item, scope in
       try historyStore.loadingContent(of: item, scope: scope)
@@ -227,7 +261,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
+  var statusItemPresentation: (label: String, isPausedIcon: Bool) {
+    Self.statusItemPresentation(isPaused: model.isPaused, storeLockState: model.storeLockState)
+  }
+
+  static func statusItemPresentation(
+    isPaused: Bool,
+    storeLockState: StoreLockState
+  ) -> (label: String, isPausedIcon: Bool) {
+    let label = storeLockState != .unlocked
+      ? "ClipBook — \(PersistenceErrorLocalization.statusTitle(for: storeLockState))"
+      : "ClipBook"
+    return (label: label, isPausedIcon: isPaused || storeLockState != .unlocked)
+  }
+
   private func configureStatusItem() {
+    guard !Self.isRunningTests else {
+      return
+    }
     guard model.preferences.showMenuBarIcon else {
       if let item = statusItem {
         NSStatusBar.system.removeStatusItem(item)
@@ -237,13 +288,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    item.button?.image = Self.statusBarImage(isPaused: model.isPaused || model.storeLockState != .unlocked)
+    let presentation = statusItemPresentation
+    item.button?.image = Self.statusBarImage(isPaused: presentation.isPausedIcon)
     item.button?.imagePosition = .imageOnly
-    let statusLabel = model.storeLockState != .unlocked
-      ? "ClipBook — \(PersistenceErrorLocalization.statusTitle(for: model.storeLockState))"
-      : "ClipBook"
-    item.button?.toolTip = statusLabel
-    item.button?.setAccessibilityLabel(statusLabel)
+    item.button?.toolTip = presentation.label
+    item.button?.setAccessibilityLabel(presentation.label)
     if model.preferences.openHistoryOnMenuBarIconClick {
       // A click toggles the history window, and the menu is attached only for
       // as long as a right-click or Control-click shows it. The action is sent
@@ -303,8 +352,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// created with: after a shortcut is reassigned the menu item still holds the
   /// previous key equivalent, so the old shortcut keeps triggering the action
   /// whenever ClipBook is the active app.
-  private func configureHistoryMenu() {
-    guard let mainMenu = NSApp.mainMenu else {
+  func configureHistoryMenu() {
+    guard !Self.isRunningTests, let mainMenu = NSApp.mainMenu else {
       return
     }
 
@@ -329,7 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     return mainMenu.items.count
   }
 
-  private func makeHistoryMenu() -> NSMenu {
+  func makeHistoryMenu() -> NSMenu {
     let menu = NSMenu(title: L10n.string("History"))
     menu.autoenablesItems = false
 
@@ -372,8 +421,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     return menu
   }
 
-  private func makeStatusMenu() -> NSMenu {
+  func makeStatusMenu() -> NSMenu {
     let menu = NSMenu()
+    menu.autoenablesItems = false
     let openClipBookItem = menuItem(L10n.string("Open ClipBook"), action: #selector(showHistory))
     if let shortcut = KeyboardShortcutParser.menuItemKeyEquivalent(for: model.preferences.showHistoryShortcut) {
       openClipBookItem.keyEquivalent = shortcut.keyEquivalent
@@ -493,7 +543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     configureHistoryMenu()
   }
 
-  @objc private func retryUnlockHistory() {
+  @objc func retryUnlockHistory() {
     coordinator.retryUnlockHistoryStore()
     configureStatusItem()
     configureHistoryMenu()

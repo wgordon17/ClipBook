@@ -100,6 +100,10 @@ nonisolated enum ImageDragFiles {
     FileManager.default.temporaryDirectory.appendingPathComponent("Dragged Images", isDirectory: true)
   }
 
+  private static func supportPartitionName(for supportDirPath: String) -> String {
+    ContentDigest.sha256(Data(supportDirPath.utf8))
+  }
+
   static func makeCopy(
     of assetURL: URL,
     named fileName: String,
@@ -125,6 +129,7 @@ nonisolated enum ImageDragFiles {
     let supportDirPath = ImageAssetStore.canonicalDirectoryURL(
       assetURL.deletingLastPathComponent().deletingLastPathComponent()
     ).path
+    let partitionName = supportPartitionName(for: supportDirPath)
 
     return folderURLsBySupportDirPath.withLock { tracked in
       guard var rootDirectory = ensureHardenedRootDirectoryLocked() else {
@@ -134,7 +139,14 @@ nonisolated enum ImageDragFiles {
       resourceValues.isExcludedFromBackup = true
       try? rootDirectory.setResourceValues(resourceValues)
 
-      let folder = rootDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+      guard let partitionDirectory = ensureHardenedSubdirectoryLocked(
+        named: partitionName,
+        under: rootDirectory
+      ) else {
+        return nil
+      }
+
+      let folder = partitionDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
       guard Darwin.mkdir(folder.path, mode_t(0o700)) == 0 else {
         return nil
       }
@@ -162,7 +174,7 @@ nonisolated enum ImageDragFiles {
         return
       }
 
-      guard let entries = try? FileManager.default.contentsOfDirectory(
+      guard let partitions = try? FileManager.default.contentsOfDirectory(
         at: root,
         includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
         options: []
@@ -172,44 +184,74 @@ nonisolated enum ImageDragFiles {
 
       var survivingFolderPaths = Set<String>()
       let cutoff = now.addingTimeInterval(-maximumAge)
-      for entry in entries {
-        let values = try? entry.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-        let timestamp = values?.creationDate ?? values?.contentModificationDate
-        if let timestamp, timestamp < cutoff {
-          scrubAndRemoveLocked(at: entry)
-        } else {
-          survivingFolderPaths.insert(ImageAssetStore.canonicalDirectoryURL(entry).path)
+      for partition in partitions {
+        var partitionStat = stat()
+        guard Darwin.lstat(partition.path, &partitionStat) == 0,
+              (partitionStat.st_mode & S_IFMT) == S_IFDIR else {
+          scrubAndRemoveLocked(at: partition)
+          continue
         }
+
+        if UUID(uuidString: partition.lastPathComponent) != nil {
+          expireOrRetainFolderLocked(at: partition, cutoff: cutoff, survivingFolderPaths: &survivingFolderPaths)
+          continue
+        }
+
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+          at: partition,
+          includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
+          options: []
+        ) else {
+          continue
+        }
+
+        for entry in entries {
+          expireOrRetainFolderLocked(at: entry, cutoff: cutoff, survivingFolderPaths: &survivingFolderPaths)
+        }
+        _ = Darwin.rmdir(partition.path)
       }
       pruneTrackedFoldersLocked(&tracked, keepingOnly: survivingFolderPaths)
+      _ = Darwin.rmdir(root.path)
+    }
+  }
+
+  private static func expireOrRetainFolderLocked(
+    at folderURL: URL,
+    cutoff: Date,
+    survivingFolderPaths: inout Set<String>
+  ) {
+    let values = try? folderURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+    let timestamp = values?.creationDate ?? values?.contentModificationDate
+    if let timestamp, timestamp < cutoff {
+      scrubAndRemoveLocked(at: folderURL)
+    } else {
+      survivingFolderPaths.insert(ImageAssetStore.canonicalDirectoryURL(folderURL).path)
     }
   }
 
   static func removeCopies(forSupportDirectory directoryURL: URL) {
     let supportDirPath = ImageAssetStore.canonicalDirectoryURL(directoryURL).path
+    let partitionName = supportPartitionName(for: supportDirPath)
 
     folderURLsBySupportDirPath.withLock { tracked in
-      guard let folderPaths = tracked.removeValue(forKey: supportDirPath),
-            !folderPaths.isEmpty else {
-        return
-      }
-
-      for folderPath in folderPaths {
-        scrubAndRemoveLocked(at: URL(fileURLWithPath: folderPath, isDirectory: true))
+      if let folderPaths = tracked.removeValue(forKey: supportDirPath) {
+        for folderPath in folderPaths {
+          scrubAndRemoveLocked(at: URL(fileURLWithPath: folderPath, isDirectory: true))
+        }
       }
 
       let root = directory
-      var st = stat()
-      if Darwin.lstat(root.path, &st) == 0,
-         (st.st_mode & S_IFMT) == S_IFDIR,
-         let remaining = try? FileManager.default.contentsOfDirectory(
-           at: root,
-           includingPropertiesForKeys: nil,
-           options: []
-         ),
-         remaining.isEmpty {
-        _ = Darwin.rmdir(root.path)
+      var rootStat = stat()
+      guard Darwin.lstat(root.path, &rootStat) == 0,
+            (rootStat.st_mode & S_IFMT) == S_IFDIR else {
+        return
       }
+      let partitionURL = root.appendingPathComponent(partitionName, isDirectory: true)
+      var partitionStat = stat()
+      if Darwin.lstat(partitionURL.path, &partitionStat) == 0 {
+        scrubAndRemoveLocked(at: partitionURL)
+      }
+      _ = Darwin.rmdir(root.path)
     }
   }
 
@@ -271,6 +313,28 @@ nonisolated enum ImageDragFiles {
 
     _ = Darwin.chmod(root.path, mode_t(0o700))
     return root
+  }
+
+  private static func ensureHardenedSubdirectoryLocked(named name: String, under root: URL) -> URL? {
+    let subdir = root.appendingPathComponent(name, isDirectory: true)
+    var st = stat()
+    if Darwin.lstat(subdir.path, &st) == 0 {
+      if (st.st_mode & S_IFMT) != S_IFDIR {
+        ImageAssetStore.secureUnlink(at: subdir)
+      }
+    }
+    if Darwin.lstat(subdir.path, &st) != 0 {
+      guard Darwin.mkdir(subdir.path, mode_t(0o700)) == 0 else {
+        return nil
+      }
+    }
+    var verifyStat = stat()
+    guard Darwin.lstat(subdir.path, &verifyStat) == 0,
+          (verifyStat.st_mode & S_IFMT) == S_IFDIR else {
+      return nil
+    }
+    _ = Darwin.chmod(subdir.path, mode_t(0o700))
+    return subdir
   }
 
   private static func scrubAndRemoveLocked(at targetURL: URL) {

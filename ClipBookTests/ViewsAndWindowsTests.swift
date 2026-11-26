@@ -2146,6 +2146,422 @@ extension SharedProcessStateTests {
                 #expect(visibleTextFieldStrings(in: standaloneHistory).contains(emptyListTitle))
             }
         }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func appDelegateStatusPresentationMenusAndRetryUnlockReflectStoreLockStates() async throws {
+            try await TestSupport.withTemporaryDirectory { supportDir in
+                let masterKey = SymmetricKey(size: .bits256)
+                let seededClip = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Clip unlocked through AppDelegate",
+                    copiedAt: Date(timeIntervalSince1970: 1_715_800_300)
+                )
+                do {
+                    let seedStore = GRDBHistoryStore(
+                        directory: supportDir,
+                        keyProvider: InMemoryDatabaseKeyProvider(key: masterKey)
+                    )
+                    defer { seedStore.close() }
+                    _ = try seedStore.saveAndReconcileItem(seededClip, convertingExternalAssets: true)
+                }
+
+                let toggleProvider = InMemoryDatabaseKeyProvider(
+                    key: nil,
+                    error: .encryptionKeyUnavailable(.interactionNotAllowed)
+                )
+                let suiteName = "com.ikryanov.clipbook.tests.\(UUID().uuidString)"
+                let defaults = try #require(UserDefaults(suiteName: suiteName))
+                defer { defaults.removePersistentDomain(forName: suiteName) }
+
+                let delegate = AppDelegate(
+                    supportDirectory: supportDir,
+                    userDefaults: defaults,
+                    keyProvider: toggleProvider
+                )
+                defer {
+                    delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+                }
+
+                // 1. Starts .locked(.interactionNotAllowed) on init: disables Pause/Resume and adds Unlock History...
+                delegate.retryUnlockHistory()
+                #expect(delegate.model.storeLockState == .locked(.interactionNotAllowed))
+                let unlockTitle = L10n.string("Unlock History...")
+                let lockedTitle = PersistenceErrorLocalization.statusTitle(for: .locked(.interactionNotAllowed))
+                #expect(delegate.statusItemPresentation.label == "ClipBook — \(lockedTitle)")
+                #expect(delegate.statusItemPresentation.isPausedIcon)
+
+                let historyLocked = delegate.makeHistoryMenu()
+                historyLocked.update()
+                let historyLockStatus = try #require(historyLocked.item(withTitle: lockedTitle))
+                #expect(!historyLockStatus.isEnabled)
+                let historyUnlockLocked = try #require(historyLocked.item(withTitle: unlockTitle))
+                #expect(historyUnlockLocked.isEnabled)
+                #expect(historyUnlockLocked.target === delegate)
+                #expect(historyUnlockLocked.action == #selector(AppDelegate.retryUnlockHistory))
+                #expect(historyLocked.item(withTitle: L10n.string("Pause Clipboard Capture"))?.isEnabled == false)
+
+                let statusLocked = delegate.makeStatusMenu()
+                statusLocked.update()
+                let statusLockStatus = try #require(statusLocked.item(withTitle: lockedTitle))
+                #expect(!statusLockStatus.isEnabled)
+                let statusUnlockLocked = try #require(statusLocked.item(withTitle: unlockTitle))
+                #expect(statusUnlockLocked.isEnabled)
+                #expect(statusUnlockLocked.target === delegate)
+                #expect(statusUnlockLocked.action == #selector(AppDelegate.retryUnlockHistory))
+                #expect(statusLocked.item(withTitle: L10n.string("Pause"))?.isEnabled == false)
+
+                // 2. Dispatching the menu item action with a wrong key transitions to .keyMismatch.
+                toggleProvider.setError(nil)
+                toggleProvider.setKey(SymmetricKey(size: .bits256))
+                delegate.perform(historyUnlockLocked.action, with: historyUnlockLocked)
+                #expect(delegate.model.storeLockState == .keyMismatch)
+                let mismatchTitle = PersistenceErrorLocalization.statusTitle(for: .keyMismatch)
+                #expect(delegate.statusItemPresentation.label == "ClipBook — \(mismatchTitle)")
+                #expect(delegate.statusItemPresentation.isPausedIcon)
+
+                let historyMismatch = delegate.makeHistoryMenu()
+                historyMismatch.update()
+                #expect(historyMismatch.item(withTitle: mismatchTitle)?.isEnabled == false)
+                let historyUnlockMismatch = try #require(historyMismatch.item(withTitle: unlockTitle))
+                #expect(historyUnlockMismatch.isEnabled)
+                #expect(historyMismatch.item(withTitle: L10n.string("Pause Clipboard Capture"))?.isEnabled == false)
+
+                let statusMismatch = delegate.makeStatusMenu()
+                statusMismatch.update()
+                #expect(statusMismatch.item(withTitle: mismatchTitle)?.isEnabled == false)
+                #expect(statusMismatch.item(withTitle: unlockTitle)?.isEnabled == true)
+                #expect(statusMismatch.item(withTitle: L10n.string("Pause"))?.isEnabled == false)
+
+                // 3. Installing the matching key and invoking retryUnlockHistory() restores .unlocked state and paused toggle.
+                toggleProvider.setKey(masterKey)
+                delegate.perform(historyUnlockMismatch.action, with: historyUnlockMismatch)
+                #expect(delegate.model.storeLockState == .unlocked)
+                #expect(delegate.model.items.map(\.id) == [seededClip.id])
+                #expect(delegate.statusItemPresentation.label == "ClipBook")
+                #expect(!delegate.statusItemPresentation.isPausedIcon)
+                delegate.model.isPaused = true
+                #expect(delegate.statusItemPresentation.label == "ClipBook")
+                #expect(delegate.statusItemPresentation.isPausedIcon)
+                delegate.model.isPaused = false
+                #expect(delegate.makeHistoryMenu().item(withTitle: unlockTitle) == nil)
+                #expect(delegate.makeHistoryMenu().item(withTitle: L10n.string("Pause Clipboard Capture"))?.isEnabled == true)
+                #expect(delegate.makeStatusMenu().item(withTitle: unlockTitle) == nil)
+                #expect(delegate.makeStatusMenu().item(withTitle: L10n.string("Pause"))?.isEnabled == true)
+            }
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func archivePassphraseSheetModelValidatesCreateAndUnlockFlows() async throws {
+            let createModel = ArchivePassphraseSheetModel(mode: .create)
+            var confirmedPassphrases: [String] = []
+            #expect(createModel.isConfirmDisabled)
+            #expect(!createModel.showsMismatchWarning)
+
+            createModel.submit(
+                onConfirmExportPassphrase: { confirmedPassphrases.append($0) },
+                verifyUnlockPassphrase: { _ in },
+                onUnlockVerified: { _ in }
+            )
+            #expect(createModel.errorMessage == PersistenceErrorLocalization.message(for: ClipBookArchiveError.emptyPassphrase))
+            #expect(confirmedPassphrases.isEmpty)
+
+            createModel.passphrase = "alpha"
+            #expect(createModel.errorMessage == nil)
+            createModel.confirmPassphrase = "beta"
+            #expect(createModel.isConfirmDisabled)
+            #expect(createModel.showsMismatchWarning)
+
+            createModel.submit(
+                onConfirmExportPassphrase: { confirmedPassphrases.append($0) },
+                verifyUnlockPassphrase: { _ in },
+                onUnlockVerified: { _ in }
+            )
+            #expect(createModel.errorMessage == L10n.string("Passphrases do not match."))
+            #expect(confirmedPassphrases.isEmpty)
+
+            // NFC-equivalent passphrases (composed U+00E9 vs decomposed e + U+0301) match and normalize to NFC.
+            let nfc = "caf\u{00E9}-pass"
+            let nfd = "cafe\u{0301}-pass"
+            createModel.passphrase = nfc
+            createModel.confirmPassphrase = nfd
+            #expect(!createModel.isConfirmDisabled)
+            #expect(!createModel.showsMismatchWarning)
+            createModel.submit(
+                onConfirmExportPassphrase: { confirmedPassphrases.append($0) },
+                verifyUnlockPassphrase: { _ in },
+                onUnlockVerified: { _ in }
+            )
+            #expect(confirmedPassphrases == [nfc])
+
+            let harness = try TestSupport.makeTestCoordinator()
+            defer { harness.cleanup() }
+            try harness.seedHistory([
+                ClipboardItem.fixture(kind: .text, text: "Encrypted archive clip", copiedAt: Date(timeIntervalSince1970: 1_715_800_400))
+            ])
+            let archiveURL = harness.supportDirectory.appendingPathComponent("passphrase-check.clipbookarchive", isDirectory: true)
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let started = harness.coordinator.beginExportHistoryArchive(
+                    mode: .encrypted(passphrase: nfc),
+                    destinationURL: archiveURL,
+                    progress: { _ in },
+                    completion: { result in
+                        switch result {
+                        case .success:
+                            continuation.resume()
+                        case .failure(let error):
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                )
+                if !started {
+                    continuation.resume(throwing: ClipBookArchiveError.corruptedEncryptedArchive("Export did not start"))
+                }
+            }
+
+            let unlockModel = ArchivePassphraseSheetModel(mode: .unlock(archiveURL))
+            var verifiedPassphrases: [String] = []
+            #expect(unlockModel.isConfirmDisabled)
+            unlockModel.submit(
+                onConfirmExportPassphrase: { _ in },
+                verifyUnlockPassphrase: { _ in },
+                onUnlockVerified: { verifiedPassphrases.append($0) }
+            )
+            #expect(unlockModel.errorMessage == PersistenceErrorLocalization.message(for: ClipBookArchiveError.emptyPassphrase))
+
+            unlockModel.passphrase = "wrong-passphrase"
+            #expect(!unlockModel.isConfirmDisabled)
+            var failureCallbackCount = 0
+            let wrongTask = unlockModel.submit(
+                onConfirmExportPassphrase: { _ in },
+                verifyUnlockPassphrase: { passphrase in
+                    try await harness.coordinator.verifyArchivePassphrase(passphrase, for: archiveURL)
+                },
+                onUnlockVerified: { verifiedPassphrases.append($0) },
+                onUnlockFailed: { failureCallbackCount += 1 }
+            )
+            await wrongTask?.value
+            #expect(!unlockModel.isVerifying)
+            #expect(unlockModel.errorMessage == PersistenceErrorLocalization.message(for: ClipBookArchiveError.incorrectPassphrase))
+            #expect(verifiedPassphrases.isEmpty)
+            #expect(failureCallbackCount == 1)
+
+            unlockModel.passphrase = nfd
+            #expect(unlockModel.errorMessage == nil)
+            let validTask = unlockModel.submit(
+                onConfirmExportPassphrase: { _ in },
+                verifyUnlockPassphrase: { passphrase in
+                    try await harness.coordinator.verifyArchivePassphrase(passphrase, for: archiveURL)
+                },
+                onUnlockVerified: { verifiedPassphrases.append($0) }
+            )
+            await validTask?.value
+            #expect(!unlockModel.isVerifying)
+            #expect(unlockModel.errorMessage == nil)
+            #expect(verifiedPassphrases == [nfc])
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        @MainActor
+        func importExportFlowStateBranchesSensitiveAlertsInspectsArchivesAndChainsDismissals() async throws {
+            let sourceHarness = try TestSupport.makeTestCoordinator()
+            defer { sourceHarness.cleanup() }
+            let baseTime = Date(timeIntervalSince1970: 1_715_800_500)
+            let regularClip = ClipboardItem.fixture(kind: .text, text: "Regular clip", copiedAt: baseTime)
+            let sensitiveClip = ClipboardItem.fixture(
+                kind: .text,
+                text: "Sensitive secret",
+                copiedAt: baseTime.addingTimeInterval(10),
+                sensitivity: .sensitive
+            )
+
+            // 1. Without sensitive items, unencrypted export starts immediately without alert.
+            try sourceHarness.seedHistory([regularClip])
+            let flow = ImportExportArchiveFlowState()
+            let plainURL = sourceHarness.supportDirectory.appendingPathComponent("plain.clipbookarchive", isDirectory: true)
+            flow.exportArchive(
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count,
+                destinationURL: plainURL
+            )
+            #expect(!flow.isSensitiveExportAlertPresented)
+            #expect(flow.activeSheet == .progress)
+            let plainDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(plainDone)
+            if case .success = flow.operationProgress?.result {} else {
+                Issue.record("Expected plain export to succeed")
+            }
+            flow.closeProgress()
+            #expect(flow.activeSheet == nil)
+            #expect(flow.operationProgress == nil)
+
+            // 2. With sensitive items and encrypt toggle off, exportArchive presents sensitive-export alert.
+            try sourceHarness.seedHistory([regularClip, sensitiveClip])
+            flow.exportArchive(
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count
+            )
+            #expect(flow.isSensitiveExportAlertPresented)
+            #expect(flow.activeSheet == nil)
+            flow.isSensitiveExportAlertPresented = false
+
+            // 2a. Choice: Encrypt Archive... -> opens .createPassphrase sheet and chains on dismissal.
+            flow.handleSensitiveExportChoice(
+                .encrypt,
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count
+            )
+            #expect(flow.activeSheet == .createPassphrase)
+
+            let encryptedURL = sourceHarness.supportDirectory.appendingPathComponent("encrypted.clipbookarchive", isDirectory: true)
+            flow.confirmExportPassphrase("export-secret")
+            #expect(flow.activeSheet == nil)
+            #expect(flow.pendingConfirmedExportPassphrase == "export-secret")
+            flow.handleSheetDismissal(
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count,
+                exportDestinationURL: encryptedURL
+            )
+            #expect(flow.pendingConfirmedExportPassphrase == nil)
+            #expect(flow.activeSheet == .progress)
+            let encryptedDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(encryptedDone)
+            #expect(try sourceHarness.coordinator.inspectArchive(at: encryptedURL).isEncrypted)
+            flow.closeProgress()
+
+            // 2b. Choice: Skip Sensitive Items -> exports only non-sensitive items.
+            let skippedURL = sourceHarness.supportDirectory.appendingPathComponent("skipped.clipbookarchive", isDirectory: true)
+            flow.handleSensitiveExportChoice(
+                .skipSensitive,
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count,
+                destinationURL: skippedURL
+            )
+            #expect(flow.activeSheet == .progress)
+            let skippedDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(skippedDone)
+            flow.closeProgress()
+
+            // 2c. Choice: Export Unencrypted Anyway -> exports all items including sensitive.
+            let includedURL = sourceHarness.supportDirectory.appendingPathComponent("included.clipbookarchive", isDirectory: true)
+            flow.handleSensitiveExportChoice(
+                .includeSensitive,
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count,
+                destinationURL: includedURL
+            )
+            #expect(flow.activeSheet == .progress)
+            let includedDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(includedDone)
+            if case .success = flow.operationProgress?.result {} else {
+                Issue.record("Expected unencrypted-including-sensitive export to succeed")
+            }
+            #expect(try !sourceHarness.coordinator.inspectArchive(at: includedURL).isEncrypted)
+            flow.closeProgress()
+
+            let includedVerifyHarness = try TestSupport.makeTestCoordinator()
+            defer { includedVerifyHarness.cleanup() }
+            flow.importArchive(from: includedURL, coordinator: includedVerifyHarness.coordinator)
+            #expect(flow.activeSheet == .progress)
+            let includedVerifyDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(includedVerifyDone)
+            #expect(Set(includedVerifyHarness.model.items.map(\.id)) == [regularClip.id, sensitiveClip.id])
+            flow.closeProgress()
+
+            // 3. Encrypt toggle ON opens .createPassphrase directly regardless of sensitive items.
+            flow.encryptExportWithPassphrase = true
+            flow.exportArchive(
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count
+            )
+            #expect(flow.activeSheet == .createPassphrase)
+            flow.activeSheet = nil
+
+            // 4. Import inspection: unencrypted imports immediately; encrypted opens .unlockPassphrase and chains on dismissal; invalid shows failure.
+            let targetHarness = try TestSupport.makeTestCoordinator()
+            defer { targetHarness.cleanup() }
+
+            flow.importArchive(from: skippedURL, coordinator: targetHarness.coordinator)
+            #expect(flow.activeSheet == .progress)
+            let skippedImportDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(skippedImportDone)
+            #expect(targetHarness.model.items.map(\.id) == [regularClip.id])
+            flow.closeProgress()
+
+            flow.importArchive(from: encryptedURL, coordinator: targetHarness.coordinator)
+            #expect(flow.activeSheet == .unlockPassphrase(encryptedURL))
+            flow.completeUnlockVerification(for: encryptedURL, passphrase: "export-secret")
+            #expect(flow.activeSheet == nil)
+            #expect(flow.pendingVerifiedImport?.url == encryptedURL)
+            flow.handleSheetDismissal(
+                coordinator: targetHarness.coordinator,
+                itemCount: targetHarness.model.items.count
+            )
+            #expect(flow.pendingVerifiedImport == nil)
+            #expect(flow.activeSheet == .progress)
+            let encryptedImportDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(encryptedImportDone)
+            #expect(Set(targetHarness.model.items.map(\.id)) == [regularClip.id, sensitiveClip.id])
+            flow.closeProgress()
+
+            let missingURL = sourceHarness.supportDirectory.appendingPathComponent("missing.clipbookarchive", isDirectory: true)
+            flow.importArchive(from: missingURL, coordinator: targetHarness.coordinator)
+            #expect(flow.activeSheet == .progress)
+            if case .failure = flow.operationProgress?.result {} else {
+                Issue.record("Expected missing archive inspection to surface failure progress")
+            }
+            flow.closeProgress()
+
+            // 5. Async failure completion paths for both startImport (wrong passphrase) and startExport (blocked symlink destination).
+            flow.startImport(from: encryptedURL, passphrase: "wrong-async-passphrase", coordinator: targetHarness.coordinator)
+            #expect(flow.activeSheet == .progress)
+            let failedImportDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(failedImportDone)
+            #expect(
+                flow.operationProgress?.result == .failure(
+                    PersistenceErrorLocalization.message(for: ClipBookArchiveError.incorrectPassphrase)
+                )
+            )
+            flow.closeProgress()
+
+            let blockedExportSymlink = sourceHarness.supportDirectory.appendingPathComponent("blocked-export.clipbookarchive")
+            try FileManager.default.createSymbolicLink(
+                at: blockedExportSymlink,
+                withDestinationURL: sourceHarness.supportDirectory
+            )
+            flow.startExport(
+                mode: .unencryptedIncludingSensitive,
+                coordinator: sourceHarness.coordinator,
+                itemCount: sourceHarness.model.items.count,
+                destinationURL: blockedExportSymlink
+            )
+            #expect(flow.activeSheet == .progress)
+            let failedExportDone = await TestSupport.waitUntil(timeout: .seconds(5)) {
+                flow.operationProgress?.isCompleted == true
+            }
+            #expect(failedExportDone)
+            if case .failure = flow.operationProgress?.result {} else {
+                Issue.record("Expected async export to symlink destination to surface failure progress")
+            }
+            flow.closeProgress()
+        }
     }
 
     @Suite(.serialized)
@@ -2994,13 +3410,20 @@ extension SharedProcessStateTests {
             historyWindow.hide()
         }
 
+        @Test
+        func linkPreviewFetcherDefaultSessionIsEphemeralWithoutCacheOrCookies() {
+            let configuration = LinkPreviewFetcher().session.configuration
+            #expect(configuration.urlCache == nil)
+            #expect(configuration.httpCookieStorage == nil)
+            #expect(configuration.httpShouldSetCookies == false)
+            #expect(configuration.requestCachePolicy == .reloadIgnoringLocalCacheData)
+        }
+
         @Test(.timeLimit(.minutes(1)))
         @MainActor
         func linkPreviewFetcherTruncatesOversizedHTMLStreamsAndRejectsOversizedImages() async throws {
             BoundedLinkPreviewTestURLProtocol.reset()
-            URLProtocol.registerClass(BoundedLinkPreviewTestURLProtocol.self)
             defer {
-                URLProtocol.unregisterClass(BoundedLinkPreviewTestURLProtocol.self)
                 BoundedLinkPreviewTestURLProtocol.reset()
             }
 
@@ -3048,7 +3471,11 @@ extension SharedProcessStateTests {
                 )
             )
 
-            let fetcher = LinkPreviewFetcher()
+            let testConfig = URLSessionConfiguration.ephemeral
+            testConfig.protocolClasses = [BoundedLinkPreviewTestURLProtocol.self]
+            let testSession = URLSession(configuration: testConfig)
+            defer { testSession.invalidateAndCancel() }
+            let fetcher = LinkPreviewFetcher(session: testSession)
             let streamingURL = try #require(URL(string: "https://\(host)/streaming-page"))
             let streamedPreview = try #require(await fetcher.fetchPreview(for: streamingURL))
             #expect(streamedPreview.title == "Bounded Stream Title")

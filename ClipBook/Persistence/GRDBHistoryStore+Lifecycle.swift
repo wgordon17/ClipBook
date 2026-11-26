@@ -730,11 +730,33 @@ nonisolated extension GRDBHistoryStore {
         }
     }
 
+    static func probeSchemaVersionForTesting(
+        at dbURL: URL,
+        probeBaseDirectory: URL,
+        forceCopyFallback: Bool
+    ) throws -> Int {
+        let shmURL = URL(fileURLWithPath: dbURL.path + "-shm", isDirectory: false)
+        let walURL = URL(fileURLWithPath: dbURL.path + "-wal", isDirectory: false)
+        let journalURL = URL(fileURLWithPath: dbURL.path + "-journal", isDirectory: false)
+        return try withNonMutatingProbeDatabase(
+            at: dbURL,
+            shmURL: shmURL,
+            walURL: walURL,
+            journalURL: journalURL,
+            probeBaseDirectory: probeBaseDirectory,
+            forceCopyFallback: forceCopyFallback
+        ) { db in
+            (try Int.fetchOne(db, sql: "PRAGMA user_version")) ?? 0
+        }
+    }
+
     private static func withNonMutatingProbeDatabase<T>(
         at dbURL: URL,
         shmURL: URL,
         walURL: URL,
         journalURL: URL,
+        probeBaseDirectory: URL? = nil,
+        forceCopyFallback: Bool = false,
         _ body: (Database) throws -> T
     ) throws -> T {
         var dbStat = stat()
@@ -785,9 +807,10 @@ nonisolated extension GRDBHistoryStore {
             }
         }
 
-        // Case 2: Uncheckpointed -wal, existing -shm, or hot -journal -> copy into an isolated
-        // 0o700 ephemeral directory, replay WAL/journal on the temp copy, and secure-unlink all temp files.
-        let baseTempDir = FileManager.default.temporaryDirectory
+        // Case 2: Uncheckpointed -wal, existing -shm, or hot -journal -> stage into an isolated
+        // 0o700 ephemeral directory via APFS copy-on-write clonefile(2) (falling back to 0o600 copy
+        // on cross-volume/non-APFS filesystems), replay WAL/journal on the staged copy, and clean up.
+        let baseTempDir = probeBaseDirectory ?? FileManager.default.temporaryDirectory
         try FileManager.default.createDirectory(at: baseTempDir, withIntermediateDirectories: true)
 
         let probeDir = baseTempDir.appendingPathComponent("clipbook-probe-\(UUID().uuidString)", isDirectory: true)
@@ -797,37 +820,56 @@ nonisolated extension GRDBHistoryStore {
         _ = Darwin.chmod(probeDir.path, mode_t(0o700))
 
         var tempQueue: DatabaseQueue?
+        var hasNonClonedFiles = false
         defer {
             try? tempQueue?.close()
             tempQueue = nil
-            scrubAndRemoveProbeDirectory(at: probeDir)
+            if hasNonClonedFiles {
+                scrubAndRemoveProbeDirectory(at: probeDir)
+            } else {
+                try? FileManager.default.removeItem(at: probeDir)
+            }
         }
 
         let tempDBURL = probeDir.appendingPathComponent(dbURL.lastPathComponent, isDirectory: false)
-        try copyRegularFile0600(from: dbURL, to: tempDBURL)
+        var dbStage = try cloneOrCopyRegularFile0600(
+            from: dbURL,
+            to: tempDBURL,
+            forceCopy: forceCopyFallback
+        )
+        if !dbStage.cloned {
+            hasNonClonedFiles = true
+        }
 
         let tempWALURL = URL(fileURLWithPath: tempDBURL.path + "-wal", isDirectory: false)
         let tempJournalURL = URL(fileURLWithPath: tempDBURL.path + "-journal", isDirectory: false)
 
-        if walSize > 0 {
-            let copiedWAL = try copyRegularFile0600(from: walURL, to: tempWALURL, allowMissingSource: true)
-            if copiedWAL {
-                _ = Darwin.link(tempWALURL.path, tempWALURL.path + ".pin")
-            } else {
-                try copyRegularFile0600(from: dbURL, to: tempDBURL)
-            }
-        }
-
-        if journalSize > 0 {
-            let copiedJournal = try copyRegularFile0600(
-                from: journalURL,
-                to: tempJournalURL,
-                allowMissingSource: true
+        for (size, sourceURL, destURL) in [(walSize, walURL, tempWALURL), (journalSize, journalURL, tempJournalURL)] where size > 0 {
+            let sidecarStage = try cloneOrCopyRegularFile0600(
+                from: sourceURL,
+                to: destURL,
+                allowMissingSource: true,
+                forceCopy: forceCopyFallback
             )
-            if copiedJournal {
-                _ = Darwin.link(tempJournalURL.path, tempJournalURL.path + ".pin")
+            if sidecarStage.created {
+                if !sidecarStage.cloned {
+                    hasNonClonedFiles = true
+                    _ = Darwin.link(destURL.path, destURL.path + ".pin")
+                }
             } else {
-                try copyRegularFile0600(from: dbURL, to: tempDBURL)
+                if dbStage.cloned {
+                    _ = Darwin.unlink(tempDBURL.path)
+                } else {
+                    ImageAssetStore.secureUnlink(at: tempDBURL)
+                }
+                dbStage = try cloneOrCopyRegularFile0600(
+                    from: dbURL,
+                    to: tempDBURL,
+                    forceCopy: forceCopyFallback
+                )
+                if !dbStage.cloned {
+                    hasNonClonedFiles = true
+                }
             }
         }
 
@@ -853,6 +895,37 @@ nonisolated extension GRDBHistoryStore {
         try? openedQueue.close()
         tempQueue = nil
         return result
+    }
+
+    @discardableResult
+    private static func cloneOrCopyRegularFile0600(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        allowMissingSource: Bool = false,
+        forceCopy: Bool = false
+    ) throws -> (created: Bool, cloned: Bool) {
+        if !forceCopy,
+           Darwin.clonefile(sourceURL.path, destinationURL.path, UInt32(CLONE_NOFOLLOW)) == 0 {
+            var clonedStat = stat()
+            guard Darwin.lstat(destinationURL.path, &clonedStat) == 0,
+                  (clonedStat.st_mode & S_IFMT) == S_IFREG else {
+                _ = Darwin.unlink(destinationURL.path)
+                throw HistoryStoreError.openFailed
+            }
+            _ = Darwin.chmod(destinationURL.path, mode_t(0o600))
+            return (true, true)
+        }
+
+        if !forceCopy && allowMissingSource && errno == ENOENT {
+            return (false, false)
+        }
+
+        let copied = try copyRegularFile0600(
+            from: sourceURL,
+            to: destinationURL,
+            allowMissingSource: allowMissingSource
+        )
+        return (copied, false)
     }
 
     static func regularSidecarSizeIfPresent(at url: URL) throws -> Int64? {

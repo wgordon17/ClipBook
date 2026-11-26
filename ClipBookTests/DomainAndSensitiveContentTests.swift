@@ -1654,6 +1654,13 @@ enum DomainAndSensitiveContentTests {
             #expect(SensitiveContent.shouldEncryptAtRest(transientSecretItem))
             #expect(SensitiveContent.isMasked(transientSecretItem, detectsAutomatically: true))
             #expect(!SensitiveContent.hasCachedMaskSecretsForTesting(in: dontSaveUniqueSecret, detectsPasswordLikeText: true))
+
+            // 8. UTF-8 byte-length fast path does not misclassify non-ASCII strings whose utf8.count > 16 MB
+            //    while utf16.count <= 16M as fail-closed secrets.
+            let largeNonASCII = String(repeating: "あ", count: 6_000_000)
+            #expect(largeNonASCII.utf8.count > SensitiveContent.maxEncryptionScanUTF16Length)
+            #expect(largeNonASCII.utf16.count <= SensitiveContent.maxEncryptionScanUTF16Length)
+            #expect(!SensitiveContent.detectsBodySecretAtRest(kind: .text, text: largeNonASCII, qrCodeText: nil, html: nil))
         }
     }
 }

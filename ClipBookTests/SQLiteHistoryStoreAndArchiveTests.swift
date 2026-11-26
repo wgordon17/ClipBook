@@ -4636,6 +4636,229 @@ enum SQLiteHistoryStoreAndArchiveTests {
             }
         }
 
+        @Test
+        func plainAssetExtensionAllowlistRejectsExecutableHandlersAndArchiveImportSanitizesExtensions() throws {
+            let pngBytes = try TestSupport.makePNGData(pixelWidth: 8, pixelHeight: 8)
+            let arbitraryBytes = Data("<?xml version=\"1.0\"?><plist></plist>".utf8)
+
+            for dangerous in ["terminal", "inetloc", "webloc", "command", "scpt", "pkg", "dmg", "svg", "enc", "app"] {
+                #expect(ImageAssetStore.plainAssetExtension(preferred: dangerous, magicBytes: pngBytes) == "png")
+                #expect(ImageAssetStore.plainAssetExtension(preferred: dangerous, magicBytes: arbitraryBytes) == "png")
+            }
+            for allowed in ["png", "JPG", "jpeg", "gif", "webp", "ico", "tif", "tiff", "bmp", "heic", "heif", "avif", "icns"] {
+                #expect(ImageAssetStore.plainAssetExtension(preferred: allowed, magicBytes: arbitraryBytes) == allowed.lowercased())
+            }
+
+            try TestSupport.withTemporaryDirectory { rootDir in
+                // Export a real v1 archive with an image item, then tamper its relativePath extension to .terminal
+                // and replace the asset bytes with arbitrary XML plist bytes; import must sanitize to .png.
+                let exportSupportDir = rootDir.appendingPathComponent("ExportSupport", isDirectory: true)
+                let exportStore = GRDBHistoryStore(directory: exportSupportDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { exportStore.close() }
+                let itemID = UUID()
+                let plainImageURL = try exportStore.writeManagedAsset(pngData: pngBytes, role: .image, clipID: itemID, encrypted: false)
+                let seededItem = ClipboardItem.fixture(
+                    id: itemID,
+                    kind: .image,
+                    assetPath: plainImageURL.path,
+                    byteSize: pngBytes.count
+                )
+                let exportService = ClipBookArchiveService(
+                    supportDirectory: exportSupportDir,
+                    kdfIterations: 1_000,
+                    allowTestIterations: true
+                )
+                let craftedV1 = rootDir.appendingPathComponent("crafted-v1.clipbookarchive", isDirectory: true)
+                try exportService.export(items: [seededItem], tags: [], to: craftedV1)
+
+                let originalAssetURL = craftedV1.appendingPathComponent("assets/images/\(itemID.uuidString).png")
+                let craftedAssetURL = craftedV1.appendingPathComponent("assets/images/\(itemID.uuidString).terminal")
+                try FileManager.default.removeItem(at: originalAssetURL)
+                try arbitraryBytes.write(to: craftedAssetURL)
+
+                let historyURL = craftedV1.appendingPathComponent("history.json")
+                let historyJSON = try String(contentsOf: historyURL, encoding: .utf8)
+                    .replacingOccurrences(
+                        of: "\(itemID.uuidString).png",
+                        with: "\(itemID.uuidString).terminal"
+                    )
+                try Data(historyJSON.utf8).write(to: historyURL)
+
+                let importSupportDir = rootDir.appendingPathComponent("ImportSupport", isDirectory: true)
+                let store = GRDBHistoryStore(directory: importSupportDir, keyProvider: InMemoryDatabaseKeyProvider())
+                defer { store.close() }
+                let archiveService = ClipBookArchiveService(
+                    supportDirectory: importSupportDir,
+                    kdfIterations: 1_000,
+                    allowTestIterations: true
+                )
+                _ = try archiveService.import(from: craftedV1, into: store)
+                let imported = try #require(try store.fetchAll().first { $0.id == itemID })
+                let importedAssetPath = try #require(imported.assetPath)
+                #expect(URL(fileURLWithPath: importedAssetPath).pathExtension == "png")
+                #expect(!importedAssetPath.hasSuffix(".terminal"))
+            }
+        }
+
+        @Test
+        func streamedV1AndCompactV2ArchivesRoundTripEmptyAndMultiItemHistories() throws {
+            try TestSupport.withTemporaryDirectory { rootDir in
+                let supportDir = rootDir.appendingPathComponent("Support", isDirectory: true)
+                let service = ClipBookArchiveService(
+                    supportDirectory: supportDir,
+                    kdfIterations: 1_000,
+                    allowTestIterations: true
+                )
+
+                // Empty v1 and v2 archives
+                let emptyV1 = rootDir.appendingPathComponent("empty-v1.clipbookarchive", isDirectory: true)
+                let emptyV2 = rootDir.appendingPathComponent("empty-v2.clipbookarchive", isDirectory: true)
+                try service.export(items: [], tags: [], to: emptyV1)
+                try service.export(items: [], tags: [], to: emptyV2, passphrase: "roundtrip-passphrase")
+
+                let emptyV1Bytes = try Data(contentsOf: emptyV1.appendingPathComponent("history.json"))
+                #expect(String(decoding: emptyV1Bytes, as: UTF8.self) == "[]")
+
+                let target1 = GRDBHistoryStore(
+                    directory: rootDir.appendingPathComponent("TargetEmpty1", isDirectory: true),
+                    keyProvider: InMemoryDatabaseKeyProvider()
+                )
+                defer { target1.close() }
+                #expect(try service.import(from: emptyV1, into: target1).itemCount == 0)
+                #expect(try service.import(from: emptyV2, into: target1, passphrase: "roundtrip-passphrase").itemCount == 0)
+
+                // Multi-item v1 and v2 round-trip
+                let baseTime = Date(timeIntervalSince1970: 1_715_802_000)
+                let first = ClipboardItem.fixture(kind: .text, text: "First streamed item", copiedAt: baseTime)
+                let second = ClipboardItem.fixture(kind: .text, text: "Second streamed item", copiedAt: baseTime.addingTimeInterval(5))
+                let multiV1 = rootDir.appendingPathComponent("multi-v1.clipbookarchive", isDirectory: true)
+                let multiV2 = rootDir.appendingPathComponent("multi-v2.clipbookarchive", isDirectory: true)
+                try service.export(items: [first, second], tags: [], to: multiV1)
+                try service.export(items: [first, second], tags: [], to: multiV2, passphrase: "roundtrip-passphrase")
+
+                let target2 = GRDBHistoryStore(
+                    directory: rootDir.appendingPathComponent("TargetMulti1", isDirectory: true),
+                    keyProvider: InMemoryDatabaseKeyProvider()
+                )
+                defer { target2.close() }
+                #expect(try service.import(from: multiV1, into: target2).itemCount == 2)
+                #expect(Set(try target2.fetchAll().map(\.id)) == [first.id, second.id])
+
+                let target3 = GRDBHistoryStore(
+                    directory: rootDir.appendingPathComponent("TargetMulti2", isDirectory: true),
+                    keyProvider: InMemoryDatabaseKeyProvider()
+                )
+                defer { target3.close() }
+                #expect(try service.import(from: multiV2, into: target3, passphrase: "roundtrip-passphrase").itemCount == 2)
+                #expect(Set(try target3.fetchAll().map(\.id)) == [first.id, second.id])
+            }
+        }
+
+        @Test
+        @MainActor
+        func fetchItemsExpiredByReturnsSortedPerKindMatchesAndRespectsProtection() throws {
+            try TestSupport.withTemporaryHistoryStore { store, _ in
+                let now = Date(timeIntervalSince1970: 1_715_803_000)
+                let day: TimeInterval = 24 * 60 * 60
+                let tag = try store.createTag(name: "Protected", color: "#3B85ED")
+
+                let expiredTextOld = ClipboardItem.fixture(kind: .text, text: "Old text", copiedAt: now.addingTimeInterval(-4 * day))
+                let expiredLinkNewer = ClipboardItem.fixture(kind: .link, text: "https://example.com/old", copiedAt: now.addingTimeInterval(-2 * day))
+                let freshText = ClipboardItem.fixture(kind: .text, text: "Fresh text", copiedAt: now.addingTimeInterval(-60))
+                let favoriteExpired = ClipboardItem.fixture(kind: .text, text: "Fav old", copiedAt: now.addingTimeInterval(-5 * day), isFavorite: true)
+                let taggedExpired = ClipboardItem.fixture(kind: .text, text: "Tagged old", copiedAt: now.addingTimeInterval(-4.5 * day), tags: [tag.id])
+
+                for item in [expiredTextOld, expiredLinkNewer, freshText, favoriteExpired, taggedExpired] {
+                    _ = try store.saveAndReconcileItem(item, convertingExternalAssets: true)
+                }
+
+                var protectedPrefs = AppPreferences()
+                protectedPrefs.textRetentionDays = 1
+                protectedPrefs.linkRetentionDays = 1
+                protectedPrefs.keepFavoritesOnClearHistory = true
+                let protectedPolicy = HistoryRetentionPolicy(
+                    preferences: protectedPrefs,
+                    kinds: [.text, .link],
+                    now: now
+                )
+                let protectedExpired = try store.fetchItems(expiredBy: protectedPolicy)
+                #expect(protectedExpired.map(\.id) == [expiredLinkNewer.id, expiredTextOld.id])
+
+                var unprotectedPrefs = protectedPrefs
+                unprotectedPrefs.keepFavoritesOnClearHistory = false
+                let unprotectedPolicy = HistoryRetentionPolicy(
+                    preferences: unprotectedPrefs,
+                    kinds: [.text, .link],
+                    now: now
+                )
+                let allExpired = try store.fetchItems(expiredBy: unprotectedPolicy)
+                #expect(allExpired.map(\.id) == [expiredLinkNewer.id, expiredTextOld.id, taggedExpired.id, favoriteExpired.id])
+            }
+        }
+
+        @Test
+        func nonMutatingProbeWithUncheckpointedV5WALPreservesSourceFilesAndCleansProbeDir() throws {
+            try TestSupport.withTemporaryDirectory { supportDir in
+                let masterKey = SymmetricKey(size: .bits256)
+                let seedStore = GRDBHistoryStore(
+                    directory: supportDir,
+                    keyProvider: InMemoryDatabaseKeyProvider(key: masterKey)
+                )
+                let item = ClipboardItem.fixture(kind: .text, text: "Uncheckpointed WAL item", copiedAt: Date(timeIntervalSince1970: 1_715_804_000))
+                _ = try seedStore.saveAndReconcileItem(item, convertingExternalAssets: true)
+
+                let dbURL = supportDir.appendingPathComponent("History.sqlite")
+                let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
+                let preDBBytes = try Data(contentsOf: dbURL)
+                let preWALBytes = try? Data(contentsOf: walURL)
+                var preDBStat = stat()
+                #expect(Darwin.lstat(dbURL.path, &preDBStat) == 0)
+
+                // Exercise both APFS clone staging and copy+scrub fallback in an isolated probeBaseDirectory,
+                // verifying exact user_version read, zero lingering probe directories, and untouched source files.
+                let probeBaseDir = supportDir.appendingPathComponent("ProbeBase", isDirectory: true)
+                for forceCopyFallback in [false, true] {
+                    let userVersion = try GRDBHistoryStore.probeSchemaVersionForTesting(
+                        at: dbURL,
+                        probeBaseDirectory: probeBaseDir,
+                        forceCopyFallback: forceCopyFallback
+                    )
+                    #expect(userVersion == GRDBHistoryStore.currentSchemaVersion)
+                    let remainingProbeEntries = try FileManager.default.contentsOfDirectory(
+                        at: probeBaseDir,
+                        includingPropertiesForKeys: nil
+                    )
+                    #expect(remainingProbeEntries.isEmpty, "Probe directory must be cleaned up (forceCopyFallback=\(forceCopyFallback))")
+                }
+
+                // Probe with a locked provider while WAL is present: must fail closed without mutating History.sqlite or -wal.
+                let lockedStore = GRDBHistoryStore(
+                    directory: supportDir,
+                    keyProvider: InMemoryDatabaseKeyProvider(key: nil, error: .encryptionKeyUnavailable(.interactionNotAllowed))
+                )
+                #expect(lockedStore.lockState == .locked(.interactionNotAllowed))
+                lockedStore.close()
+
+                var postDBStat = stat()
+                #expect(Darwin.lstat(dbURL.path, &postDBStat) == 0)
+                #expect(postDBStat.st_mtimespec.tv_sec == preDBStat.st_mtimespec.tv_sec)
+                #expect(postDBStat.st_mtimespec.tv_nsec == preDBStat.st_mtimespec.tv_nsec)
+                #expect(try Data(contentsOf: dbURL) == preDBBytes)
+                #expect((try? Data(contentsOf: walURL)) == preWALBytes)
+
+                seedStore.close()
+
+                // Reopen with the real key and confirm the uncheckpointed item survived intact.
+                let reopenedStore = GRDBHistoryStore(
+                    directory: supportDir,
+                    keyProvider: InMemoryDatabaseKeyProvider(key: masterKey)
+                )
+                defer { reopenedStore.close() }
+                #expect(reopenedStore.lockState == .unlocked)
+                #expect(try reopenedStore.fetchAll().map(\.id) == [item.id])
+            }
+        }
+
         private static func encodedPatterns(for needle: String) -> [(label: String, bytes: Data)] {
             var patterns: [(String, Data)] = [
                 ("utf8", Data(needle.utf8))

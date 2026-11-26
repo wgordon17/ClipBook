@@ -210,7 +210,8 @@ nonisolated final class ClipBookArchiveService: Sendable {
         loadItem: (ClipboardItem) throws -> ClipboardItem = { $0 },
         progress: ((ClipBookArchiveProgress) -> Void)? = nil
     ) throws {
-        let encoder = Self.makeEncoder()
+        let manifestEncoder = Self.makeEncoder(prettyPrinted: true)
+        let compactEncoder = Self.makeEncoder(prettyPrinted: false)
         let pendingEncryption = try deriveExportEncryptionKeys(for: passphrase)
 
         let destinationParent = archiveURL.deletingLastPathComponent()
@@ -240,7 +241,7 @@ nonisolated final class ClipBookArchiveService: Sendable {
             appVersion: appVersion,
             exportedAt: exportedAt,
             to: stagedArchiveURL,
-            encoder: encoder
+            encoder: manifestEncoder
         )
 
         let archiveTags = tags.map { tag in
@@ -255,30 +256,52 @@ nonisolated final class ClipBookArchiveService: Sendable {
         )
 
         progress?(ClipBookArchiveProgress(completedItemCount: 0, totalItemCount: items.count))
-        var archiveItems: [ClipBookArchiveItem] = []
-        archiveItems.reserveCapacity(items.count)
 
-        for rawItem in items {
-            let exportedItem = try autoreleasepool { () throws -> ClipBookArchiveItem in
-                let hydrated = (!rawItem.isContentLoaded || (rawItem.hasFormatting && !rawItem.isFormattingLoaded))
-                    ? try loadItem(rawItem)
-                    : rawItem
-                return try exportSession.makeArchiveItem(from: hydrated)
+        if let encryptionContext {
+            var historyPlaintext = Data("{\"items\":[".utf8)
+            defer {
+                if !historyPlaintext.isEmpty {
+                    historyPlaintext.resetBytes(in: 0..<historyPlaintext.count)
+                }
             }
-            archiveItems.append(exportedItem)
-            progress?(ClipBookArchiveProgress(completedItemCount: archiveItems.count, totalItemCount: items.count))
-        }
+            try Self.streamEncodedHistoryItems(
+                items: items,
+                encoder: compactEncoder,
+                loadItem: loadItem,
+                exportSession: &exportSession,
+                progress: progress
+            ) { chunk in
+                historyPlaintext.append(chunk)
+            }
+            historyPlaintext.append(contentsOf: "],\"expectedAssets\":".utf8)
+            historyPlaintext.append(try compactEncoder.encode(exportSession.expectedAssets))
+            historyPlaintext.append(0x7D) // '}'
 
-        try Self.writeArchiveMetadataFiles(
-            tags: archiveTags,
-            items: archiveItems,
-            expectedAssets: exportSession.expectedAssets,
-            appVersion: appVersion,
-            exportedAt: exportedAt,
-            encryptionContext: encryptionContext,
-            to: stagedArchiveURL,
-            encoder: encoder
-        )
+            try Self.writeEncryptedArchiveMetadataFiles(
+                tags: archiveTags,
+                historyPlaintext: &historyPlaintext,
+                encryptionContext: encryptionContext,
+                to: stagedArchiveURL,
+                compactEncoder: compactEncoder
+            )
+        } else {
+            let historyFileURL = stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false)
+            try Self.streamPlainHistoryJSON(
+                items: items,
+                to: historyFileURL,
+                encoder: compactEncoder,
+                loadItem: loadItem,
+                exportSession: &exportSession,
+                progress: progress
+            )
+            try Self.writePlainArchiveMetadataFiles(
+                tags: archiveTags,
+                appVersion: appVersion,
+                exportedAt: exportedAt,
+                to: stagedArchiveURL,
+                encoder: manifestEncoder
+            )
+        }
 
         try Self.swapStagedArchive(at: stagedArchiveURL, into: archiveURL)
     }
@@ -424,64 +447,150 @@ nonisolated final class ClipBookArchiveService: Sendable {
         )
     }
 
-    private static func writeArchiveMetadataFiles(
+    private static func streamEncodedHistoryItems(
+        items: [ClipboardItem],
+        encoder: JSONEncoder,
+        loadItem: (ClipboardItem) throws -> ClipboardItem,
+        exportSession: inout ArchiveExportSession,
+        progress: ((ClipBookArchiveProgress) -> Void)?,
+        emit: (Data) throws -> Void
+    ) throws {
+        let comma = Data([0x2C]) // ','
+        var completedCount = 0
+        for rawItem in items {
+            let encodedItem = try autoreleasepool { () throws -> Data in
+                let hydrated = (!rawItem.isContentLoaded || (rawItem.hasFormatting && !rawItem.isFormattingLoaded))
+                    ? try loadItem(rawItem)
+                    : rawItem
+                let exportedItem = try exportSession.makeArchiveItem(from: hydrated)
+                return try encoder.encode(exportedItem)
+            }
+            if completedCount > 0 {
+                try emit(comma)
+            }
+            try emit(encodedItem)
+            completedCount += 1
+            progress?(ClipBookArchiveProgress(completedItemCount: completedCount, totalItemCount: items.count))
+        }
+    }
+
+    private static func streamPlainHistoryJSON(
+        items: [ClipboardItem],
+        to destinationURL: URL,
+        encoder: JSONEncoder,
+        loadItem: (ClipboardItem) throws -> ClipboardItem,
+        exportSession: inout ArchiveExportSession,
+        progress: ((ClipBookArchiveProgress) -> Void)?
+    ) throws {
+        let fd = Darwin.open(destinationURL.path, O_CREAT | O_WRONLY | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        _ = Darwin.fchmod(fd, mode_t(0o600))
+
+        var succeeded = false
+        defer {
+            _ = Darwin.close(fd)
+            if !succeeded {
+                ImageAssetStore.secureUnlink(at: destinationURL)
+            }
+        }
+
+        try writeAllBytes(Data([0x5B]), to: fd) // '['
+        try streamEncodedHistoryItems(
+            items: items,
+            encoder: encoder,
+            loadItem: loadItem,
+            exportSession: &exportSession,
+            progress: progress
+        ) { chunk in
+            try writeAllBytes(chunk, to: fd)
+        }
+        try writeAllBytes(Data([0x5D]), to: fd) // ']'
+
+        if Darwin.fcntl(fd, F_FULLFSYNC) != 0 {
+            _ = Darwin.fsync(fd)
+        }
+        succeeded = true
+    }
+
+    private static func writeAllBytes(_ data: Data, to fd: Int32) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var offset = 0
+            while offset < rawBuffer.count {
+                let written = Darwin.write(fd, baseAddress.advanced(by: offset), rawBuffer.count - offset)
+                if written > 0 {
+                    offset += written
+                } else if written < 0 && errno == EINTR {
+                    continue
+                } else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+        }
+    }
+
+    private static func writeEncryptedArchiveMetadataFiles(
         tags: [ClipBookArchiveTag],
-        items: [ClipBookArchiveItem],
-        expectedAssets: [String: String],
+        historyPlaintext: inout Data,
+        encryptionContext: ArchiveEncryptionContext,
+        to stagedArchiveURL: URL,
+        compactEncoder: JSONEncoder
+    ) throws {
+        let sealedTags = try HistoryCrypto.sealArchiveEntry(
+            try compactEncoder.encode(tags),
+            key: encryptionContext.keys.aeadKey,
+            archiveID: encryptionContext.archiveID,
+            manifestDigest: encryptionContext.manifestDigest,
+            relativePath: "tags.json.enc"
+        )
+        try writePrivateFile(
+            sealedTags,
+            to: stagedArchiveURL.appendingPathComponent("tags.json.enc", isDirectory: false)
+        )
+
+        let sealedHistory = try HistoryCrypto.sealArchiveEntry(
+            historyPlaintext,
+            key: encryptionContext.keys.aeadKey,
+            archiveID: encryptionContext.archiveID,
+            manifestDigest: encryptionContext.manifestDigest,
+            relativePath: "history.json.enc"
+        )
+        if !historyPlaintext.isEmpty {
+            historyPlaintext.resetBytes(in: 0..<historyPlaintext.count)
+        }
+        historyPlaintext = Data()
+        try writePrivateFile(
+            sealedHistory,
+            to: stagedArchiveURL.appendingPathComponent("history.json.enc", isDirectory: false),
+            sync: true
+        )
+    }
+
+    private static func writePlainArchiveMetadataFiles(
+        tags: [ClipBookArchiveTag],
         appVersion: String?,
         exportedAt: Date,
-        encryptionContext: ArchiveEncryptionContext?,
         to stagedArchiveURL: URL,
         encoder: JSONEncoder
     ) throws {
-        if let encryptionContext {
-            let sealedTags = try HistoryCrypto.sealArchiveEntry(
-                try encoder.encode(tags),
-                key: encryptionContext.keys.aeadKey,
-                archiveID: encryptionContext.archiveID,
-                manifestDigest: encryptionContext.manifestDigest,
-                relativePath: "tags.json.enc"
-            )
-            try writePrivateFile(
-                sealedTags,
-                to: stagedArchiveURL.appendingPathComponent("tags.json.enc", isDirectory: false)
-            )
-
-            let payload = ClipBookEncryptedHistoryPayload(items: items, expectedAssets: expectedAssets)
-            let sealedHistory = try HistoryCrypto.sealArchiveEntry(
-                try encoder.encode(payload),
-                key: encryptionContext.keys.aeadKey,
-                archiveID: encryptionContext.archiveID,
-                manifestDigest: encryptionContext.manifestDigest,
-                relativePath: "history.json.enc"
-            )
-            try writePrivateFile(
-                sealedHistory,
-                to: stagedArchiveURL.appendingPathComponent("history.json.enc", isDirectory: false),
-                sync: true
-            )
-        } else {
-            let manifest = ClipBookArchiveManifest(
-                formatVersion: plainFormatVersion,
-                appName: "ClipBook",
-                appVersion: appVersion,
-                exportedAt: exportedAt,
-                encryption: nil
-            )
-            try writePrivateFile(
-                try encoder.encode(manifest),
-                to: stagedArchiveURL.appendingPathComponent("manifest.json", isDirectory: false)
-            )
-            try writePrivateFile(
-                try encoder.encode(tags),
-                to: stagedArchiveURL.appendingPathComponent("tags.json", isDirectory: false)
-            )
-            try writePrivateFile(
-                try encoder.encode(items),
-                to: stagedArchiveURL.appendingPathComponent("history.json", isDirectory: false),
-                sync: true
-            )
-        }
+        let manifest = ClipBookArchiveManifest(
+            formatVersion: plainFormatVersion,
+            appName: "ClipBook",
+            appVersion: appVersion,
+            exportedAt: exportedAt,
+            encryption: nil
+        )
+        try writePrivateFile(
+            try encoder.encode(manifest),
+            to: stagedArchiveURL.appendingPathComponent("manifest.json", isDirectory: false)
+        )
+        try writePrivateFile(
+            try encoder.encode(tags),
+            to: stagedArchiveURL.appendingPathComponent("tags.json", isDirectory: false),
+            sync: true
+        )
     }
 
     private func loadArchiveContents(
@@ -540,10 +649,14 @@ nonisolated final class ClipBookArchiveService: Sendable {
             throw ClipBookArchiveError.missingFile("history.json")
         }
 
-        let tagsData = try Self.readRegularFileNoFollow(at: tagsURL, relativePath: "tags.json")
-        let historyData = try Self.readRegularFileNoFollow(at: historyURL, relativePath: "history.json")
-        let archiveTags = try decoder.decode([ClipBookArchiveTag].self, from: tagsData)
-        let archiveItems = try decoder.decode([ClipBookArchiveItem].self, from: historyData)
+        let archiveTags = try decoder.decode(
+            [ClipBookArchiveTag].self,
+            from: Self.readRegularFileNoFollow(at: tagsURL, relativePath: "tags.json")
+        )
+        let archiveItems = try decoder.decode(
+            [ClipBookArchiveItem].self,
+            from: Self.readRegularFileNoFollow(at: historyURL, relativePath: "history.json")
+        )
         return (archiveTags, archiveItems, nil)
     }
 
@@ -1050,16 +1163,21 @@ nonisolated final class ClipBookArchiveService: Sendable {
         ) else {
             throw ClipBookArchiveError.missingFile(relativePath)
         }
-        let sealedBytes = try Self.readRegularFileNoFollow(at: fileURL, relativePath: relativePath)
-        let decryptedBytes: Data
+        let decryptedBytes: Data = try {
+            let sealedBytes = try Self.readRegularFileNoFollow(at: fileURL, relativePath: relativePath)
+            do {
+                return try HistoryCrypto.openArchiveEntry(
+                    sealedBytes,
+                    key: context.keys.aeadKey,
+                    archiveID: context.archiveID,
+                    manifestDigest: context.manifestDigest,
+                    relativePath: relativePath
+                )
+            } catch {
+                throw ClipBookArchiveError.corruptedEncryptedArchive(relativePath)
+            }
+        }()
         do {
-            decryptedBytes = try HistoryCrypto.openArchiveEntry(
-                sealedBytes,
-                key: context.keys.aeadKey,
-                archiveID: context.archiveID,
-                manifestDigest: context.manifestDigest,
-                relativePath: relativePath
-            )
             return try decoder.decode(type, from: decryptedBytes)
         } catch {
             throw ClipBookArchiveError.corruptedEncryptedArchive(relativePath)
@@ -1300,10 +1418,10 @@ nonisolated final class ClipBookArchiveService: Sendable {
 
     // MARK: - Low-Level Filesystem & Formatting Utilities
 
-    static func makeEncoder() -> JSONEncoder {
+    static func makeEncoder(prettyPrinted: Bool = true) -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.outputFormatting = prettyPrinted ? [.prettyPrinted, .sortedKeys] : [.sortedKeys]
         return encoder
     }
 
