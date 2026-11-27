@@ -13,7 +13,6 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  actions: read
   contents: read
 
 concurrency:
@@ -21,39 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Marking a PR ready for review changes no code. The macOS suite runs on that
-  # event only when this head commit has no successful CI run yet, which is the
-  # case for PRs opened with GITHUB_TOKEN (their open event starts no workflow).
-  decide:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run-macos: ${{ steps.decide.outputs.run-macos }}
-    steps:
-      - name: Decide whether the macOS suite must run
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_ACTION: ${{ github.event.action }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          RUN_MACOS=true
-          if [[ "$EVENT_ACTION" == "ready_for_review" && -n "$HEAD_SHA" ]]; then
-            if SUCCESSFUL_RUNS="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-              -f head_sha="$HEAD_SHA" -f event=pull_request -f status=success --jq '.total_count')"; then
-              if [[ "$SUCCESSFUL_RUNS" =~ ^[0-9]+$ ]] && (( SUCCESSFUL_RUNS > 0 )); then
-                RUN_MACOS=false
-              fi
-            fi
-          fi
-          printf 'run-macos=%s\n' "$RUN_MACOS" >> "$GITHUB_OUTPUT"
-          printf 'run-macos=%s (action=%s, head=%s)\n' "$RUN_MACOS" "$EVENT_ACTION" "$HEAD_SHA"
-
   macos-test:
-    needs:
-      - decide
-    if: needs.decide.outputs.run-macos == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -171,15 +138,12 @@ jobs:
   build-and-test:
     if: always()
     needs:
-      - decide
       - macos-test
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require macOS CI success
         env:
-          DECIDE_RESULT: ${{ needs.decide.result }}
-          RUN_MACOS: ${{ needs.decide.outputs.run-macos }}
           MACOS_RESULT: ${{ needs.macos-test.result }}
         run: |
           set -euo pipefail
@@ -187,10 +151,5 @@ jobs:
             printf 'macOS CI succeeded.\n'
             exit 0
           fi
-          if [[ "$MACOS_RESULT" == "skipped" && "$DECIDE_RESULT" == "success" && "$RUN_MACOS" == "false" ]]; then
-            printf 'macOS CI already succeeded for this commit; not re-run.\n'
-            exit 0
-          fi
-          printf 'macOS CI did not succeed (decide=%s, run-macos=%s, macos-test=%s).\n' \
-            "$DECIDE_RESULT" "$RUN_MACOS" "$MACOS_RESULT" >&2
+          printf 'macOS CI did not succeed (macos-test=%s).\n' "$MACOS_RESULT" >&2
           exit 1
