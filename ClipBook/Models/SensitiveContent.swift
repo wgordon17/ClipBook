@@ -1,9 +1,10 @@
 import AppKit
 import CryptoKit
+import Foundation
 
 /// What the user said about an item, which always wins over what the app
 /// detects on its own. An item the user said nothing about has none.
-enum ItemSensitivity: String, Codable, Hashable {
+nonisolated enum ItemSensitivity: String, Codable, Hashable, Sendable {
     /// The whole content is hidden.
     case sensitive
     /// Nothing is hidden, whatever the content looks like.
@@ -13,7 +14,7 @@ enum ItemSensitivity: String, Codable, Hashable {
 /// Hides passwords, keys and tokens in the text the history shows. Only what
 /// is drawn on screen is masked: pasting, copying, dragging and searching all
 /// work with the real content.
-enum SensitiveContent {
+nonisolated enum SensitiveContent {
     /// A fully hidden item always shows the same number of dots, so the length
     /// of the secret is not given away.
     static let wholeMask = String(repeating: maskCharacter, count: 12)
@@ -41,6 +42,7 @@ enum SensitiveContent {
 
     /// What the dots are drawn with in text of the given font, besides their
     /// color.
+    @MainActor
     static func maskAttributes(for font: NSFont) -> [NSAttributedString.Key: Any] {
         [
             .font: NSFontManager.shared.convert(font, toSize: font.pointSize * maskFontScale),
@@ -51,6 +53,7 @@ enum SensitiveContent {
 
     /// Sets the dots in `range` apart from the text right before them by the
     /// space there is between the dots themselves.
+    @MainActor
     static func addSpacing(beforeMaskAt range: NSRange, in attributedText: NSMutableAttributedString) {
         guard range.location > 0 else {
             return
@@ -59,6 +62,57 @@ enum SensitiveContent {
         let precedingCharacter = (attributedText.string as NSString)
             .rangeOfComposedCharacterSequence(at: range.location - 1)
         attributedText.addAttribute(.kern, value: maskSpacing, range: precedingCharacter)
+    }
+
+    @MainActor
+    static func applyMaskStyle(
+        to textField: NSTextField,
+        text: String,
+        hidesSensitiveContent: Bool
+    ) {
+        guard hidesSensitiveContent, text.utf8.contains(0x97) else {
+            textField.stringValue = text
+            return
+        }
+        let ranges = maskRanges(in: text)
+        guard !ranges.isEmpty else {
+            textField.stringValue = text
+            return
+        }
+
+        let font = textField.font ?? .systemFont(ofSize: NSFont.systemFontSize)
+        let color = textField.textColor ?? .labelColor
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = textField.alignment
+        paragraphStyle.lineBreakMode = textField.lineBreakMode
+        let baseAttributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        let attributed = NSMutableAttributedString(string: text, attributes: baseAttributes)
+        for range in ranges {
+            attributed.addAttributes(maskAttributes(for: font), range: range)
+            attributed.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+            addSpacing(beforeMaskAt: range, in: attributed)
+        }
+        textField.attributedStringValue = attributed
+    }
+
+    static func strippingMasks(from text: String) -> String {
+        guard text.utf8.contains(0x97) else {
+            return text
+        }
+        let ranges = maskRanges(in: text)
+        guard !ranges.isEmpty else {
+            return text
+        }
+        let mutable = NSMutableString(string: text)
+        for range in ranges.reversed() {
+            mutable.replaceCharacters(in: range, with: "")
+        }
+        return (mutable as String).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Where the dots that stand for hidden content are in a text that was
@@ -108,6 +162,7 @@ enum SensitiveContent {
     // so a secret past a row's reach would otherwise show in it unmasked.
     private static let itemCharacterLimit = 4_000
     static let previewCharacterLimit = 200_000
+    static let maxEncryptionScanUTF16Length = 16 * 1024 * 1024
     // A secret that begins inside a limit may end after it, so the search goes
     // on this far past it. The longest tokens and keys are shorter.
     private static let straddlingMargin = 4_096
@@ -117,12 +172,19 @@ enum SensitiveContent {
     /// count against the limit.
     private static func searchedText(_ text: String, limit: Int) -> String {
         let window = text.prefix(while: \.isWhitespace).count + limit + straddlingMargin
+        let candidate: String
         // The byte count is known without walking through the text, and no text
         // has fewer bytes than characters.
-        guard text.utf8.count > window else {
-            return text
+        if text.utf8.count > window {
+            candidate = String(text.prefix(window))
+        } else {
+            candidate = text
         }
-        return String(text.prefix(window))
+        guard candidate.utf8.count > maxEncryptionScanUTF16Length,
+              candidate.utf16.count > maxEncryptionScanUTF16Length else {
+            return candidate
+        }
+        return String(candidate.scalarBoundedUTF16Prefix(maxEncryptionScanUTF16Length))
     }
 
     /// Puts the masks in place of `secrets` in a text of `length` characters,
@@ -143,48 +205,156 @@ enum SensitiveContent {
         }
     }
 
-    static func isMasked(_ item: ClipboardItem, detectsAutomatically: Bool) -> Bool {
+    static func livePreviewSecretExists(in item: ClipboardItem) -> Bool {
         guard item.kind.canHoldSensitiveContent else {
             return false
         }
+        let previewText = item.scannablePreviewText
+        guard SensitiveContentDetector.mayContainSecret(in: previewText) else {
+            return false
+        }
+        return containsSecretAtRest(
+            in: searchedText(previewText, limit: previewCharacterLimit),
+            detectsPasswordLikeText: item.kind == .text || item.kind == .richText
+        )
+    }
 
+    static func detectsPreviewSecret(in item: ClipboardItem) -> Bool {
+        if let itemTitle = item.itemTitle,
+           containsSecretAtRest(
+               in: searchedText(itemTitle, limit: previewCharacterLimit),
+               detectsPasswordLikeText: false
+           ) {
+            return true
+        }
+
+        switch item.kind {
+        case .text, .richText, .link, .email:
+            if item.containsPreviewSecret {
+                return true
+            }
+            if let previewTitle = item.linkPreviewDetails?.title,
+               containsSecretAtRest(
+                   in: searchedText(previewTitle, limit: previewCharacterLimit),
+                   detectsPasswordLikeText: false
+               ) {
+                return true
+            }
+            if let previewDescription = item.linkPreviewDetails?.description,
+               containsSecretAtRest(
+                   in: searchedText(previewDescription, limit: previewCharacterLimit),
+                   detectsPasswordLikeText: false
+               ) {
+                return true
+            }
+            return false
+        case .image:
+            return item.containsRestSecret
+        case .file:
+            return item.containsRestSecret || item.filePaths.contains { path in
+                containsSecretAtRest(in: path, detectsPasswordLikeText: false)
+            }
+        case .color:
+            return false
+        }
+    }
+
+    private static func containsSecretAtRest(in text: String?, detectsPasswordLikeText: Bool) -> Bool {
+        guard let text, !text.isEmpty else {
+            return false
+        }
+        if text.utf8.count > maxEncryptionScanUTF16Length,
+           text.utf16.count > maxEncryptionScanUTF16Length {
+            return true
+        }
+        guard SensitiveContentDetector.mayContainSecret(in: text) else {
+            return false
+        }
+        let key = restVerdictCacheKey(for: text, detectsPasswordLikeText: detectsPasswordLikeText)
+        if let cached = restVerdictCache.object(forKey: key) {
+            return cached.containsSecret
+        }
+        let hasSecret = !SensitiveContentDetector.secrets(
+            in: text,
+            detectsPasswordLikeText: detectsPasswordLikeText
+        ).isEmpty
+        restVerdictCache.setObject(hasSecret ? .yes : .no, forKey: key)
+        return hasSecret
+    }
+
+    static func detectsBodySecretAtRest(
+        kind: ClipboardKind,
+        text: String?,
+        qrCodeText: String?,
+        html: String?,
+        rtfData: Data? = nil
+    ) -> Bool {
+        if containsSecretAtRest(in: text, detectsPasswordLikeText: kind == .text || kind == .richText) {
+            return true
+        }
+        if containsSecretAtRest(in: qrCodeText, detectsPasswordLikeText: false) {
+            return true
+        }
+        if containsSecretAtRest(in: html, detectsPasswordLikeText: false) {
+            return true
+        }
+        if let rtfData, !rtfData.isEmpty {
+            if rtfData.count > maxEncryptionScanUTF16Length * 4 {
+                return true
+            }
+            let rtfString = String(decoding: rtfData, as: UTF8.self)
+            if containsSecretAtRest(in: rtfString, detectsPasswordLikeText: false) {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func detectsAnySecretAtRest(in item: ClipboardItem) -> Bool {
+        if item.containsRestSecret {
+            return true
+        }
+        if containsSecretAtRest(in: item.title, detectsPasswordLikeText: false) {
+            return true
+        }
+        if let linkPreview = item.linkPreviewDetails {
+            if containsSecretAtRest(in: linkPreview.url, detectsPasswordLikeText: false)
+                || containsSecretAtRest(in: linkPreview.title, detectsPasswordLikeText: false)
+                || containsSecretAtRest(in: linkPreview.description, detectsPasswordLikeText: false) {
+                return true
+            }
+        }
+        for path in item.filePaths {
+            if containsSecretAtRest(in: path, detectsPasswordLikeText: false) {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func shouldEncryptAtRest(_ item: ClipboardItem) -> Bool {
         switch item.sensitivity {
         case .sensitive:
             return true
         case .notSensitive:
             return false
         case .none:
-            // Most rows hold ordinary text that no pattern can match, and
-            // ruling that out is cheaper than the cache lookup below.
-            guard detectsAutomatically,
-                  SensitiveContentDetector.mayContainSecret(in: item.previewText) else {
-                return false
-            }
-            let previewText = item.previewText
-            let utf8Count = previewText.utf8.count
-            let digest = itemMaskPrefixDigest(for: previewText)
-            let detectsPasswordLikeText = item.kind == .text || item.kind == .richText
-            let cacheKey = item.id as NSUUID
-            if let cached = itemMaskCache.object(forKey: cacheKey),
-               cached.utf8Count == utf8Count,
-               cached.detectsPasswordLikeText == detectsPasswordLikeText,
-               cached.prefixDigest == digest {
-                return cached.isMasked
-            }
-            let isMasked = !detectedSecrets(
-                in: searchedText(previewText, limit: previewCharacterLimit),
-                for: item
-            ).isEmpty
-            itemMaskCache.setObject(
-                CachedItemMask(
-                    utf8Count: utf8Count,
-                    prefixDigest: digest,
-                    detectsPasswordLikeText: detectsPasswordLikeText,
-                    isMasked: isMasked
-                ),
-                forKey: cacheKey
-            )
-            return isMasked
+            return detectsAnySecretAtRest(in: item)
+        }
+    }
+
+    static func requiresEncryptedAsset(for item: ClipboardItem, role: AssetRole = .image) -> Bool {
+        shouldEncryptAtRest(item) || (role == .image && item.hasUnverifiedEncryptedImageAsset)
+    }
+
+    static func isMasked(_ item: ClipboardItem, detectsAutomatically: Bool) -> Bool {
+        switch item.sensitivity {
+        case .sensitive:
+            return true
+        case .notSensitive:
+            return false
+        case .none:
+            return detectsAutomatically && detectsPreviewSecret(in: item)
         }
     }
 
@@ -192,24 +362,7 @@ enum SensitiveContent {
     /// whether it stays out of the history. What the user said about the item
     /// wins over what is found in it.
     static func containsSensitiveContent(_ item: ClipboardItem) -> Bool {
-        guard item.kind.canHoldSensitiveContent else {
-            return false
-        }
-
-        switch item.sensitivity {
-        case .sensitive:
-            return true
-        case .notSensitive:
-            return false
-        case .none:
-            // Each item is checked once here, so what is found is not
-            // remembered for the rows.
-            let detectsPasswordLikeText = item.kind == .text || item.kind == .richText
-            return !SensitiveContentDetector.secrets(
-                in: searchedText(item.previewText, limit: previewCharacterLimit),
-                detectsPasswordLikeText: detectsPasswordLikeText
-            ).isEmpty
-        }
+        shouldEncryptAtRest(item)
     }
 
     /// The text to show in place of `text`, which is the item's content or a
@@ -220,17 +373,14 @@ enum SensitiveContent {
         detectsAutomatically: Bool,
         characterLimit: Int = itemCharacterLimit
     ) -> String {
-        guard item.kind.canHoldSensitiveContent else {
-            return text
-        }
-
         switch item.sensitivity {
         case .sensitive:
             return wholeMask
         case .notSensitive:
             return text
         case .none:
-            guard detectsAutomatically else {
+            guard detectsAutomatically,
+                  item.kind.canHoldSensitiveContent || item.kind == .image || item.kind == .file else {
                 return text
             }
 
@@ -245,16 +395,41 @@ enum SensitiveContent {
         }
     }
 
+    /// Masks inline secrets inside a user-assigned item title across all kinds
+    /// while keeping non-secret human titles readable even on `.sensitive` rows.
+    static func maskedTitle(
+        _ title: String,
+        for item: ClipboardItem,
+        detectsAutomatically: Bool,
+        characterLimit: Int = itemCharacterLimit
+    ) -> String {
+        if item.sensitivity == .notSensitive || (item.sensitivity == nil && !detectsAutomatically) {
+            return title
+        }
+        guard SensitiveContentDetector.mayContainSecret(in: title) else {
+            return title
+        }
+
+        let secrets = cachedSecrets(
+            in: searchedText(title, limit: characterLimit),
+            detectsPasswordLikeText: false
+        )
+        guard !secrets.isEmpty else {
+            return title
+        }
+
+        let masked = NSMutableString(string: title)
+        maskSecrets(secrets, inTextOfLength: masked.length) { masked.replaceCharacters(in: $0, with: $1) }
+        return masked as String
+    }
+
     /// The formatted counterpart of `maskedText`, for rich text.
+    @MainActor
     static func maskedAttributedText(
         _ attributedText: NSAttributedString,
         for item: ClipboardItem,
         detectsAutomatically: Bool
     ) -> NSAttributedString {
-        guard item.kind.canHoldSensitiveContent else {
-            return attributedText
-        }
-
         switch item.sensitivity {
         case .sensitive:
             let attributes = attributedText.length > 0
@@ -264,7 +439,7 @@ enum SensitiveContent {
         case .notSensitive:
             return attributedText
         case .none:
-            guard detectsAutomatically else {
+            guard detectsAutomatically, item.kind.canHoldSensitiveContent else {
                 return attributedText
             }
 
@@ -285,14 +460,69 @@ enum SensitiveContent {
 
     // Rows are configured again and again while the list scrolls and reloads,
     // so what was found in a text is remembered.
-    private static let cache: NSCache<NSString, CachedSecrets> = {
+    nonisolated(unsafe) private static let cache: NSCache<NSString, CachedSecrets> = {
         let cache = NSCache<NSString, CachedSecrets>()
         cache.countLimit = 2_000
         cache.totalCostLimit = 8_000_000
         return cache
     }()
 
-    private final class CachedSecrets {
+    private nonisolated final class CachedRestVerdict: Sendable {
+        static let yes = CachedRestVerdict(true)
+        static let no = CachedRestVerdict(false)
+
+        let containsSecret: Bool
+
+        private init(_ containsSecret: Bool) {
+            self.containsSecret = containsSecret
+        }
+    }
+
+    nonisolated(unsafe) private static let restVerdictCache: NSCache<NSString, CachedRestVerdict> = {
+        let cache = NSCache<NSString, CachedRestVerdict>()
+        cache.countLimit = 32_768
+        return cache
+    }()
+
+    private static func restVerdictCacheKey(for text: String, detectsPasswordLikeText: Bool) -> NSString {
+        var hasher = SHA256()
+        var flag: UInt8 = detectsPasswordLikeText ? 1 : 0
+        withUnsafeBytes(of: &flag) { hasher.update(bufferPointer: $0) }
+        var utf8Count = text.utf8.count
+        withUnsafeBytes(of: &utf8Count) { hasher.update(bufferPointer: $0) }
+        var copy = text
+        copy.withUTF8 { hasher.update(bufferPointer: UnsafeRawBufferPointer($0)) }
+        let digest = hasher.finalize()
+        return digest.withUnsafeBytes { bytes -> NSString in
+            var hex = [UInt8](repeating: 0, count: 64)
+            let alphabet: StaticString = "0123456789abcdef"
+            alphabet.withUTF8Buffer { lut in
+                for i in 0..<32 {
+                    let b = bytes[i]
+                    hex[i * 2] = lut[Int(b >> 4)]
+                    hex[i * 2 + 1] = lut[Int(b & 0x0F)]
+                }
+            }
+            return String(decoding: hex, as: UTF8.self) as NSString
+        }
+    }
+
+    nonisolated static func removeAll() {
+        cache.removeAllObjects()
+        restVerdictCache.removeAllObjects()
+    }
+
+    #if DEBUG
+    nonisolated static func hasCachedMaskSecretsForTesting(
+        in text: String,
+        detectsPasswordLikeText: Bool
+    ) -> Bool {
+        let key = "\(detectsPasswordLikeText ? 1 : 0)\(text)" as NSString
+        return cache.object(forKey: key) != nil
+    }
+    #endif
+
+    private nonisolated final class CachedSecrets: Sendable {
         let secrets: [SensitiveContentDetector.Secret]
 
         init(_ secrets: [SensitiveContentDetector.Secret]) {
@@ -300,68 +530,13 @@ enum SensitiveContent {
         }
     }
 
-    // Covers previewCharacterLimit + straddlingMargin even when every scalar is
-    // 4 UTF-8 bytes, without walking grapheme clusters or retaining plaintext.
-    private static let itemMaskDigestByteLimit = 819_200
-
-    private static let itemMaskCache: NSCache<NSUUID, CachedItemMask> = {
-        let cache = NSCache<NSUUID, CachedItemMask>()
-        cache.countLimit = 4_000
-        return cache
-    }()
-
-    private final class CachedItemMask {
-        let utf8Count: Int
-        let prefixDigest: SHA256.Digest
-        let detectsPasswordLikeText: Bool
-        let isMasked: Bool
-
-        init(
-            utf8Count: Int,
-            prefixDigest: SHA256.Digest,
-            detectsPasswordLikeText: Bool,
-            isMasked: Bool
-        ) {
-            self.utf8Count = utf8Count
-            self.prefixDigest = prefixDigest
-            self.detectsPasswordLikeText = detectsPasswordLikeText
-            self.isMasked = isMasked
-        }
-    }
-
-    private static func itemMaskPrefixDigest(for text: String) -> SHA256.Digest {
-        var hasher = SHA256()
-        let prefixBytes = text.utf8.prefix(itemMaskDigestByteLimit)
-        let hashedContiguously = prefixBytes.withContiguousStorageIfAvailable { buffer -> Bool in
-            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
-            return true
-        } ?? false
-        if !hashedContiguously {
-            withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 4_096) { scratch in
-                var count = 0
-                for byte in prefixBytes {
-                    scratch[count] = byte
-                    count += 1
-                    if count == scratch.count {
-                        hasher.update(bufferPointer: UnsafeRawBufferPointer(scratch))
-                        count = 0
-                    }
-                }
-                if count > 0 {
-                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: scratch.baseAddress, count: count))
-                }
-            }
-        }
-        return hasher.finalize()
-    }
-
-    private static func detectedSecrets(
+    private static func cachedSecrets(
         in text: String,
-        for item: ClipboardItem
+        detectsPasswordLikeText: Bool
     ) -> [SensitiveContentDetector.Secret] {
-        // A link or an email address is one token by nature, so only text is
-        // checked for being a password as a whole.
-        let detectsPasswordLikeText = item.kind == .text || item.kind == .richText
+        guard !text.isEmpty else {
+            return []
+        }
         let key = "\(detectsPasswordLikeText ? 1 : 0)\(text)" as NSString
         if let cached = cache.object(forKey: key) {
             return cached.secrets
@@ -374,10 +549,20 @@ enum SensitiveContent {
         cache.setObject(CachedSecrets(secrets), forKey: key, cost: key.length)
         return secrets
     }
+
+    private static func detectedSecrets(
+        in text: String,
+        for item: ClipboardItem
+    ) -> [SensitiveContentDetector.Secret] {
+        // A link or an email address is one token by nature, so only text is
+        // checked for being a password as a whole.
+        let detectsPasswordLikeText = item.kind == .text || item.kind == .richText
+        return cachedSecrets(in: text, detectsPasswordLikeText: detectsPasswordLikeText)
+    }
 }
 
 /// How an item with sensitive content is shown at the moment.
-struct SensitiveContentPresentation: Equatable {
+nonisolated struct SensitiveContentPresentation: Equatable, Sendable {
     static let none = SensitiveContentPresentation(isMasked: false, isRevealed: false)
 
     /// The item has content to hide.
@@ -390,7 +575,7 @@ struct SensitiveContentPresentation: Equatable {
     }
 }
 
-extension ClipboardKind {
+nonisolated extension ClipboardKind {
     /// The kinds whose content is text the history shows as it is.
     var canHoldSensitiveContent: Bool {
         switch self {
@@ -405,8 +590,8 @@ extension ClipboardKind {
 /// Finds the parts of a text that look like a secret. It prefers missing a
 /// secret to hiding ordinary text, because the user can always hide an item by
 /// hand, while text that is hidden for no reason gets in the way every time.
-enum SensitiveContentDetector {
-    struct Secret {
+nonisolated enum SensitiveContentDetector {
+    nonisolated struct Secret: Sendable {
         var range: NSRange
         /// The last four digits of a secret that is a card number.
         var cardNumberEnding: String?
@@ -560,7 +745,11 @@ enum SensitiveContentDetector {
         // JSON Web Token
         #"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"#,
         // Private key block, to its end or to the end of the text
-        #"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)"#
+        #"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)"#,
+        // TOTP / HOTP provisioning URI
+        #"(?i)\botpauth://[^\s"'<>]+"#,
+        // Wi-Fi QR credentials (bounded possessive linear-time scan supporting escaped semicolons)
+        #"(?i)\bWIFI:(?:(?!(?:P|WIFI):)(?:\\.|[^\\;\r\n]){0,256}+;){0,10}+P:(?:\\.|[^\\;\r\n]){4,128}+;"#
     ].map(makeExpression)
 
     // The password in scheme://user:password@host
@@ -772,7 +961,7 @@ enum SensitiveContentDetector {
     }
 }
 
-private extension NSString {
+private nonisolated extension NSString {
     var rangeOfTrimmedContent: NSRange {
         let visibleCharacters = CharacterSet.whitespacesAndNewlines.inverted
         let first = rangeOfCharacter(from: visibleCharacters)

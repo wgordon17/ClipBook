@@ -1,10 +1,6 @@
 import Foundation
-import AppKit
-import Carbon
-import Combine
-import SQLite3
 
-enum ClipboardKind: String, Codable, CaseIterable, Identifiable, Hashable {
+nonisolated enum ClipboardKind: String, Codable, CaseIterable, Identifiable, Hashable, Sendable {
     case text
     case richText
     case link
@@ -15,6 +11,7 @@ enum ClipboardKind: String, Codable, CaseIterable, Identifiable, Hashable {
 
     var id: String { rawValue }
 
+    @MainActor
     var title: String {
         switch self {
         case .text: L10n.string("Text")

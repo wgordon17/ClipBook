@@ -665,7 +665,7 @@ import Testing
         abort "ci.yml: must not duplicate fork push trigger covered by release.yml" if ci_triggers.key?("push")
         abort "ci.yml: pull_request types must include ready_for_review" unless Array(ci_triggers.dig("pull_request", "types")).include?("ready_for_review")
         abort "ci.yml: jobs must not reference an environment" if ci["jobs"].each_value.any? { |j| j.key?("environment") }
-        abort "ci.yml: macos-test must skip draft pull requests" unless ci.dig("jobs", "macos-test", "if") == "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
+        abort "ci.yml: macos-test must run on draft pull requests too" if ci.dig("jobs", "macos-test").key?("if")
         abort "ci.yml: build-and-test must run always() to prevent skipped-check bypass" unless ci.dig("jobs", "build-and-test", "if") == "always()"
         abort "ci.yml: build-and-test must depend on macos-test" unless Array(ci.dig("jobs", "build-and-test", "needs")) == ["macos-test"]
         abort "ci.yml: must not reference secrets" if YAML.dump(ci).include?("secrets.")
@@ -1245,6 +1245,241 @@ import Testing
             #expect(result.status == 0, "\(result.stderr)")
             #expect(result.stdout.contains("ok:-C /stub/rcodesign.toml sign"))
             #expect(result.stdout.contains("ok:verify /stub/ClipBook.app/Contents/MacOS/ClipBook"))
+        }
+    }
+
+    @Test
+    func releaseForkVerifyAppRpathsValidatesSlicesAndFailsClosed() throws {
+        let scriptURL = Self.repoRootURL.appendingPathComponent("scripts/release-fork.sh")
+        let scriptText = try String(contentsOf: scriptURL, encoding: .utf8)
+
+        let helperStart = try #require(scriptText.range(of: "verify_app_rpaths() {")?.lowerBound)
+        let helperEnd = try #require(
+            scriptText.range(of: "\nverify_app_rpaths \"$STAGED_APP\"")?.lowerBound
+        )
+        let extractedFunctions = String(scriptText[helperStart..<helperEnd])
+
+        try TestSupport.withTemporaryDirectory { tempDir in
+            let appURL = tempDir.appendingPathComponent("ClipBook.app", isDirectory: true)
+            let macOSDir = appURL.appendingPathComponent("Contents/MacOS", isDirectory: true)
+            try FileManager.default.createDirectory(at: macOSDir, withIntermediateDirectories: true)
+            let binURL = macOSDir.appendingPathComponent("ClipBook")
+            try Data("macho-placeholder".utf8).write(to: binURL)
+
+            let stubBin = tempDir.appendingPathComponent("stub-bin", isDirectory: true)
+            try FileManager.default.createDirectory(at: stubBin, withIntermediateDirectories: true)
+            let otoolStub = stubBin.appendingPathComponent("otool")
+            let otoolScript = """
+            #!/bin/bash
+            set -euo pipefail
+            if [[ "${1:-}" != "-arch" || "${2:-}" != "all" || "${3:-}" != "-l" ]]; then
+              printf 'Error: unexpected otool args: %s\\n' "$*" >&2
+              exit 2
+            fi
+            printf '%s' "${STUB_OTOOL_OUTPUT:-}"
+            """
+            try Data(otoolScript.utf8).write(to: otoolStub)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: otoolStub.path)
+
+            let harnessURL = tempDir.appendingPathComponent("verify-rpaths-harness.sh")
+            let harnessScript = """
+            #!/bin/bash
+            set -euo pipefail
+            read -r -a REQUIRED_APP_ARCHS <<< "${STUB_REQUIRED_ARCHS:-arm64 x86_64}"
+            \(extractedFunctions)
+            verify_app_rpaths "$1"
+            """
+            try Data(harnessScript.utf8).write(to: harnessURL)
+
+            var baseEnv = ProcessInfo.processInfo.environment
+            let existingPath = baseEnv["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            baseEnv["PATH"] = "\(stubBin.path):\(existingPath)"
+
+            func runRpathCheck(otoolOutput: String, requiredArchs: String = "arm64 x86_64") throws -> ProcessResult {
+                var env = baseEnv
+                env["STUB_OTOOL_OUTPUT"] = otoolOutput
+                env["STUB_REQUIRED_ARCHS"] = requiredArchs
+                return try Self.runProcess(
+                    executablePath: "/bin/bash",
+                    arguments: [harnessURL.path, appURL.path],
+                    environment: env
+                )
+            }
+
+            let validDualArchOutput = """
+            \(binURL.path) (architecture arm64):
+            Load command 0
+                  cmd LC_SEGMENT_64
+              cmdsize 72
+            Load command 1
+                      cmd LC_RPATH
+                  cmdsize 32
+                     path /usr/lib/swift (offset 12)
+            Load command 2
+                      cmd LC_RPATH
+                  cmdsize 48
+                     path @executable_path/../Frameworks (offset 12)
+            \(binURL.path) (architecture x86_64):
+            Load command 0
+                  cmd LC_SEGMENT_64
+              cmdsize 72
+            Load command 1
+                      cmd LC_RPATH
+                  cmdsize 48
+                     path @executable_path/../Frameworks (offset 12)
+            Load command 2
+                      cmd LC_RPATH
+                  cmdsize 32
+                     path /usr/lib/swift (offset 12)
+
+            """
+
+            let validPass = try runRpathCheck(otoolOutput: validDualArchOutput)
+            #expect(validPass.status == 0, "Expected valid dual-arch output to pass: \(validPass.stderr)")
+
+            let validSingleArchOutput = """
+            \(binURL.path):
+            Load command 0
+                      cmd LC_RPATH
+                  cmdsize 32
+                     path /usr/lib/swift (offset 12)
+            Load command 1
+                      cmd LC_RPATH
+                  cmdsize 48
+                     path @executable_path/../Frameworks (offset 12)
+
+            """
+            let singleArchPass = try runRpathCheck(otoolOutput: validSingleArchOutput, requiredArchs: "arm64")
+            #expect(singleArchPass.status == 0, "Expected valid single-arch output to pass: \(singleArchPass.stderr)")
+
+            let failureCases: [(label: String, requiredArchs: String, output: String, expectedError: String)] = [
+                (
+                    "disallowed @loader_path/PreviewDylib rpath",
+                    "arm64 x86_64",
+                    """
+                    \(binURL.path) (architecture arm64):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    Load command 1
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    Load command 2
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @loader_path/PreviewDylib (offset 12)
+                    \(binURL.path) (architecture x86_64):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    Load command 1
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    """,
+                    "Disallowed LC_RPATH entry \"@loader_path/PreviewDylib\""
+                ),
+                (
+                    "missing /usr/lib/swift on second slice",
+                    "arm64 x86_64",
+                    """
+                    \(binURL.path) (architecture arm64):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    Load command 1
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    \(binURL.path) (architecture x86_64):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    """,
+                    "must declare both @executable_path/../Frameworks and /usr/lib/swift"
+                ),
+                (
+                    "missing @executable_path/../Frameworks on first slice",
+                    "arm64 x86_64",
+                    """
+                    \(binURL.path) (architecture arm64):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    \(binURL.path) (architecture x86_64):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    Load command 1
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    """,
+                    "must declare both @executable_path/../Frameworks and /usr/lib/swift"
+                ),
+                (
+                    "empty otool output",
+                    "arm64 x86_64",
+                    "",
+                    "Empty otool load-command output"
+                ),
+                (
+                    "missing slice headers",
+                    "arm64",
+                    """
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    Load command 1
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    """,
+                    "Missing Mach-O slice header"
+                ),
+                (
+                    "malformed LC_RPATH without path line",
+                    "arm64",
+                    """
+                    \(binURL.path):
+                    Load command 0
+                              cmd LC_RPATH
+                          cmdsize 32
+                    Load command 1
+                              cmd LC_RPATH
+                          cmdsize 32
+                             path /usr/lib/swift (offset 12)
+                    Load command 2
+                              cmd LC_RPATH
+                          cmdsize 48
+                             path @executable_path/../Frameworks (offset 12)
+                    """,
+                    "Malformed LC_RPATH load command without path entry"
+                ),
+                (
+                    "fewer slices than REQUIRED_APP_ARCHS",
+                    "arm64 x86_64",
+                    validSingleArchOutput,
+                    "Expected 2 Mach-O slice(s)"
+                )
+            ]
+
+            for testCase in failureCases {
+                let result = try runRpathCheck(otoolOutput: testCase.output, requiredArchs: testCase.requiredArchs)
+                #expect(result.status != 0, "Expected '\(testCase.label)' to fail closed")
+                #expect(
+                    result.stderr.contains(testCase.expectedError),
+                    "Expected '\(testCase.expectedError)' for '\(testCase.label)', got: \(result.stderr)"
+                )
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 @testable import ClipBook
 import AppKit
 import Foundation
+import SQLite3
 import Testing
 
 @Suite
@@ -243,7 +244,9 @@ enum AppModelAndLocalizationTests {
 
             #expect(model.items.map(\.id) == [activeItem.id])
             #expect(model.trashedItems.count == 1)
-            #expect(model.trashedItems.first?.text == "Recognized OCR in trash")
+            #expect(model.trashedItems.first?.isContentLoaded == false)
+            #expect(model.trashedItems.first?.hasRecognizedText == true)
+            #expect(model.trashedItems.first?.previewText == "Recognized OCR in trash")
 
             model.replace(unloadedTrashedNotInMemory)
             #expect(model.items.map(\.id) == [activeItem.id])
@@ -278,7 +281,8 @@ enum AppModelAndLocalizationTests {
             model.replace([newItem, other, newItemLater])
 
             #expect(model.items.map(\.id) == [newItem.id, other.id, existing.id])
-            #expect(model.items.first?.text == "New, latest version")
+            #expect(model.items.first?.isContentLoaded == false)
+            #expect(model.items.first?.previewText == "New, latest version")
         }
 
         @Test
@@ -333,6 +337,171 @@ enum AppModelAndLocalizationTests {
             #expect(model.items.contains { $0.id == trashedOne.id && $0.deletedAt == nil })
             #expect(model.selectedItemID == trashedOne.id)
             #expect(model.selectedItemIDs == [trashedOne.id])
+        }
+
+        @Test
+        @MainActor
+        func unloadedHeaderInsertionTagMutationInvalidationAndStoreAwareCorpusDonorReuse() throws {
+            try TestSupport.withTemporaryHistoryStore { baseStore, directory in
+                let spyStore = SpyHistoryStore(base: baseStore)
+                let model = AppModel()
+
+                let tagOps = try spyStore.createTag(name: "OpsVault", color: "#3B85ED")
+                let tagDocs = try spyStore.createTag(name: "DocsTeam", color: "#2196F3")
+                model.tags = [tagOps, tagDocs]
+
+                let body40KB = String(repeating: "x", count: 40_000) + "TAIL_SENTINEL_AT_40KB"
+                let rtfBytes = try TestSupport.makeRTFData(text: body40KB)
+                let htmlMarkup = "<article><p>\(body40KB)</p></article>"
+
+                let richSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .richText,
+                        text: body40KB,
+                        rtfData: rtfBytes,
+                        html: htmlMarkup,
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_100),
+                        tags: [tagOps.id]
+                    ),
+                    convertingExternalAssets: true
+                )
+                let plainSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .text,
+                        text: "Plain untagged note",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_200),
+                        tags: []
+                    ),
+                    convertingExternalAssets: true
+                )
+                let qrSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .image,
+                        text: "QR badge",
+                        qrCodeText: "QR_PAYLOAD_TOKEN_987",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_250)
+                    ),
+                    convertingExternalAssets: true
+                )
+
+                // AppModel.insert, insertIntoTrash, restore, and replace strip body + formatting while preserving header flags.
+                model.insert(richSaved)
+                model.insert(plainSaved)
+                model.insert(qrSaved)
+                #expect(model.items.count == 3)
+                #expect(model.items.allSatisfy { !$0.isContentLoaded && !$0.isFormattingLoaded && $0.searchText.isEmpty })
+
+                let richInModel = try #require(model.items.first { $0.id == richSaved.id })
+                #expect(richInModel.text == nil)
+                #expect(richInModel.html == nil)
+                #expect(richInModel.rtfData == nil)
+                #expect(richInModel.characterCount == body40KB.count)
+                #expect(richInModel.hasFormatting)
+                #expect(richInModel.storedContentKey == richSaved.storedContentKey)
+
+                model.selectedHistoryFilterContentTypes = [.trash]
+                model.insertIntoTrash([richSaved])
+                #expect(model.trashedItems.first?.isContentLoaded == false)
+                #expect(model.trashedItems.first?.searchText.isEmpty == true)
+                model.selectedHistoryFilterContentTypes = []
+                model.restore([richSaved], selection: nil)
+                #expect(model.items.allSatisfy { !$0.isContentLoaded && $0.searchText.isEmpty })
+
+                // Idle: cachedSearchCorpus is nil until a search corpus is built.
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                // First makeSearchCorpus(using:) resolves complete short headers in RAM and hydrates only incomplete/QR items from SQLite.
+                spyStore.resetRecordedCalls()
+                let corpus1 = model.makeSearchCorpus(using: spyStore)
+                #expect(corpus1.hasCompleteTexts)
+                #expect(spyStore.fetchSearchTextsCalls.count == 1)
+                #expect(Set(spyStore.fetchSearchTextsCalls[0].ids) == [richSaved.id, qrSaved.id])
+                #expect(corpus1.texts.contains { $0.contains("Plain untagged note") })
+                #expect(corpus1.texts.contains { $0.contains("QR_PAYLOAD_TOKEN_987") })
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus === corpus1)
+
+                // Repeat makeSearchCorpus(using:) at same sortedListRevision returns cached corpus with 0 DB calls.
+                spyStore.resetRecordedCalls()
+                let corpus2 = model.makeSearchCorpus(using: spyStore)
+                #expect(corpus2 === corpus1)
+                #expect(spyStore.fetchSearchTextsCalls.isEmpty)
+
+                // Direct model.tags mutation invalidates sortedListRevision + cachedSearchCorpus,
+                // and incremental donor reuse reuses untagged plainSaved while querying ONLY tagged richSaved!
+                let revBeforeTagRename = model.sortedListRevision
+                model.tags = [ClipBook.Tag(id: tagOps.id, name: "RenamedSecOps", color: tagOps.color), tagDocs]
+                #expect(model.sortedListRevision != revBeforeTagRename)
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                // Make corpus1 the donor via installSearchResult before building the next corpus.
+                let seedResult = try #require(
+                    HistorySearchJob().run(
+                        corpus: corpus1,
+                        terms: HistorySearchTerms(query: "TAIL_SENTINEL_AT_40KB"),
+                        locale: .current
+                    )
+                )
+                model.installSearchResult(seedResult)
+
+                spyStore.resetRecordedCalls()
+                let corpusAfterDirectTagMutation = model.makeSearchCorpus(using: spyStore)
+                #expect(corpusAfterDirectTagMutation.hasCompleteTexts)
+                #expect(spyStore.fetchSearchTextsCalls.count == 1)
+                #expect(spyStore.fetchSearchTextsCalls[0].ids == [richSaved.id])
+                #expect(corpusAfterDirectTagMutation.texts.contains { $0.contains("RenamedSecOps") && $0.contains("TAIL_SENTINEL_AT_40KB") })
+
+                // Unpersisted incomplete (>8 KB) header fallback sets hasCompleteTexts == false, revision slot == 0, and does NOT cache.
+                let unpersisted = ClipboardItem.fixture(
+                    kind: .text,
+                    text: "Transient unpersisted clip " + String(repeating: "u", count: 9_000),
+                    copiedAt: Date(timeIntervalSince1970: 1_700_000_300)
+                )
+                model.insert(unpersisted)
+                spyStore.resetRecordedCalls()
+                let degradedCorpus = model.makeSearchCorpus(using: spyStore)
+                #expect(!degradedCorpus.hasCompleteTexts)
+                let unpersistedSlot = try #require(degradedCorpus.indexByID()[unpersisted.id])
+                #expect(degradedCorpus.revisions[unpersistedSlot] == 0)
+                #expect(degradedCorpus.texts[unpersistedSlot].contains("Transient unpersisted clip"))
+                #expect(model.prepareSearchCorpusDescriptor().cachedCorpus == nil)
+
+                // Downgrading unsealed sensitivity columns while tampering clip_contents.text on an isEncrypted=1 row
+                // must NOT bypass AEAD verification via RAM header resolution (isStoredEncrypted stays true).
+                let secretToken = ["sk", "-live-tamper-", "99887766554433221100aabb"].joined()
+                let secretSaved = try spyStore.saveAndReconcileItem(
+                    ClipboardItem.fixture(
+                        kind: .text,
+                        text: "Bearer \(secretToken)",
+                        copiedAt: Date(timeIntervalSince1970: 1_700_000_400)
+                    ),
+                    convertingExternalAssets: true
+                )
+                #expect(secretSaved.isStoredEncrypted)
+                #expect(!secretSaved.hasCompleteHeaderSearchText)
+
+                // Flip unsealed clips.containsRestSecret=0 and corrupt clip_contents.text directly in SQLite.
+                let dbURL = directory.appendingPathComponent("History.sqlite")
+                var rawDB: OpaquePointer?
+                #expect(sqlite3_open_v2(dbURL.path, &rawDB, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+                defer { sqlite3_close(rawDB) }
+                let tamperSQL = """
+                    UPDATE clips SET containsRestSecret = 0, sensitivity = 'notSensitive' WHERE id = '\(secretSaved.id.uuidString)';
+                    UPDATE clip_contents SET text = X'DEADBEEF' WHERE clipId = '\(secretSaved.id.uuidString)';
+                    """
+                #expect(sqlite3_exec(rawDB, tamperSQL, nil, nil, nil) == SQLITE_OK)
+
+                let fetchedAfterTamper = try spyStore.fetchAll()
+                let tamperedHeader = try #require(fetchedAfterTamper.first { $0.id == secretSaved.id })
+                #expect(tamperedHeader.isStoredEncrypted)
+                #expect(!tamperedHeader.hasCompleteHeaderSearchText)
+
+                let tamperModel = AppModel()
+                tamperModel.items = [tamperedHeader]
+                spyStore.resetRecordedCalls()
+                let tamperCorpus = tamperModel.makeSearchCorpus(using: spyStore)
+                #expect(spyStore.fetchSearchTextsCalls.map(\.ids) == [[secretSaved.id]])
+                #expect(tamperCorpus.texts == [""])
+            }
         }
     }
 
@@ -534,6 +703,183 @@ enum AppModelAndLocalizationTests {
             }
         }
     }
+
+    @Suite
+    struct ArchiveAndPersistenceCatalogTests {
+        private static let requiredNonSourceLocales = [
+            "de",
+            "en-GB",
+            "es",
+            "it",
+            "ja",
+            "pt-BR",
+            "zh-Hans"
+        ]
+
+        private static let persistenceAndArchiveCatalogKeys: [String] = [
+            "History Unlocked",
+            "History Locked",
+            "History Encryption Key Mismatch",
+            "%@ Unlock Keychain and click Unlock History to resume clipboard capture.",
+            "The history database was encrypted with a different key than the current Keychain key. Restore the matching Keychain key and click Unlock History.",
+            "Unable to open the ClipBook history database.",
+            "The history database was encrypted with a different key than the current Keychain key.",
+            "Unable to verify or decrypt protected history data.",
+            "The archive encryption passphrase or key derivation parameters are invalid.",
+            "Unable to migrate the history database: %@",
+            "The history encryption key could not be found in Keychain.",
+            "Keychain is locked and cannot unlock the history encryption key right now.",
+            "Access to the history encryption key in Keychain was canceled.",
+            "Keychain authentication failed while accessing the history encryption key.",
+            "The stored history encryption key data is corrupted or invalid.",
+            "Unable to access the history encryption key (Keychain status %@).",
+            "ClipBook archive version %d is not supported.",
+            "The archive is missing %@.",
+            "The archive contains an invalid asset path: %@.",
+            "A passphrase is required to unlock this encrypted ClipBook archive.",
+            "The archive passphrase cannot be empty.",
+            "The archive passphrase is incorrect.",
+            "The encrypted ClipBook archive is damaged or was modified (%@).",
+            "The archive encryption parameters are invalid or unsupported.",
+            "Unlock History...",
+            "Unlock History",
+            "Encrypt archive with passphrase",
+            "Protect exported history items, tags, and copied image assets with AES-256-GCM encryption.",
+            "Export Contains Sensitive Items",
+            "Encrypt Archive...",
+            "Skip Sensitive Items",
+            "Export Unencrypted Anyway",
+            "Your clipboard history includes sensitive items such as passwords, API keys, or protected images. Unencrypted archives store them in plain text.",
+            "Exported %d items and %d tags to %@.",
+            "Imported %d items and %d tags.",
+            "Passphrase",
+            "Confirm Passphrase",
+            "Passphrases do not match.",
+            "Encrypt Archive",
+            "Unlock Encrypted Archive",
+            "Enter a passphrase to encrypt this archive. You will need the same passphrase to import or recover it later.",
+            "Enter the passphrase for %@.",
+            "Unlock",
+            "Importing History",
+            "Exporting History",
+            "History Imported",
+            "History Exported",
+            "Import Failed",
+            "Export Failed",
+            "The license key cannot be deactivated :("
+        ]
+
+        @Test
+        func archiveEncryptionAndLockCatalogCompletenessAndFormatSpecifierParity() throws {
+            // Self-test positional specifier parser on reordered "%2$@ ... %1$d" and escaped "%%".
+            #expect(Self.formatSpecifierMap(in: "100%% plain") == [:])
+            #expect(
+                Self.formatSpecifierMap(in: "In %2$@: %1$d Objekte")
+                    == Self.formatSpecifierMap(in: "%d items in %@")
+            )
+            #expect(Self.formatSpecifierMap(in: "In %2$@: %1$d Objekte") == [1: "d", 2: "@"])
+
+            let xcstringsURL = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("ClipBook/Localizable.xcstrings")
+            let rawData = try Data(contentsOf: xcstringsURL)
+            let root = try #require(try JSONSerialization.jsonObject(with: rawData) as? [String: Any])
+            #expect(root["sourceLanguage"] as? String == "en")
+
+            let stringsDict = try #require(root["strings"] as? [String: Any])
+
+            for key in Self.persistenceAndArchiveCatalogKeys {
+                let entry = try #require(stringsDict[key] as? [String: Any], Comment(rawValue: "Missing xcstrings key: \(key)"))
+                let localizations = try #require(
+                    entry["localizations"] as? [String: Any],
+                    Comment(rawValue: "Missing localizations dictionary for key: \(key)")
+                )
+
+                let englishSource: String
+                if let enEntry = localizations["en"] as? [String: Any],
+                   let enUnit = enEntry["stringUnit"] as? [String: Any],
+                   let enValue = enUnit["value"] as? String {
+                    #expect(enUnit["state"] as? String == "translated", Comment(rawValue: "\(key) [en]"))
+                    #expect(!enValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, Comment(rawValue: "\(key) [en]"))
+                    englishSource = enValue
+                } else {
+                    englishSource = key
+                }
+                let expectedSpecifiers = Self.formatSpecifierMap(in: englishSource)
+
+                for locale in Self.requiredNonSourceLocales {
+                    let localeEntry = try #require(
+                        localizations[locale] as? [String: Any],
+                        Comment(rawValue: "Missing locale \(locale) for key: \(key)")
+                    )
+                    let unit = try #require(
+                        localeEntry["stringUnit"] as? [String: Any],
+                        Comment(rawValue: "Missing stringUnit in \(locale) for key: \(key)")
+                    )
+                    let state = unit["state"] as? String
+                    let value = (unit["value"] as? String) ?? ""
+                    #expect(state == "translated", Comment(rawValue: "Untranslated state in \(locale) for key: \(key)"))
+                    #expect(
+                        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                        Comment(rawValue: "Empty translation in \(locale) for key: \(key)")
+                    )
+                    let actualSpecifiers = Self.formatSpecifierMap(in: value)
+                    #expect(
+                        actualSpecifiers == expectedSpecifiers,
+                        Comment(rawValue: "Format specifier mismatch in \(locale) for key '\(key)': \(actualSpecifiers) != \(expectedSpecifiers)")
+                    )
+                }
+            }
+        }
+
+        private static func formatSpecifierMap(in format: String) -> [Int: String] {
+            let pattern = #"%(\%|(?:([1-9][0-9]*)\$)?[-+ #0]*(?:[0-9]+)?(?:\.[0-9]+)?(hh|h|ll|l|z|t|j|q|L)?([@dDiuUxXoOfeEgGcCsSpaAF]))"#
+            guard let regex = try? NSRegularExpression(pattern: pattern) else {
+                return [:]
+            }
+
+            let nsRange = NSRange(format.startIndex..<format.endIndex, in: format)
+            let matches = regex.matches(in: format, range: nsRange)
+            var result: [Int: String] = [:]
+            var implicitPosition = 0
+
+            for match in matches {
+                if let wholeBodyRange = Range(match.range(at: 1), in: format),
+                   format[wholeBodyRange] == "%" {
+                    continue
+                }
+
+                let position: Int
+                if match.range(at: 2).location != NSNotFound,
+                   let posRange = Range(match.range(at: 2), in: format),
+                   let explicitPos = Int(format[posRange]) {
+                    position = explicitPos
+                } else {
+                    implicitPosition += 1
+                    position = implicitPosition
+                }
+
+                let lengthMod: String
+                if match.range(at: 3).location != NSNotFound,
+                   let lenRange = Range(match.range(at: 3), in: format) {
+                    lengthMod = String(format[lenRange])
+                } else {
+                    lengthMod = ""
+                }
+
+                guard match.range(at: 4).location != NSNotFound,
+                      let convRange = Range(match.range(at: 4), in: format) else {
+                    continue
+                }
+                let rawConv = String(format[convRange])
+                let normalizedConv = (rawConv == "i") ? "d" : rawConv
+                result[position] = lengthMod + normalizedConv
+            }
+
+            return result
+        }
+    }
 }
 
 extension SharedProcessStateTests {
@@ -558,6 +904,95 @@ extension SharedProcessStateTests {
             L10n.setLanguage("fr-CA")
             #expect(L10n.languageIdentifier == "en")
             #expect(L10n.currentLocale.identifier == "en")
+        }
+
+        @Test
+        @MainActor
+        func persistenceErrorAndStoreLockLocalizationAcrossLanguages() {
+            defer {
+                L10n.setLanguage("en")
+            }
+
+            let errorCases: [(label: String, error: Error, expectedSubstring: String?)] = [
+                ("openFailed", HistoryStoreError.openFailed, nil),
+                ("keyNotFound", HistoryStoreError.encryptionKeyUnavailable(.notFound), nil),
+                ("interactionNotAllowed", HistoryStoreError.encryptionKeyUnavailable(.interactionNotAllowed), nil),
+                ("userCanceled", HistoryStoreError.encryptionKeyUnavailable(.userCanceled), nil),
+                ("authFailed", HistoryStoreError.encryptionKeyUnavailable(.authFailed), nil),
+                ("corruptKeyData", HistoryStoreError.encryptionKeyUnavailable(.corruptKeyData), nil),
+                ("unexpectedStatus", HistoryStoreError.encryptionKeyUnavailable(.unexpectedStatus(-25308)), "-25308"),
+                ("encryptionKeyMismatch", HistoryStoreError.encryptionKeyMismatch, nil),
+                ("authenticationFailed", HistoryStoreError.authenticationFailed, nil),
+                ("invalidArchiveKeyParameters", HistoryStoreError.invalidArchiveKeyParameters, nil),
+                ("migrationFailed", HistoryStoreError.migrationFailed("V4_TO_V5_TOKEN"), "V4_TO_V5_TOKEN"),
+                ("unsupportedVersion", ClipBookArchiveError.unsupportedVersion(99), "99"),
+                ("missingFile", ClipBookArchiveError.missingFile("manifest.json"), "manifest.json"),
+                ("invalidAssetPath", ClipBookArchiveError.invalidAssetPath("../escape.png"), "../escape.png"),
+                ("passphraseRequired", ClipBookArchiveError.passphraseRequired, nil),
+                ("emptyPassphrase", ClipBookArchiveError.emptyPassphrase, nil),
+                ("incorrectPassphrase", ClipBookArchiveError.incorrectPassphrase, nil),
+                ("corruptedEncryptedArchive", ClipBookArchiveError.corruptedEncryptedArchive("tags.json.enc"), "tags.json.enc"),
+                ("invalidKeyParameters", ClipBookArchiveError.invalidKeyParameters, nil)
+            ]
+
+            L10n.setLanguage("en")
+            let enUnlockedTitle = PersistenceErrorLocalization.statusTitle(for: .unlocked)
+            let enLockedTitle = PersistenceErrorLocalization.statusTitle(for: .locked(.interactionNotAllowed))
+            let enMismatchTitle = PersistenceErrorLocalization.statusTitle(for: .keyMismatch)
+            #expect(enUnlockedTitle == "History Unlocked")
+            #expect(enLockedTitle == "History Locked")
+            #expect(enMismatchTitle == "History Encryption Key Mismatch")
+            #expect(PersistenceErrorLocalization.statusMessage(for: .unlocked).isEmpty)
+
+            let enLockedMessage = PersistenceErrorLocalization.statusMessage(for: .locked(.interactionNotAllowed))
+            let enMismatchMessage = PersistenceErrorLocalization.statusMessage(for: .keyMismatch)
+            #expect(enLockedMessage.contains("Keychain is locked"))
+            #expect(enLockedMessage.contains("Unlock History"))
+            #expect(enMismatchMessage.contains("different key"))
+
+            var englishMessages: [String: String] = [:]
+            for testCase in errorCases {
+                let msg = PersistenceErrorLocalization.message(for: testCase.error)
+                #expect(!msg.isEmpty, Comment(rawValue: "en \(testCase.label)"))
+                #expect(
+                    msg == testCase.error.localizedDescription,
+                    Comment(rawValue: "en \(testCase.label) matches errorDescription")
+                )
+                if let sub = testCase.expectedSubstring {
+                    #expect(msg.contains(sub), Comment(rawValue: "en \(testCase.label) missing \(sub)"))
+                }
+                englishMessages[testCase.label] = msg
+            }
+
+            let customError = NSError(
+                domain: "com.clipbook.tests",
+                code: 77,
+                userInfo: [NSLocalizedDescriptionKey: "Custom fallback error message"]
+            )
+            #expect(PersistenceErrorLocalization.message(for: customError) == "Custom fallback error message")
+
+            L10n.setLanguage("de")
+            let deUnlockedTitle = PersistenceErrorLocalization.statusTitle(for: .unlocked)
+            let deLockedTitle = PersistenceErrorLocalization.statusTitle(for: .locked(.interactionNotAllowed))
+            let deMismatchTitle = PersistenceErrorLocalization.statusTitle(for: .keyMismatch)
+            #expect(!deUnlockedTitle.isEmpty && deUnlockedTitle != enUnlockedTitle)
+            #expect(!deLockedTitle.isEmpty && deLockedTitle != enLockedTitle)
+            #expect(!deMismatchTitle.isEmpty && deMismatchTitle != enMismatchTitle)
+            #expect(PersistenceErrorLocalization.statusMessage(for: .unlocked).isEmpty)
+
+            let deLockedMessage = PersistenceErrorLocalization.statusMessage(for: .locked(.interactionNotAllowed))
+            let deMismatchMessage = PersistenceErrorLocalization.statusMessage(for: .keyMismatch)
+            #expect(!deLockedMessage.isEmpty && deLockedMessage != enLockedMessage)
+            #expect(!deMismatchMessage.isEmpty && deMismatchMessage != enMismatchMessage)
+
+            for testCase in errorCases {
+                let deMsg = PersistenceErrorLocalization.message(for: testCase.error)
+                #expect(!deMsg.isEmpty, Comment(rawValue: "de \(testCase.label)"))
+                #expect(deMsg != englishMessages[testCase.label], Comment(rawValue: "de \(testCase.label) did not translate"))
+                if let sub = testCase.expectedSubstring {
+                    #expect(deMsg.contains(sub), Comment(rawValue: "de \(testCase.label) missing \(sub)"))
+                }
+            }
         }
 
         @Test

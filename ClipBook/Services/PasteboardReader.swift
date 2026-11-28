@@ -13,8 +13,8 @@ nonisolated struct PasteboardReadRequest: Sendable {
     var ignoresTransientContent: Bool
     var ignoresConcealedContent: Bool
     var ignoredApplicationEntries: [String]
-    /// Where a copied image is stored.
-    var imagesDirectory: URL
+    /// Computes the digest of an extracted PNG image (keyed HMAC in v5).
+    var computeImageDigest: @Sendable (_ pngData: Data) -> String = ContentDigest.sha256
     /// The image already in the history with the given digest, if any. It is
     /// asked from the read queue.
     var findStoredImage: @Sendable (_ digest: String) -> StoredImage?
@@ -69,10 +69,14 @@ nonisolated struct PasteboardContent: Sendable {
     nonisolated enum Payload: Sendable {
         case files(paths: [String], byteSize: Int, recognizedContent: RecognizedImageContent)
         /// `reusesStoredFile` is set when the image is already in the history:
-        /// `assetPath` is then that item's file, which is not the reader's to delete.
+        /// `existingAssetPath` is then that item's file, while new captures
+        /// keep `pngData` in memory until `PasteboardMonitor` stages `.enc`.
         case image(
             id: UUID,
-            assetPath: String,
+            pngData: Data?,
+            existingAssetPath: String?,
+            pixelWidth: Int?,
+            pixelHeight: Int?,
             byteSize: Int,
             recognizedContent: RecognizedImageContent,
             digest: String,
@@ -89,16 +93,6 @@ nonisolated struct PasteboardContent: Sendable {
     var isConcealed = false
 }
 
-// What an image is read for when it is captured: the text it shows, and the
-// payload of the QR code it carries. Both are read from the same image in
-// one pass, because an image can hold either, both or neither.
-nonisolated struct RecognizedImageContent: Sendable {
-    static let empty = RecognizedImageContent(text: nil, qrCodeText: nil)
-
-    var text: String?
-    var qrCodeText: String?
-}
-
 /// Reads the general pasteboard. It is called off the main thread: an
 /// application may put a promise on the pasteboard and hand the data over only
 /// when it is asked for, and the read waits for that application as long as it
@@ -106,6 +100,7 @@ nonisolated struct RecognizedImageContent: Sendable {
 /// `ImageTextRecognizer`'s job once the image is in the history.
 nonisolated enum PasteboardReader {
     static let ghostType = NSPasteboard.PasteboardType("com.ikryanov.clipbook.v2.ghost")
+    static let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
 
     static func read(_ request: PasteboardReadRequest, from pasteboard: NSPasteboard = .general) -> PasteboardReadResult {
         let changeCount = pasteboard.changeCount
@@ -162,7 +157,7 @@ nonisolated enum PasteboardReader {
     }
 
     private static func isConcealed(_ pasteboard: NSPasteboard) -> Bool {
-        (pasteboard.types ?? []).contains(.init("org.nspasteboard.ConcealedType"))
+        (pasteboard.types ?? []).contains(concealedType)
     }
 
     private static func readPayload(from pasteboard: NSPasteboard, request: PasteboardReadRequest) -> PasteboardContent.Payload? {
@@ -230,15 +225,16 @@ nonisolated enum PasteboardReader {
                 return nil
             }
 
-            // An image already in the history keeps its file and the text read
-            // from it, so it is neither stored nor read again. Reading the text
-            // is what takes the time and the memory.
-            let digest = ContentDigest.sha256(png)
+            let dimensions = ClipboardItem.pixelDimensions(of: png)
+            let digest = request.computeImageDigest(png)
             if let storedImage = request.findStoredImage(digest),
                FileManager.default.fileExists(atPath: storedImage.assetPath) {
                 return .image(
                     id: UUID(),
-                    assetPath: storedImage.assetPath,
+                    pngData: nil,
+                    existingAssetPath: storedImage.assetPath,
+                    pixelWidth: dimensions?.width,
+                    pixelHeight: dimensions?.height,
                     byteSize: png.count,
                     recognizedContent: storedImage.recognizedContent,
                     digest: digest,
@@ -246,19 +242,12 @@ nonisolated enum PasteboardReader {
                 )
             }
 
-            let imagesDirectory = request.imagesDirectory
-            try? FileManager.default.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
-            let id = UUID()
-            let url = imagesDirectory.appendingPathComponent("\(id.uuidString).png")
-            do {
-                try png.write(to: url, options: .atomic)
-            } catch {
-                return nil
-            }
-
             return .image(
-                id: id,
-                assetPath: url.path,
+                id: UUID(),
+                pngData: png,
+                existingAssetPath: nil,
+                pixelWidth: dimensions?.width,
+                pixelHeight: dimensions?.height,
                 byteSize: png.count,
                 recognizedContent: .empty,
                 digest: digest,

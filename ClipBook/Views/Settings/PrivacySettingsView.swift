@@ -19,6 +19,7 @@ struct PrivacySettingsView: View {
             }
             SettingsRow(title: L10n.string("Keep sensitive content"), description: L10n.string("Passwords, API keys, access tokens and card numbers found in copied text.")) {
                 lifetimePicker(L10n.string("Keep sensitive content"), selection: sensitiveContentLifetime)
+                    .disabled(model.storeLockState != .unlocked)
             }
             SettingsToggle(title: L10n.string("Ignore transient content"), description: L10n.string("Skip temporary pasteboard values that apps do not intend to store."), isOn: $model.preferences.ignoreTransientContent)
         }
@@ -39,6 +40,7 @@ struct PrivacySettingsView: View {
             }
                 .padding(.horizontal, 0)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(model.storeLockState != .unlocked)
         }
     }
 

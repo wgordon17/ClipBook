@@ -1,7 +1,9 @@
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
-struct LinkPreview {
+struct LinkPreview: @unchecked Sendable {
   let url: URL
   let title: String?
   let description: String?
@@ -11,6 +13,10 @@ struct LinkPreview {
   /// shows them, so they are not read in `image` and `favicon`.
   var imageURL: URL?
   var faviconURL: URL?
+  var ownerClipID: UUID? = nil
+  var requiresEncryptedAssets: Bool = false
+  var imagePNGData: Data? = nil
+  var faviconPNGData: Data? = nil
 
   var hasVisibleDetails: Bool {
     title != nil || description != nil || image != nil || favicon != nil || imageURL != nil || faviconURL != nil
@@ -35,7 +41,9 @@ extension ClipboardItem {
       image: nil,
       favicon: nil,
       imageURL: Self.existingFileURL(atPath: details.imagePath),
-      faviconURL: Self.existingFileURL(atPath: details.faviconPath)
+      faviconURL: Self.existingFileURL(atPath: details.faviconPath),
+      ownerClipID: id,
+      requiresEncryptedAssets: SensitiveContent.shouldEncryptAtRest(self)
     )
   }
 
@@ -99,9 +107,17 @@ final class HistoryItemRowLinkView: HistoryItemRowView {
   private func configureFavicon(at url: URL, for item: ClipboardItem, toolTip: String) {
     let boxSize = CGSize(width: HistoryRow.typeIconSize, height: HistoryRow.typeIconSize)
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: boxSize, scale: backingScale)
+    let assetContext = linkPreview?.ownerClipID.map {
+      ImageAssetThumbnailLoader.ManagedAssetContext(
+        role: .linkFavicon,
+        ownerClipID: $0,
+        requiresEncryption: linkPreview?.requiresEncryptedAssets ?? false
+      )
+    }
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
-      maximumPixelSize: maximumPixelSize
+      maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext
     ) { [weak self] image in
       guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent, self.showsLinkPreview, let image else {
         return
@@ -121,9 +137,17 @@ final class HistoryItemRowLinkView: HistoryItemRowView {
     // than the box needs more pixels along its long side than the box itself has.
     let fillSize = CGSize(width: HistoryRow.linkPreviewImageWidth * 2, height: HistoryRow.linkPreviewImageHeight * 2)
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: fillSize, scale: backingScale)
+    let assetContext = linkPreview?.ownerClipID.map {
+      ImageAssetThumbnailLoader.ManagedAssetContext(
+        role: .linkPreview,
+        ownerClipID: $0,
+        requiresEncryption: linkPreview?.requiresEncryptedAssets ?? false
+      )
+    }
     linkPreviewImageView.image = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
-      maximumPixelSize: maximumPixelSize
+      maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext
     ) { [weak self] image in
       guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent, self.showsLinkPreview, let image else {
         return
@@ -186,12 +210,34 @@ class LinkPreviewAspectFillImageView: NSImageView {
   }
 }
 
-final class LinkPreviewFetcher {
+nonisolated final class LinkPreviewFetcher: Sendable {
+  private struct FetchedImagePayload: @unchecked Sendable {
+    let image: NSImage
+    let pngData: Data?
+  }
+
   private static let maximumHTMLBytes = 512 * 1024
   private static let maximumPreviewImageBytes = 5 * 1024 * 1024
   private static let maximumFaviconBytes = 512 * 1024
   private static let requestTimeout: TimeInterval = 10
 
+  private static func makeDefaultSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    return URLSession(configuration: configuration)
+  }
+
+  private static let defaultSession: URLSession = makeDefaultSession()
+  let session: URLSession
+
+  init(session: URLSession = LinkPreviewFetcher.defaultSession) {
+    self.session = session
+  }
+
+  @concurrent
   func fetchPreview(for url: URL) async -> LinkPreview? {
     guard let html = await fetchHTML(for: url) else {
       return nil
@@ -204,21 +250,29 @@ final class LinkPreviewFetcher {
       maximumByteCount: Self.maximumFaviconBytes
     )
 
+    let resolvedImage = await previewImage
+    let resolvedFavicon = await favicon
     return LinkPreview(
       url: url,
       title: metadata.title,
       description: metadata.description,
-      image: await previewImage,
-      favicon: await favicon
+      image: resolvedImage?.image,
+      favicon: resolvedFavicon?.image,
+      imagePNGData: resolvedImage?.pngData,
+      faviconPNGData: resolvedFavicon?.pngData
     )
   }
 
-  private func fetchPreviewImage(at url: URL?) async -> NSImage? {
+  private func fetchPreviewImage(at url: URL?) async -> FetchedImagePayload? {
     guard let url else {
       return nil
     }
 
-    return await Self.fetchImage(at: url, maximumByteCount: Self.maximumPreviewImageBytes)
+    return await Self.fetchImage(
+      at: url,
+      session: session,
+      maximumByteCount: Self.maximumPreviewImageBytes
+    )
   }
 
   private func fetchHTML(for url: URL) async -> String? {
@@ -232,26 +286,33 @@ final class LinkPreviewFetcher {
     request.setValue("ClipBook/1.0", forHTTPHeaderField: "User-Agent")
 
     do {
-      let (data, response) = try await URLSession.shared.data(for: request)
-      guard Task.isCancelled == false,
-            let httpResponse = response as? HTTPURLResponse,
-            (200..<400).contains(httpResponse.statusCode) else {
+      guard let (data, _) = try await Self.fetchBoundedData(
+        for: request,
+        session: session,
+        maximumByteCount: Self.maximumHTMLBytes,
+        truncateAtLimit: true
+      ),
+      Task.isCancelled == false else {
         return nil
       }
 
-      return String(decoding: data.prefix(Self.maximumHTMLBytes), as: UTF8.self)
+      return String(decoding: data, as: UTF8.self)
     } catch {
       return nil
     }
   }
 
-  private func fetchFirstImage(at urls: [URL], maximumByteCount: Int) async -> NSImage? {
+  private func fetchFirstImage(at urls: [URL], maximumByteCount: Int) async -> FetchedImagePayload? {
     for url in urls {
       guard Task.isCancelled == false else {
         return nil
       }
 
-      if let image = await Self.fetchImage(at: url, maximumByteCount: maximumByteCount) {
+      if let image = await Self.fetchImage(
+        at: url,
+        session: session,
+        maximumByteCount: maximumByteCount
+      ) {
         return image
       }
     }
@@ -259,7 +320,11 @@ final class LinkPreviewFetcher {
     return nil
   }
 
-  private static func fetchImage(at url: URL, maximumByteCount: Int) async -> NSImage? {
+  private static func fetchImage(
+    at url: URL,
+    session: URLSession,
+    maximumByteCount: Int
+  ) async -> FetchedImagePayload? {
     guard url.scheme == "http" || url.scheme == "https" else {
       return nil
     }
@@ -269,18 +334,128 @@ final class LinkPreviewFetcher {
     request.setValue("ClipBook/1.0", forHTTPHeaderField: "User-Agent")
 
     do {
-      let (data, response) = try await URLSession.shared.data(for: request)
-      guard Task.isCancelled == false,
-            data.count <= maximumByteCount,
-            let httpResponse = response as? HTTPURLResponse,
-            (200..<400).contains(httpResponse.statusCode) else {
+      guard let (data, _) = try await fetchBoundedData(
+        for: request,
+        session: session,
+        maximumByteCount: maximumByteCount,
+        truncateAtLimit: false
+      ),
+      Task.isCancelled == false,
+      let image = NSImage(data: data) else {
         return nil
       }
 
-      return NSImage(data: data)
+      return FetchedImagePayload(image: image, pngData: normalizedPNGData(from: data))
     } catch {
       return nil
     }
+  }
+
+  private static func normalizedPNGData(from rawData: Data) -> Data? {
+    guard let source = CGImageSourceCreateWithData(rawData as CFData, nil) else {
+      return nil
+    }
+    let imageCount = CGImageSourceGetCount(source)
+    guard imageCount > 0 else {
+      return nil
+    }
+    var bestIndex = 0
+    var bestArea = 0
+    if imageCount > 1 {
+      for index in 0..<imageCount {
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+           let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+           let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue {
+          let area = width * height
+          if area > bestArea {
+            bestArea = area
+            bestIndex = index
+          }
+        }
+      }
+    }
+    guard let cgImage = CGImageSourceCreateImageAtIndex(source, bestIndex, nil) else {
+      return nil
+    }
+    let output = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(
+      output,
+      UTType.png.identifier as CFString,
+      1,
+      nil
+    ) else {
+      return nil
+    }
+    CGImageDestinationAddImage(destination, cgImage, nil)
+    guard CGImageDestinationFinalize(destination) else {
+      return nil
+    }
+    return output as Data
+  }
+
+  // Streams response bytes off the main actor so oversized or unending responses
+  // are cancelled at the byte limit instead of buffered whole into memory.
+  @concurrent
+  private nonisolated static func fetchBoundedData(
+    for request: URLRequest,
+    session: URLSession = defaultSession,
+    maximumByteCount: Int,
+    truncateAtLimit: Bool
+  ) async throws -> (Data, HTTPURLResponse)? {
+    guard maximumByteCount >= 0 else {
+      return nil
+    }
+
+    let (bytes, response) = try await session.bytes(for: request)
+    defer {
+      bytes.task.cancel()
+    }
+
+    guard let httpResponse = response as? HTTPURLResponse,
+          (200..<400).contains(httpResponse.statusCode) else {
+      return nil
+    }
+
+    if !truncateAtLimit,
+       httpResponse.expectedContentLength > Int64(maximumByteCount) {
+      return nil
+    }
+
+    if truncateAtLimit, maximumByteCount == 0 {
+      return (Data(), httpResponse)
+    }
+
+    let initialCapacity: Int
+    if httpResponse.expectedContentLength > 0 {
+      initialCapacity = min(Int(clamping: httpResponse.expectedContentLength), maximumByteCount)
+    } else {
+      initialCapacity = min(maximumByteCount, 16 * 1024)
+    }
+    var data = Data()
+    data.reserveCapacity(initialCapacity)
+
+    for try await byte in bytes {
+      if data.count >= maximumByteCount {
+        bytes.task.cancel()
+        if truncateAtLimit {
+          break
+        }
+        return nil
+      }
+
+      data.append(byte)
+
+      if truncateAtLimit, data.count >= maximumByteCount {
+        bytes.task.cancel()
+        break
+      }
+    }
+
+    guard Task.isCancelled == false else {
+      return nil
+    }
+
+    return (data, httpResponse)
   }
 }
 
@@ -292,13 +467,26 @@ struct LinkPreviewMetadata {
 }
 
 enum LinkPreviewHTMLParser {
-  private nonisolated static let titlePattern = #"<title\b[^>]*>(.*?)</title>"#
-  private nonisolated static let metaPattern = #"<meta\b[^>]*>"#
-  private nonisolated static let linkPattern = #"<link\b[^>]*>"#
-  private nonisolated static let attributePattern = #"([^\s=/"'>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))"#
+  private nonisolated static let titleRegex = try! NSRegularExpression(
+    pattern: #"<title\b[^>]*>(.*?)</title>"#,
+    options: [.caseInsensitive, .dotMatchesLineSeparators]
+  )
+  private nonisolated static let metaRegex = try! NSRegularExpression(
+    pattern: #"<meta\b[^>]*>"#,
+    options: [.caseInsensitive, .dotMatchesLineSeparators]
+  )
+  private nonisolated static let linkRegex = try! NSRegularExpression(
+    pattern: #"<link\b[^>]*>"#,
+    options: [.caseInsensitive, .dotMatchesLineSeparators]
+  )
+  private nonisolated static let attributeRegex = try! NSRegularExpression(
+    pattern: #"([^\s=/"'>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>]+))"#,
+    options: [.caseInsensitive]
+  )
+  private nonisolated static let whitespaceRegex = try! NSRegularExpression(pattern: #"\s+"#)
 
   nonisolated static func parse(html: String, baseURL: URL) -> LinkPreviewMetadata {
-    let metaTags = tags(matching: metaPattern, in: html).map(attributes(in:))
+    let metaTags = tags(matching: metaRegex, in: html).map(attributes(in:))
     let title = firstMetaContent(
       in: metaTags,
       matching: ["og:title", "twitter:title"]
@@ -320,11 +508,7 @@ enum LinkPreviewHTMLParser {
     )
   }
 
-  private nonisolated static func tags(matching pattern: String, in html: String) -> [String] {
-    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
-      return []
-    }
-
+  private nonisolated static func tags(matching regex: NSRegularExpression, in html: String) -> [String] {
     let range = NSRange(html.startIndex..<html.endIndex, in: html)
     return regex.matches(in: html, options: [], range: range).compactMap { match in
       Range(match.range, in: html).map { String(html[$0]) }
@@ -334,12 +518,8 @@ enum LinkPreviewHTMLParser {
   private nonisolated static func attributes(in tag: String) -> [String: String] {
     // The "/" of a self-closing tag is not part of an unquoted value: <link href=/icon.png/>.
     let tag = tag.hasSuffix("/>") ? String(tag.dropLast(2)) + ">" : tag
-    guard let regex = try? NSRegularExpression(pattern: attributePattern, options: [.caseInsensitive]) else {
-      return [:]
-    }
-
     let range = NSRange(tag.startIndex..<tag.endIndex, in: tag)
-    return regex.matches(in: tag, options: [], range: range).reduce(into: [:]) { result, match in
+    return attributeRegex.matches(in: tag, options: [], range: range).reduce(into: [:]) { result, match in
       guard let nameRange = Range(match.range(at: 1), in: tag) else {
         return
       }
@@ -374,8 +554,7 @@ enum LinkPreviewHTMLParser {
   }
 
   private nonisolated static func htmlTitle(in html: String) -> String? {
-    guard let regex = try? NSRegularExpression(pattern: titlePattern, options: [.caseInsensitive, .dotMatchesLineSeparators]),
-          let match = regex.firstMatch(in: html, options: [], range: NSRange(html.startIndex..<html.endIndex, in: html)),
+    guard let match = titleRegex.firstMatch(in: html, options: [], range: NSRange(html.startIndex..<html.endIndex, in: html)),
           let range = Range(match.range(at: 1), in: html) else {
       return nil
     }
@@ -384,7 +563,7 @@ enum LinkPreviewHTMLParser {
   }
 
   private nonisolated static func faviconURLs(in html: String, baseURL: URL) -> [URL] {
-    let candidates = tags(matching: linkPattern, in: html)
+    let candidates = tags(matching: linkRegex, in: html)
       .map(attributes(in:))
       .compactMap { attributes -> (priority: Int, url: URL)? in
         guard let rel = attributes["rel"]?.lowercased(),
@@ -430,8 +609,9 @@ enum LinkPreviewHTMLParser {
 
   private nonisolated static func cleanedText(_ text: String) -> String {
     let unescaped = ClipboardTextTransform.decodeHTMLEntities(text)
-    return unescaped
-      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    let range = NSRange(unescaped.startIndex..<unescaped.endIndex, in: unescaped)
+    return whitespaceRegex
+      .stringByReplacingMatches(in: unescaped, options: [], range: range, withTemplate: " ")
       .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 

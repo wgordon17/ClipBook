@@ -81,13 +81,13 @@ profile; pass `--skip-notarization` to produce local artifacts without one. Run
 
 ## Custom Fork Build, Auto-Updates & Upstream Interoperability
 
-This fork (`wgordon17/ClipBook`) builds on upstream `vladimir-ikryanov/ClipBook` while maintaining full bidirectional on-disk compatibility and publishing self-signed, Sparkle-updated universal macOS builds from the `fork` trunk.
+This fork (`wgordon17/ClipBook`) builds on upstream `vladimir-ikryanov/ClipBook`, adding `GRDB.swift v7.12.0` + Apple `CryptoKit` encryption at rest (`History.sqlite` `v5` normalized schema) while preserving 100% wire compatibility for preferences (`"ClipBookPreferencesV2"`, `"ClipBookForkPreferencesV1"`) and unencrypted `formatVersion = 1` `.clipbookarchive` exports, and publishing self-signed, Sparkle-updated universal macOS builds from the `fork` trunk.
 
 ### Branch Layout & Upstream Sync Workflow
 
 - **`fork` (default protected release trunk):** Carries merged improvements, contract tests, and fork release automation. Protected by an active GitHub Repository Ruleset (`allowed_merge_methods: ["merge"]`) so two-parent merge commits preserve `upstream/main` ancestry.
 - **`main` (pure upstream mirror):** Fast-forwarded to `vladimir-ikryanov/ClipBook:main` without fork-only commits.
-- **Automated upstream sync (`.github/workflows/sync-upstream.yml`):** Runs weekly (Mondays 09:17 UTC) and via `workflow_dispatch` on `ubuntu-latest` with zero repository code or git hook execution. It mirrors `upstream/main` to `main`, checks upstream's appcast for `FORK_UPSTREAM_VERSION` updates, fails closed if upstream modifies `.github/workflows/`, and opens or updates a **draft** PR (`chore/sync-upstream` -> `fork`). Marking that draft PR **Ready for review** in GitHub triggers `ci.yml` (`build-and-test`), and merging it with a merge commit triggers `release.yml`.
+- **Automated upstream sync (`.github/workflows/sync-upstream.yml`):** Runs weekly (Mondays 09:17 UTC) and via `workflow_dispatch` on `ubuntu-latest` with zero repository code or git hook execution. It mirrors `upstream/main` to `main`, checks upstream's appcast for `FORK_UPSTREAM_VERSION` updates, fails closed if upstream modifies `.github/workflows/`, and opens or updates a **draft** PR (`chore/sync-upstream` -> `fork`) using `GITHUB_TOKEN`. Human-opened draft PRs run `ci.yml` (`build-and-test`) directly on open/push; because GitHub Actions suppresses `on: pull_request` runs for `GITHUB_TOKEN`-created PRs, marking the sync draft PR **Ready for review** in GitHub triggers `ci.yml` (`build-and-test`), and merging with a merge commit triggers `release.yml`.
 
 ### Initial Install, Secondary-Mac Trust & Sparkle Auto-Updates
 
@@ -157,17 +157,32 @@ Upstream `./release.sh` remains untouched for Apple Developer ID + notarization 
   | `--dry-run` | Generate and verify artifacts in a temporary workspace without modifying repo files, Keychain, or GitHub. |
   | `-h`, `--help` | Show all options. |
 
-### Bidirectional Upstream Interoperability & TCC Reset
+### Upstream Interoperability & TCC Reset
 
-Fork and Upstream builds can share data safely in both directions without migration loss:
+Fork and Upstream builds interoperate cleanly across preferences and archives while failing closed against accidental cross-version database corruption:
 
-- **Shared wire-locked stores:** `UserDefaults` key `"ClipBookPreferencesV2"` (`AppPreferences`), `History.sqlite` (`PRAGMA user_version = 4`, `clips` and `tags`), `Images/`, `LinkPreviews/`, and `.clipbookarchive` (`formatVersion = 1`) match upstream `vladimir-ikryanov/ClipBook` verbatim.
+- **One-way `History.sqlite` (`v5`) clean-room schema:** On first launch, Fork migrates legacy `History.sqlite` (`v0`–`v4`) via a two-phase clean-room cutover (`History.v5.migrating.sqlite`, `0600`) to `PRAGMA user_version = 5` (`tags`, `clips`, `clip_contents`, `clip_tags`, `store_metadata`) and intentionally omits `clips.payload`. If an older or Upstream binary opens a `v5` database, `SELECT ... payload FROM clips` fails statement preparation cleanly rather than returning empty rows and triggering Upstream's `removeOrphanedStoredFiles()` deletion sweep over `Images/` and `LinkPreviews/`. To transfer history back to an Upstream build, export an unencrypted (`formatVersion = 1`) `.clipbookarchive` from Settings -> Import (for offline emergency plaintext decryption to JSON + asset files, see [docs/recovery.md](docs/recovery.md)).
+- **Wire-compatible preferences & `v1` archives:** `UserDefaults` key `"ClipBookPreferencesV2"` (`AppPreferences`) and unencrypted `formatVersion = 1` `.clipbookarchive` exports (`manifest.json`, `tags.json`, `history.json`, and decrypted `assets/`) remain 100% wire-compatible with upstream `vladimir-ikryanov/ClipBook`.
 - **Reboot detection compatibility:** Fork reads and writes `"ClipBookLastKnownKernelBootTime"` (`kern.boottime`) while keeping `"ClipBookLastKnownBootTime"` (`Date() - systemUptime`) warm so `clearHistoryOnReboot` works seamlessly across switches in either direction.
-- **Isolated fork sidecars:** Fork-specific preferences use `"ClipBookForkPreferencesV1"` (`ForkPreferences`), fork-specific files live under `~/Library/Application Support/ClipBook2/Fork/` (outside upstream's orphan-swept `Images/` and `LinkPreviews/` directories), and Sparkle state uses `SUDefaultsDomain = $(PRODUCT_BUNDLE_IDENTIFIER).fork.sparkle`.
+- **Isolated fork sidecars:** Fork-specific preferences use `"ClipBookForkPreferencesV1"` (`ForkPreferences`), fork-specific files live under `~/Library/Application Support/ClipBook2/Fork/` (outside `Images/` and `LinkPreviews/`), and Sparkle state uses `SUDefaultsDomain = $(PRODUCT_BUNDLE_IDENTIFIER).fork.sparkle`.
 - **Accessibility TCC when switching binary families:** Because Upstream (Apple Developer ID) and Fork (`ClipBook Fork Code Signing`) have different code-signing Designated Requirements for `com.ikryanov.clipbook.v2`, reset Accessibility permission once whenever replacing `/Applications/ClipBook.app` with the other build family:
   ```bash
   tccutil reset Accessibility com.ikryanov.clipbook.v2
   ```
+
+### Encrypted Storage, Debug Isolation & Offline Recovery
+
+- **`GRDB.swift v7.12.0` + `CryptoKit` encryption at rest:**
+  - `GRDBHistoryStore` runs on a WAL-mode `DatabasePool` (`auto_vacuum = INCREMENTAL`, `secure_delete = ON`, `trusted_schema = OFF`, `cell_size_check = ON`, `temp_store = MEMORY`) with lazy `clip_contents` offloading (`text`, `qrCodeText`, `rtf`, `html`) so resident `AppModel` headers keep full bodies out of idle RAM and hydrate on demand (`searchQueue` incremental donor reuse for search).
+  - Certificate-signed Release builds store a 256-bit master key (encoded as 64 lowercase hex ASCII bytes) in `~/Library/Keychains/login.keychain-db` (`kSecClassGenericPassword`, service `com.ikryanov.clipbook.v2.encryption`, account `master-key-v1`, `kSecAttrSynchronizable = false`) and derive four domain-separated 256-bit `HKDF<SHA256>` subkeys (`dbColumnAEADKey`, `assetFileAEADKey`, `contentKeyHMACKey`, `keyVerifierHMACKey`, verified at startup against `store_metadata` `'key_verifier_v1'`). When Keychain is locked or the key is unavailable or mismatched at launch, ClipBook pauses clipboard capture instead of resetting `History.sqlite` and surfaces **Unlock History** controls in the History window, menu bar (**Unlock History...**), and **Settings -> Import**.
+  - Whenever `SensitiveContent.shouldEncryptAtRest` holds (explicit `.sensitive` mark, concealed clipboard types, or detected credentials/tokens/`otpauth://`/`WIFI:` QR payloads across untruncated `text`, `qrCodeText`, `html`, `rtfData`, `title`, `linkPreviewDetails`, or `filePaths`), all 11 sensitive `clips` and `clip_contents` columns are sealed with `0x01` + `AES-256-GCM` authenticated against `columnAAD(table:column:clipID:)`, and managed external assets under `Images/*.enc` and `LinkPreviews/*.enc` are sealed with `"CBENC01\0"` + `AES-256-GCM` authenticated against `assetAAD(role:clipID:)`.
+  - **Zero-plaintext screenshot staging:** New `.image` captures are written immediately as `0600` `Images/<id>.enc` before background Vision OCR runs on in-memory PNG bytes; once OCR finishes, secret or concealed captures stay encrypted (or purge immediately under `dontSave`) while benign captures demote cleanly to `.png`. Any staged `.enc` image whose OCR was interrupted by quit or lock remains protected across export, paste, drag, and preview until recognition resumes on next launch or unlock.
+- **Development & ad-hoc Release storage isolation (`ClipBook2-Debug/`):**
+  - `AppDirectories.usesIsolatedDebugStorage` inspects the running process via `SecCodeCopySigningInformation` and routes both `#if DEBUG` builds (`com.ikryanov.clipbook.v2.debug`) and any unsigned or ad-hoc `-configuration Release` build (for example `CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= CODE_SIGN_IDENTITY=-`, `./run.sh --configuration Release`, or `./scripts/release-fork.sh --smoke-test`) to `~/Library/Application Support/ClipBook2-Debug/` with a local `0600` `.devkey` (`FileDatabaseKeyProvider`). Local non-certificate builds never migrate production `~/Library/Application Support/ClipBook2/` or write `cdhash:`-pinned items into `login.keychain-db`.
+- **Unencrypted (`v1`) vs passphrase-encrypted (`v2`) `.clipbookarchive` exports:**
+  - Unencrypted exports produce Upstream-compatible `formatVersion = 1` bundles (prompting first when history contains sensitive items so you can encrypt, skip sensitive items, or confirm plaintext export).
+  - Passphrase-encrypted exports produce `formatVersion = 2` bundles backed by `600,000`-iteration `PBKDF2-HMAC-SHA256` (Unicode NFC passphrase) + `HKDF<SHA256>` and `"CBARC02\0"` `AES-256-GCM` over `tags.json.enc`, `history.json.enc` (with `expectedAssets` 64-hex SHA-256 inventory), and `assets/**/*.enc` authenticated against `SHA256(manifest.json)`.
+- **Offline emergency recovery:** See [docs/recovery.md](docs/recovery.md) for the exact `HKDF-SHA256` / `PBKDF2-HMAC-SHA256` / `AES-256-GCM` wire format, macOS Keychain retrieval commands (GUI and headless SSH), and runnable `uv run --with cryptography` recipes to decrypt a local `History.sqlite` + `.enc` assets or a `formatVersion = 2` `.clipbookarchive` offline.
 
 ## License
 

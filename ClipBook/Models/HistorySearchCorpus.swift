@@ -7,13 +7,259 @@ import os
 nonisolated final class HistorySearchCorpus: Sendable {
     let revision: Int
     let ids: [UUID]
+    let revisions: [UInt64]
     let texts: [String]
+    let tagNamesByID: [Tag.ID: String]
+    let hasCompleteTexts: Bool
+    private static let cancellationPollMask = 4_095
+    private static let parallelResolveThreshold = 2_048
     fileprivate let cachedIndexByID = OSAllocatedUnfairLock<[UUID: Int]?>(initialState: nil)
+    fileprivate let cachedASCIIFlags = OSAllocatedUnfairLock<[Bool]?>(initialState: nil)
 
-    init(revision: Int, ids: [UUID], texts: [String]) {
+    init(
+        revision: Int,
+        ids: [UUID],
+        revisions: [UInt64] = [],
+        texts: [String],
+        tagNamesByID: [Tag.ID: String] = [:],
+        hasCompleteTexts: Bool = true
+    ) {
         self.revision = revision
         self.ids = ids
+        self.revisions = revisions.count == ids.count
+            ? revisions
+            : Array(repeating: 0, count: ids.count)
         self.texts = texts
+        self.tagNamesByID = tagNamesByID
+        self.hasCompleteTexts = hasCompleteTexts
+    }
+
+    func indexByID() -> [UUID: Int] {
+        if let cached = cachedIndexByID.withLock({ $0 }) {
+            return cached
+        }
+        var built = [UUID: Int](minimumCapacity: ids.count)
+        for (index, id) in ids.enumerated() {
+            built[id] = index
+        }
+        let indexByID = built
+        return cachedIndexByID.withLock { state in
+            if let existing = state {
+                return existing
+            }
+            state = indexByID
+            return indexByID
+        }
+    }
+
+    func reusableText(for item: ClipboardItem, tagNamesByID: [Tag.ID: String]) -> String? {
+        guard hasCompleteTexts else {
+            return nil
+        }
+        return reusableText(for: item, tagNamesByID: tagNamesByID, indexByID: indexByID())
+    }
+
+    private func reusableText(
+        for item: ClipboardItem,
+        tagNamesByID: [Tag.ID: String],
+        indexByID: [UUID: Int]
+    ) -> String? {
+        guard item.searchRevision != 0,
+              let index = indexByID[item.id],
+              index < revisions.count,
+              index < texts.count,
+              revisions[index] == item.searchRevision,
+              item.tags.isEmpty || item.tags.allSatisfy({ self.tagNamesByID[$0] == tagNamesByID[$0] }) else {
+            return nil
+        }
+        return texts[index]
+    }
+
+    static func resolve(
+        _ descriptor: AppModel.SearchCorpusDescriptor,
+        previousCorpus: HistorySearchCorpus? = nil,
+        fetchSearchTexts: ((_ ids: [UUID], _ trashed: Bool, _ tagNamesByID: [Tag.ID: String], _ isCancelled: () -> Bool) throws -> [String?]?)?,
+        isCancelled: () -> Bool = { false }
+    ) -> HistorySearchCorpus? {
+        if isCancelled() {
+            return nil
+        }
+        if let cached = descriptor.cachedCorpus {
+            return cached
+        }
+        if let previousCorpus,
+           previousCorpus.revision == descriptor.revision,
+           previousCorpus.hasCompleteTexts {
+            return previousCorpus
+        }
+
+        let count = descriptor.headers.count
+        if count == 0 {
+            return HistorySearchCorpus(
+                revision: descriptor.revision,
+                ids: [],
+                revisions: [],
+                texts: [],
+                tagNamesByID: descriptor.tagNamesByID,
+                hasCompleteTexts: true
+            )
+        }
+
+        let primaryDonor = previousCorpus?.hasCompleteTexts == true ? previousCorpus : nil
+        let secondaryDonor = (descriptor.donorCorpus === previousCorpus || descriptor.donorCorpus?.hasCompleteTexts != true)
+            ? nil
+            : descriptor.donorCorpus
+        let primaryIndexByID = primaryDonor?.indexByID()
+        let secondaryIndexByID = secondaryDonor?.indexByID()
+
+        var ids = [UUID](repeating: UUID(), count: count)
+        var revisions = [UInt64](repeating: 0, count: count)
+        var texts = [String](repeating: "", count: count)
+        var missingSlots: [(slotIndex: Int, id: UUID)] = []
+
+        let headers = descriptor.headers
+        let tagNamesByID = descriptor.tagNamesByID
+        if count < parallelResolveThreshold {
+            headers.withUnsafeBufferPointer { buffer in
+                for i in 0..<count {
+                    if (i & cancellationPollMask) == 0, isCancelled() {
+                        return
+                    }
+                    let header = buffer[i]
+                    ids[i] = header.id
+                    if header.isContentLoaded {
+                        texts[i] = header.searchText
+                        revisions[i] = header.searchRevision
+                    } else if let primaryDonor, let primaryIndexByID,
+                              let reused = primaryDonor.reusableText(for: header, tagNamesByID: tagNamesByID, indexByID: primaryIndexByID) {
+                        texts[i] = reused
+                        revisions[i] = header.searchRevision
+                    } else if let secondaryDonor, let secondaryIndexByID,
+                              let reused = secondaryDonor.reusableText(for: header, tagNamesByID: tagNamesByID, indexByID: secondaryIndexByID) {
+                        texts[i] = reused
+                        revisions[i] = header.searchRevision
+                    } else if header.hasCompleteHeaderSearchText {
+                        texts[i] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                        revisions[i] = header.searchRevision
+                    } else {
+                        missingSlots.append((slotIndex: i, id: header.id))
+                    }
+                }
+            }
+        } else {
+            let chunkCount = min(count, max(1, ProcessInfo.processInfo.activeProcessorCount * 2))
+            let chunkSize = (count + chunkCount - 1) / chunkCount
+            var chunkMissingSlots = [[(slotIndex: Int, id: UUID)]](repeating: [], count: chunkCount)
+            headers.withUnsafeBufferPointer { headersBuffer in
+                ids.withUnsafeMutableBufferPointer { idsBuffer in
+                    revisions.withUnsafeMutableBufferPointer { revisionsBuffer in
+                        texts.withUnsafeMutableBufferPointer { textsBuffer in
+                            chunkMissingSlots.withUnsafeMutableBufferPointer { missingBuffer in
+                                nonisolated(unsafe) let headersBuffer = headersBuffer
+                                nonisolated(unsafe) let idsBuffer = idsBuffer
+                                nonisolated(unsafe) let revisionsBuffer = revisionsBuffer
+                                nonisolated(unsafe) let textsBuffer = textsBuffer
+                                nonisolated(unsafe) let missingBuffer = missingBuffer
+                                DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+                                    let start = chunk * chunkSize
+                                    let end = min(start + chunkSize, count)
+                                    guard start < end else {
+                                        return
+                                    }
+                                    var localMissing: [(slotIndex: Int, id: UUID)] = []
+                                    for i in start..<end {
+                                        if ((i &- start) & cancellationPollMask) == 0, isCancelled() {
+                                            return
+                                        }
+                                        let header = headersBuffer[i]
+                                        idsBuffer[i] = header.id
+                                        if header.isContentLoaded {
+                                            textsBuffer[i] = header.searchText
+                                            revisionsBuffer[i] = header.searchRevision
+                                        } else if let primaryDonor, let primaryIndexByID,
+                                                  let reused = primaryDonor.reusableText(for: header, tagNamesByID: tagNamesByID, indexByID: primaryIndexByID) {
+                                            textsBuffer[i] = reused
+                                            revisionsBuffer[i] = header.searchRevision
+                                        } else if let secondaryDonor, let secondaryIndexByID,
+                                                  let reused = secondaryDonor.reusableText(for: header, tagNamesByID: tagNamesByID, indexByID: secondaryIndexByID) {
+                                            textsBuffer[i] = reused
+                                            revisionsBuffer[i] = header.searchRevision
+                                        } else if header.hasCompleteHeaderSearchText {
+                                            textsBuffer[i] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                                            revisionsBuffer[i] = header.searchRevision
+                                        } else {
+                                            localMissing.append((slotIndex: i, id: header.id))
+                                        }
+                                    }
+                                    missingBuffer[chunk] = localMissing
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if isCancelled() {
+                return nil
+            }
+            let totalMissing = chunkMissingSlots.reduce(0) { $0 + $1.count }
+            missingSlots.reserveCapacity(totalMissing)
+            for chunkMissing in chunkMissingSlots {
+                missingSlots.append(contentsOf: chunkMissing)
+            }
+        }
+
+        if isCancelled() {
+            return nil
+        }
+
+        if missingSlots.isEmpty {
+            return HistorySearchCorpus(
+                revision: descriptor.revision,
+                ids: ids,
+                revisions: revisions,
+                texts: texts,
+                tagNamesByID: tagNamesByID,
+                hasCompleteTexts: true
+            )
+        }
+
+        let fetched = fetchSearchTexts.flatMap { fetch in
+            try? fetch(missingSlots.map(\.id), descriptor.isTrashed, tagNamesByID, isCancelled)
+        }
+        if fetched == nil, isCancelled() {
+            return nil
+        }
+
+        var usedFallback = false
+        headers.withUnsafeBufferPointer { buffer in
+            for (offset, slot) in missingSlots.enumerated() {
+                if (offset & cancellationPollMask) == 0, isCancelled() {
+                    return
+                }
+                let header = buffer[slot.slotIndex]
+                if let fetched, offset < fetched.count, let fetchedText = fetched[offset] {
+                    texts[slot.slotIndex] = fetchedText
+                    revisions[slot.slotIndex] = header.searchRevision
+                } else {
+                    usedFallback = true
+                    texts[slot.slotIndex] = header.headerFallbackSearchText(tagNamesByID: tagNamesByID)
+                    revisions[slot.slotIndex] = 0
+                }
+            }
+        }
+
+        if isCancelled() {
+            return nil
+        }
+
+        return HistorySearchCorpus(
+            revision: descriptor.revision,
+            ids: ids,
+            revisions: revisions,
+            texts: texts,
+            tagNamesByID: tagNamesByID,
+            hasCompleteTexts: fetched != nil && !usedFallback
+        )
     }
 }
 
@@ -160,64 +406,106 @@ nonisolated final class HistorySearchJob: Sendable {
             let texts = corpus.texts
             let checkStride = count <= 512 ? 1 : 64
             var chunkCounts = [Int](repeating: 0, count: chunkCount)
+            let existingASCIIFlags = corpus.cachedASCIIFlags.withLock { $0 }
+            let shouldRecordASCIIFlags = allowsPrefilter && existingASCIIFlags == nil && previousMatches == nil
+            var recordedASCIIFlags = shouldRecordASCIIFlags ? [Bool](repeating: false, count: count) : []
 
             matches.withUnsafeMutableBufferPointer { buffer in
                 chunkCounts.withUnsafeMutableBufferPointer { countsBuffer in
-                    nonisolated(unsafe) let buffer = buffer
-                    nonisolated(unsafe) let countsBuffer = countsBuffer
-                    DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
-                        guard !self.isCancelled else {
-                            return
-                        }
-                        let start = chunk * chunkSize
-                        let end = min(start + chunkSize, count)
-                        guard start < end else {
-                            return
-                        }
-                        var localMatchCount = 0
-                        if let previousMatches {
-                            for index in start..<end {
-                                if (index - start) % checkStride == 0, self.isCancelled {
-                                    return
+                    recordedASCIIFlags.withUnsafeMutableBufferPointer { asciiFlagsBuffer in
+                        nonisolated(unsafe) let buffer = buffer
+                        nonisolated(unsafe) let countsBuffer = countsBuffer
+                        nonisolated(unsafe) let asciiFlagsBuffer = asciiFlagsBuffer
+                        DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
+                            guard !self.isCancelled else {
+                                return
+                            }
+                            let start = chunk * chunkSize
+                            let end = min(start + chunkSize, count)
+                            guard start < end else {
+                                return
+                            }
+                            var localMatchCount = 0
+                            if let previousMatches {
+                                for index in start..<end {
+                                    if (index - start) % checkStride == 0, self.isCancelled {
+                                        return
+                                    }
+                                    let knownASCII = existingASCIIFlags?[index]
+                                    if !previousMatches[index] {
+                                        if let knownASCII {
+                                            if knownASCII {
+                                                continue
+                                            }
+                                        } else if texts[index].utf8.allSatisfy({ $0 < 0x80 }) {
+                                            continue
+                                        }
+                                    }
+                                    let matched = HistorySearchMatcher.matches(
+                                        texts[index],
+                                        terms,
+                                        locale: locale,
+                                        allowsPrefilter: allowsPrefilter,
+                                        knownAllASCII: knownASCII
+                                    )
+                                    buffer[index] = matched
+                                    if matched {
+                                        localMatchCount += 1
+                                    }
                                 }
-                                if !previousMatches[index],
-                                   texts[index].utf8.allSatisfy({ $0 < 0x80 }) {
-                                    continue
+                            } else if shouldRecordASCIIFlags {
+                                for index in start..<end {
+                                    if (index - start) % checkStride == 0, self.isCancelled {
+                                        return
+                                    }
+                                    var isASCII = false
+                                    let matched = HistorySearchMatcher.matchesRecordingASCII(
+                                        texts[index],
+                                        terms,
+                                        locale: locale,
+                                        allowsPrefilter: allowsPrefilter,
+                                        knownAllASCII: nil,
+                                        isAllASCIIOut: &isASCII
+                                    )
+                                    asciiFlagsBuffer[index] = isASCII
+                                    buffer[index] = matched
+                                    if matched {
+                                        localMatchCount += 1
+                                    }
                                 }
-                                let matched = HistorySearchMatcher.matches(
-                                    texts[index],
-                                    terms,
-                                    locale: locale,
-                                    allowsPrefilter: allowsPrefilter
-                                )
-                                buffer[index] = matched
-                                if matched {
-                                    localMatchCount += 1
+                            } else {
+                                for index in start..<end {
+                                    if (index - start) % checkStride == 0, self.isCancelled {
+                                        return
+                                    }
+                                    let matched = HistorySearchMatcher.matches(
+                                        texts[index],
+                                        terms,
+                                        locale: locale,
+                                        allowsPrefilter: allowsPrefilter,
+                                        knownAllASCII: existingASCIIFlags?[index]
+                                    )
+                                    buffer[index] = matched
+                                    if matched {
+                                        localMatchCount += 1
+                                    }
                                 }
                             }
-                        } else {
-                            for index in start..<end {
-                                if (index - start) % checkStride == 0, self.isCancelled {
-                                    return
-                                }
-                                let matched = HistorySearchMatcher.matches(
-                                    texts[index],
-                                    terms,
-                                    locale: locale,
-                                    allowsPrefilter: allowsPrefilter
-                                )
-                                buffer[index] = matched
-                                if matched {
-                                    localMatchCount += 1
-                                }
-                            }
+                            countsBuffer[chunk] = localMatchCount
                         }
-                        countsBuffer[chunk] = localMatchCount
                     }
                 }
             }
             guard !isCancelled else {
                 return nil
+            }
+            if shouldRecordASCIIFlags {
+                let completedASCIIFlags = recordedASCIIFlags
+                corpus.cachedASCIIFlags.withLock {
+                    if $0 == nil {
+                        $0 = completedASCIIFlags
+                    }
+                }
             }
             matchCount = chunkCounts.reduce(0, +)
             if matchCount > 0, !warmUpFontCascadeIfNeeded(texts: texts, matches: matches, terms: terms) {

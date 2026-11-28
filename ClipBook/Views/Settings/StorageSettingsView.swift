@@ -29,8 +29,9 @@ struct StorageSettingsView: View {
         RetentionRow(clipType: .email, value: retentionDays(for: .email))
         RetentionRow(clipType: .color, value: retentionDays(for: .color))
       }
+      .disabled(model.storeLockState != .unlocked)
     }
-    
+
     SettingsSectionGroup() {
       PickerRow(title: L10n.string("Keep deleted items in Trash"), description: L10n.string("Deleted items can be put back until this period ends. Type Trash in the search field to see them.")) {
         Picker(L10n.string("Keep deleted items in Trash"), selection: trashRetentionDays) {
@@ -39,11 +40,13 @@ struct StorageSettingsView: View {
           }
         }
         .labelsHidden()
+        .disabled(model.storeLockState != .unlocked)
       }
       SettingsRow(title: L10n.string("Empty Trash"), description: L10n.string("Permanently delete the items in the Trash.")) {
         Button(L10n.string("Empty Trash...")) {
           coordinator.emptyTrash(fromSettings: true)
         }
+        .disabled(model.storeLockState != .unlocked)
       }
     }
 

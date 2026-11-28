@@ -27,12 +27,12 @@ final class HistoryItemRowFileView: HistoryItemRowView {
       return
     }
 
-    let style: HistoryTypeIconImageStyle = isFirstFileImage(item) ? .picture : .icon
+    let style: HistoryTypeIconImageStyle = (!hidesSensitiveContent && isFirstFileImage(item)) ? .picture : .icon
     let alpha = isMissing ? Self.missingFilePreviewAlpha : 1
-    let toolTip = item.contentTitle
+    let toolTip: String? = hidesSensitiveContent ? nil : item.contentTitle
     let targetSize = CGSize(width: HistoryRow.typeIconBoxSize, height: HistoryRow.typeIconBoxSize)
     let image = filePreviewImage(filePath: filePath, targetSize: targetSize) { [weak self] image in
-      guard let self, self.isConfigured(for: item) else {
+      guard let self, self.isConfigured(for: item), !self.hidesSensitiveContent else {
         return
       }
 
@@ -59,7 +59,7 @@ final class HistoryItemRowFileView: HistoryItemRowView {
     detailsField.setContentCompressionResistancePriority(.required, for: .horizontal)
 
     let pathField = makeSecondaryLabel(
-      text: folderPath(for: item),
+      text: contentText(folderPath(for: item)),
       textColor: textColor,
       lineBreakMode: .byTruncatingMiddle
     )

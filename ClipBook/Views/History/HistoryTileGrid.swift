@@ -764,6 +764,15 @@ final class HistoryTileView: NSView {
   private let sourceAppIconView = NSImageView()
   private let selectionOrderBadgeView = HistorySelectionOrderBadgeView()
   private var configuredItemID: UUID?
+  private var hidesSensitiveContent = false
+
+  private static var placeholderSymbolImage: NSImage? {
+    let configuration = NSImage.SymbolConfiguration(pointSize: 28, weight: .regular)
+    let image = NSImage(systemSymbolName: "photo", accessibilityDescription: nil)?
+      .withSymbolConfiguration(configuration)
+    image?.isTemplate = true
+    return image
+  }
 
   var selectionState = HistoryTileSelectionState() {
     didSet {
@@ -792,14 +801,49 @@ final class HistoryTileView: NSView {
 
   /// Shows the item. The picture is decoded in the background unless it was
   /// decoded at this size before.
-  func configure(item: ClipboardItem, quickPasteIndex: Int?) {
+  func configure(
+    item: ClipboardItem,
+    quickPasteIndex: Int?,
+    detectsSensitiveContent: Bool = false,
+    hidesSensitiveContent: Bool = false
+  ) {
     let isSameItem = configuredItemID == item.id
+    let wasHidingSensitiveContent = self.hidesSensitiveContent
     configuredItemID = item.id
+    self.hidesSensitiveContent = hidesSensitiveContent
 
-    let title = Self.title(for: item)
-    titleField.stringValue = title
-    toolTip = title
-    setAccessibilityLabel(title)
+    let rawTitle = Self.title(for: item)
+    let title: String
+    if hidesSensitiveContent {
+      if let itemTitle = item.itemTitle {
+        title = SensitiveContent.maskedTitle(
+          itemTitle,
+          for: item,
+          detectsAutomatically: detectsSensitiveContent
+        )
+      } else {
+        title = SensitiveContent.maskedText(
+          rawTitle,
+          for: item,
+          detectsAutomatically: detectsSensitiveContent
+        )
+      }
+    } else {
+      title = rawTitle
+    }
+    SensitiveContent.applyMaskStyle(
+      to: titleField,
+      text: title,
+      hidesSensitiveContent: hidesSensitiveContent
+    )
+    toolTip = hidesSensitiveContent ? nil : title
+    if hidesSensitiveContent {
+      let stripped = SensitiveContent.strippingMasks(from: title)
+      let baseLabel = stripped.isEmpty ? ItemPreviewDetailsView.typeName(for: item) : stripped
+      setAccessibilityLabel("\(baseLabel), \(L10n.string("Show Sensitive Content"))")
+    } else {
+      setAccessibilityLabel(title)
+    }
     favoriteView.isHidden = !item.isFavorite
     quickPasteField.stringValue = quickPasteIndex.map { "⌘\($0)" } ?? ""
     quickPasteField.isHidden = quickPasteIndex == nil
@@ -813,7 +857,14 @@ final class HistoryTileView: NSView {
     sourceAppIconView.isHidden = sourceAppIcon == nil
     needsLayout = true
 
-    if !isSameItem {
+    if hidesSensitiveContent {
+      imageView.contentTintColor = .tertiaryLabelColor
+      imageView.image = Self.placeholderSymbolImage
+      return
+    }
+
+    imageView.contentTintColor = nil
+    if !isSameItem || wasHidingSensitiveContent {
       imageView.image = nil
     }
     loadPicture(for: item)
@@ -821,6 +872,8 @@ final class HistoryTileView: NSView {
 
   func clearForReuse() {
     configuredItemID = nil
+    hidesSensitiveContent = false
+    imageView.contentTintColor = nil
     imageView.image = nil
     selectionState = HistoryTileSelectionState()
   }
@@ -856,11 +909,19 @@ final class HistoryTileView: NSView {
     let maximumPixelSize = ImageAssetThumbnailLoader.maximumPixelSize(forDisplaySize: pictureSize, scale: scale)
     let itemID = item.id
     let isFile = item.kind == .file
+    let assetContext: ImageAssetThumbnailLoader.ManagedAssetContext? = item.kind == .image
+      ? ImageAssetThumbnailLoader.ManagedAssetContext(
+          role: .image,
+          ownerClipID: item.id,
+          requiresEncryption: SensitiveContent.requiresEncryptedAsset(for: item, role: .image)
+        )
+      : nil
     let cachedImage = ImageAssetThumbnailLoader.shared.thumbnail(
       for: url,
-      maximumPixelSize: maximumPixelSize
+      maximumPixelSize: maximumPixelSize,
+      assetContext: assetContext
     ) { [weak self] image in
-      guard let self, self.configuredItemID == itemID else {
+      guard let self, self.configuredItemID == itemID, !self.hidesSensitiveContent else {
         return
       }
 

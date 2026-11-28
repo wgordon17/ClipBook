@@ -2,16 +2,31 @@
 import AppKit
 import Foundation
 import ImageIO
+import os
 import SwiftUI
 import Testing
 import UniformTypeIdentifiers
 
-/// Container suite for tests that mutate process-global state such as the `L10n` language.
-/// Suites nested in `SharedProcessStateTests` run one after the other, but other suites still
-/// run beside them, so a test that reads localized text compares it with text produced in the
-/// same language instead of with fixed English strings.
+/// Container suite for tests that mutate process-global state such as the `L10n` language,
+/// `ImageDragFiles`, `ImageAssetThumbnailLoader.shared`, and `SVGImageRenderer.shared`.
+/// Suites nested in `SharedProcessStateTests` run one after the other so process-wide caches,
+/// temporary drag directories, and window/localization state never interleave across suites.
 @Suite(.serialized)
 enum SharedProcessStateTests {}
+
+nonisolated enum TestSQLiteFixtureError: LocalizedError, Equatable, Sendable {
+    case prepareFailed(String)
+    case stepFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .prepareFailed(let message):
+            "Test SQLite prepare failed: \(message)"
+        case .stepFailed(let message):
+            "Test SQLite step failed: \(message)"
+        }
+    }
+}
 
 final class TestNoOpUpdateService: UpdateService {
     var isRelaunchingToInstallUpdate: Bool = false
@@ -22,6 +37,224 @@ final class TestNoOpUpdateService: UpdateService {
     }
 
     func checkForUpdates(presenting window: NSWindow?) {}
+}
+
+/// Thread-safe `HistoryStore` wrapper that records `loadingContent`, `upsert`, and `fetchSearchTexts`
+/// invocations and provides fault-injection / URL-interception seams for integration tests.
+nonisolated final class SpyHistoryStore: HistoryStore, @unchecked Sendable {
+    nonisolated struct LoadingContentCall: Equatable, Sendable {
+        let id: UUID
+        let scope: ClipboardContentScope
+    }
+
+    nonisolated struct FetchSearchTextsCall: Equatable, Sendable {
+        let ids: [UUID]
+        let trashed: Bool
+        let tagNamesByID: [ClipBook.Tag.ID: String]
+    }
+
+    private nonisolated struct State: Sendable {
+        var loadingContentCalls: [LoadingContentCall] = []
+        var upsertCallIDs: [UUID] = []
+        var fetchSearchTextsCalls: [FetchSearchTextsCall] = []
+        var fetchItemsWhereCalls: Int = 0
+        var shouldThrowOnFetchSearchTexts = false
+        var suppressBrowserURLOnLoadingContent = false
+        var resolvedBrowserURLsOnLoadingContent: [URL] = []
+        var fetchItemOverride: (@Sendable (ClipboardKind, String, String?) -> ClipboardItem?)?
+    }
+
+    let base: GRDBHistoryStore
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(base: GRDBHistoryStore) {
+        self.base = base
+    }
+
+    var loadingContentCalls: [LoadingContentCall] {
+        state.withLock { $0.loadingContentCalls }
+    }
+
+    var upsertCallIDs: [UUID] {
+        state.withLock { $0.upsertCallIDs }
+    }
+
+    var fetchSearchTextsCalls: [FetchSearchTextsCall] {
+        state.withLock { $0.fetchSearchTextsCalls }
+    }
+
+    var fetchItemsWhereCalls: Int {
+        state.withLock { $0.fetchItemsWhereCalls }
+    }
+
+    var resolvedBrowserURLsOnLoadingContent: [URL] {
+        state.withLock { $0.resolvedBrowserURLsOnLoadingContent }
+    }
+
+    var shouldThrowOnFetchSearchTexts: Bool {
+        get { state.withLock { $0.shouldThrowOnFetchSearchTexts } }
+        set { state.withLock { $0.shouldThrowOnFetchSearchTexts = newValue } }
+    }
+
+    var suppressBrowserURLOnLoadingContent: Bool {
+        get { state.withLock { $0.suppressBrowserURLOnLoadingContent } }
+        set { state.withLock { $0.suppressBrowserURLOnLoadingContent = newValue } }
+    }
+
+    func resetRecordedCalls() {
+        state.withLock {
+            $0.loadingContentCalls.removeAll()
+            $0.upsertCallIDs.removeAll()
+            $0.fetchSearchTextsCalls.removeAll()
+            $0.fetchItemsWhereCalls = 0
+            $0.resolvedBrowserURLsOnLoadingContent.removeAll()
+        }
+    }
+
+    var lockState: StoreLockState { base.lockState }
+    var isOpen: Bool { base.isOpen }
+    func retryUnlock() throws { try base.retryUnlock() }
+    func flushPendingFreePageRelease() { base.flushPendingFreePageRelease() }
+    func close() { base.close() }
+
+    func computeImageDigest(forPNGData pngData: Data) -> String {
+        base.computeImageDigest(forPNGData: pngData)
+    }
+
+    func writeManagedAsset(
+        pngData: Data,
+        role: AssetRole,
+        clipID: UUID,
+        encrypted: Bool,
+        preferredPlainExtension: String?,
+        sync: Bool
+    ) throws -> URL {
+        try base.writeManagedAsset(
+            pngData: pngData,
+            role: role,
+            clipID: clipID,
+            encrypted: encrypted,
+            preferredPlainExtension: preferredPlainExtension,
+            sync: sync
+        )
+    }
+
+    func finalizeRecognizedImage(
+        id: UUID,
+        content: RecognizedImageContent,
+        sensitiveContentLifetime: Int
+    ) throws -> (updated: ClipboardItem?, previous: ClipboardItem?, isTrashed: Bool, purged: Bool) {
+        try base.finalizeRecognizedImage(
+            id: id,
+            content: content,
+            sensitiveContentLifetime: sensitiveContentLifetime
+        )
+    }
+
+    func fetchAll() throws -> [ClipboardItem] { try base.fetchAll() }
+    func fetchTrashedItems() throws -> [ClipboardItem] { try base.fetchTrashedItems() }
+    func fetchItems(trashedBefore date: Date) throws -> [ClipboardItem] { try base.fetchItems(trashedBefore: date) }
+    func moveToTrash(ids: [UUID], at date: Date) throws { try base.moveToTrash(ids: ids, at: date) }
+    func restoreFromTrash(ids: [UUID]) throws { try base.restoreFromTrash(ids: ids) }
+    func fetchTags() throws -> [ClipBook.Tag] { try base.fetchTags() }
+    func capture(_ item: ClipboardItem, updatesCopySequence: Bool) throws -> ClipboardItem {
+        try base.capture(item, updatesCopySequence: updatesCopySequence)
+    }
+
+    func upsert(_ item: ClipboardItem) throws {
+        state.withLock { $0.upsertCallIDs.append(item.id) }
+        try base.upsert(item)
+    }
+
+    @discardableResult
+    func saveAndReconcileItem(_ item: ClipboardItem, convertingExternalAssets: Bool) throws -> ClipboardItem {
+        try base.saveAndReconcileItem(item, convertingExternalAssets: convertingExternalAssets)
+    }
+
+    func setSensitivity(_ sensitivity: ItemSensitivity?, for id: UUID) throws -> ClipboardItem? {
+        try base.setSensitivity(sensitivity, for: id)
+    }
+
+    func loadingContent(of item: ClipboardItem, scope: ClipboardContentScope) throws -> ClipboardItem {
+        let hydrated = try base.loadingContent(of: item, scope: scope)
+        let shouldSuppressBrowserURL = state.withLock { state -> Bool in
+            state.loadingContentCalls.append(LoadingContentCall(id: item.id, scope: scope))
+            if let url = hydrated.browserURL {
+                state.resolvedBrowserURLsOnLoadingContent.append(url)
+            }
+            return state.suppressBrowserURLOnLoadingContent
+        }
+        if shouldSuppressBrowserURL {
+            var suppressed = hydrated
+            suppressed.text = "not a valid url"
+            return suppressed
+        }
+        return hydrated
+    }
+
+    func createTag(name: String, color: String) throws -> ClipBook.Tag { try base.createTag(name: name, color: color) }
+    func updateTag(id: ClipBook.Tag.ID, name: String, color: String) throws -> ClipBook.Tag { try base.updateTag(id: id, name: name, color: color) }
+    func deleteTag(id: ClipBook.Tag.ID) throws { try base.deleteTag(id: id) }
+    func delete(_ id: UUID) throws { try base.delete(id) }
+    func delete(ids: [UUID]) throws { try base.delete(ids: ids) }
+    func clear() throws { try base.clear() }
+    func clear(keepingFavoritesAndTaggedItems: Bool) throws { try base.clear(keepingFavoritesAndTaggedItems: keepingFavoritesAndTaggedItems) }
+    func recordAction(_ id: UUID, copiedAt: Date?, incrementsCopyCount: Bool) throws -> ClipboardItem? {
+        try base.recordAction(id, copiedAt: copiedAt, incrementsCopyCount: incrementsCopyCount)
+    }
+    func fetchItems(expiredBy policy: HistoryRetentionPolicy) throws -> [ClipboardItem] { try base.fetchItems(expiredBy: policy) }
+    func fetchItems(expiringBy date: Date) throws -> [ClipboardItem] { try base.fetchItems(expiringBy: date) }
+    func nextExpiryDate() throws -> Date? { try base.nextExpiryDate() }
+    var fetchItemOverride: (@Sendable (ClipboardKind, String, String?) -> ClipboardItem?)? {
+        get { state.withLock { $0.fetchItemOverride } }
+        set { state.withLock { $0.fetchItemOverride = newValue } }
+    }
+
+    func fetchItem(kind: ClipboardKind, contentKey: String, htmlDigest: String?) throws -> ClipboardItem? {
+        if let override = state.withLock({ $0.fetchItemOverride }),
+           let item = override(kind, contentKey, htmlDigest) {
+            return item
+        }
+        return try base.fetchItem(kind: kind, contentKey: contentKey, htmlDigest: htmlDigest)
+    }
+    func fetchStoredFilePaths() throws -> Set<String> { try base.fetchStoredFilePaths() }
+    func fetchTrashedAssetPaths() throws -> Set<String> { try base.fetchTrashedAssetPaths() }
+
+    func fetchSearchTexts(
+        for ids: [UUID],
+        trashed: Bool,
+        tagNamesByID: [ClipBook.Tag.ID: String],
+        isCancelled: () -> Bool
+    ) throws -> [String?]? {
+        let shouldThrow = state.withLock { state -> Bool in
+            state.fetchSearchTextsCalls.append(
+                FetchSearchTextsCall(ids: ids, trashed: trashed, tagNamesByID: tagNamesByID)
+            )
+            return state.shouldThrowOnFetchSearchTexts
+        }
+        if shouldThrow {
+            throw TestSQLiteFixtureError.stepFailed("Simulated fetchSearchTexts failure")
+        }
+        return try base.fetchSearchTexts(
+            for: ids,
+            trashed: trashed,
+            tagNamesByID: tagNamesByID,
+            isCancelled: isCancelled
+        )
+    }
+
+    func fetchItems(where isIncluded: (ClipboardItem) -> Bool) throws -> [ClipboardItem] {
+        state.withLock { $0.fetchItemsWhereCalls += 1 }
+        return try base.fetchItems(where: isIncluded)
+    }
+
+    func fetchMostRecentItem(where isIncluded: (ClipboardItem) -> Bool) throws -> ClipboardItem? {
+        try base.fetchMostRecentItem(where: isIncluded)
+    }
+
+    func performInTransaction(_ body: () throws -> Void) throws {
+        try base.performInTransaction(body)
+    }
 }
 
 struct RenderedViewSnapshot {
@@ -37,7 +270,7 @@ struct RenderedViewSnapshot {
 final class TestCoordinatorHarness {
     let coordinator: AppCoordinator
     let model: AppModel
-    let historyStore: SQLiteHistoryStore
+    let historyStore: GRDBHistoryStore
     let preferencesStore: PreferencesStore
     let clipboardMonitor: PasteboardMonitor
     let globalShortcuts: GlobalShortcutService
@@ -51,7 +284,7 @@ final class TestCoordinatorHarness {
     init(
         coordinator: AppCoordinator,
         model: AppModel,
-        historyStore: SQLiteHistoryStore,
+        historyStore: GRDBHistoryStore,
         preferencesStore: PreferencesStore,
         clipboardMonitor: PasteboardMonitor,
         globalShortcuts: GlobalShortcutService,
@@ -75,7 +308,7 @@ final class TestCoordinatorHarness {
     /// Stores `items` and loads them into the model, as if they had been captured earlier.
     func seedHistory(_ items: [ClipboardItem]) throws {
         for item in items {
-            try historyStore.upsert(item)
+            try historyStore.saveAndReconcileItem(item, convertingExternalAssets: true)
         }
         coordinator.loadHistory()
     }
@@ -93,6 +326,8 @@ final class TestCoordinatorHarness {
         guard !isCleanedUp else { return }
         isCleanedUp = true
         coordinator.stopBackgroundWorkForTesting()
+        coordinator.cancelBackgroundMaintenance()
+        historyStore.close()
         pasteboard.releaseGlobally()
         TestSupport.removeDefaultsSuite(named: userDefaultsSuiteName)
         try? FileManager.default.removeItem(at: supportDirectory)
@@ -102,6 +337,8 @@ final class TestCoordinatorHarness {
         let suiteName = userDefaultsSuiteName
         let supportDir = supportDirectory
         if !isCleanedUp {
+            coordinator.cancelOrphanedFileSweeps(waitUntilDone: true)
+            historyStore.close()
             TestSupport.removeDefaultsSuite(named: suiteName)
             try? FileManager.default.removeItem(at: supportDir)
         }
@@ -249,9 +486,14 @@ enum TestSupport {
         return try await body(directory)
     }
 
-    static func withTemporaryHistoryStore<T>(_ body: (SQLiteHistoryStore, URL) throws -> T) throws -> T {
+    static func withTemporaryHistoryStore<T>(_ body: (GRDBHistoryStore, URL) throws -> T) throws -> T {
         try withTemporaryDirectory { directory in
-            try body(SQLiteHistoryStore(directory: directory), directory)
+            let store = GRDBHistoryStore(
+                directory: directory,
+                keyProvider: InMemoryDatabaseKeyProvider()
+            )
+            defer { store.close() }
+            return try body(store, directory)
         }
     }
 
@@ -268,7 +510,7 @@ enum TestSupport {
     }
 
     /// Removes the preferences of a test suite, and the empty property list that removing the domain leaves behind.
-    static func removeDefaultsSuite(named suiteName: String) {
+    nonisolated static func removeDefaultsSuite(named suiteName: String) {
         UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
         let propertyList = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Preferences/\(suiteName).plist")
@@ -284,19 +526,37 @@ enum TestSupport {
     }
 
     @MainActor
-    static func makeTestCoordinator() throws -> TestCoordinatorHarness {
+    private static func buildCoordinatorHarness(
+        supportDirectory: URL?,
+        defaultDirectoryPrefix: String,
+        keyProvider: any DatabaseKeyProvider,
+        probeStoreBeforeInit: Bool,
+        wrapStore: (GRDBHistoryStore) -> any HistoryStore,
+        now: @escaping @Sendable () -> Date,
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent,
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent,
+        bindsMonitorDelegate: Bool,
+        configureInitialPreferences: ((inout AppPreferences) -> Void)?
+    ) throws -> (harness: TestCoordinatorHarness, pasteService: PasteService) {
         ensureAppKitInitialized()
         let fileManager = FileManager.default
-        let supportDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("ClipBookCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        let resolvedSupportDir = supportDirectory ?? fileManager.temporaryDirectory
+            .appendingPathComponent("\(defaultDirectoryPrefix)-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: resolvedSupportDir, withIntermediateDirectories: true)
 
         let suiteName = "com.ikryanov.clipbook.coordinator.tests.\(UUID().uuidString)"
         let userDefaults = try #require(UserDefaults(suiteName: suiteName))
         userDefaults.removePersistentDomain(forName: suiteName)
 
         let pasteboard = NSPasteboard.withUniqueName()
-        let historyStore = SQLiteHistoryStore(directory: supportDirectory)
+        let baseStore = GRDBHistoryStore(
+            directory: resolvedSupportDir,
+            keyProvider: keyProvider
+        )
+        if probeStoreBeforeInit {
+            _ = try? baseStore.fetchAll()
+        }
+        let wiredStore = wrapStore(baseStore)
         let preferencesStore = PreferencesStore(userDefaults: userDefaults)
 
         var initialPreferences = AppPreferences()
@@ -310,6 +570,7 @@ enum TestSupport {
         initialPreferences.launchAtLogin = false
         // Keep link-preview network fetches off unless a test explicitly enables them.
         initialPreferences.showPreviewForLinks = false
+        configureInitialPreferences?(&initialPreferences)
         preferencesStore.save(initialPreferences)
 
         let model = AppModel()
@@ -319,43 +580,169 @@ enum TestSupport {
         let updateService = TestNoOpUpdateService()
         let licensingService = LicensingService()
         let clipboardMonitor = PasteboardMonitor(
-            historyStore: historyStore,
+            historyStore: wiredStore,
             fileManager: fileManager,
-            supportDirectory: supportDirectory,
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            now: now,
+            recognizeImageData: recognizeImageData,
+            recognizeImageFile: recognizeImageFile
         )
-
         let pasteService = PasteService(
             pasteboard: pasteboard,
-            loadFormatting: { [historyStore] item in
-                (try? historyStore.loadingFormatting(of: item)) ?? item
+            loadContent: { [wiredStore] item, scope in
+                try wiredStore.loadingContent(of: item, scope: scope)
             }
         )
         let coordinator = AppCoordinator(
             model: model,
             preferencesStore: preferencesStore,
-            historyStore: historyStore,
+            historyStore: wiredStore,
             clipboardMonitor: clipboardMonitor,
             pasteService: pasteService,
             globalShortcuts: globalShortcuts,
             updateService: updateService,
             licensingService: licensingService,
             fileManager: fileManager,
-            supportDirectory: supportDirectory
+            supportDirectory: resolvedSupportDir
         )
+        if bindsMonitorDelegate {
+            clipboardMonitor.delegate = coordinator
+            clipboardMonitor.updatePreferences(initialPreferences)
+        }
 
-        return TestCoordinatorHarness(
+        let harness = TestCoordinatorHarness(
             coordinator: coordinator,
             model: model,
-            historyStore: historyStore,
+            historyStore: baseStore,
             preferencesStore: preferencesStore,
             clipboardMonitor: clipboardMonitor,
             globalShortcuts: globalShortcuts,
             updateService: updateService,
             pasteboard: pasteboard,
             userDefaultsSuiteName: suiteName,
-            supportDirectory: supportDirectory
+            supportDirectory: resolvedSupportDir
         )
+        return (harness, pasteService)
+    }
+
+    @MainActor
+    static func makeTestCoordinator(
+        supportDirectory: URL? = nil,
+        keyProvider: any DatabaseKeyProvider = InMemoryDatabaseKeyProvider(),
+        probeStoreBeforeInit: Bool = false,
+        now: @escaping @Sendable () -> Date = { Date() },
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofImageAt:),
+        bindsMonitorDelegate: Bool = false,
+        configureInitialPreferences: ((inout AppPreferences) -> Void)? = nil
+    ) throws -> TestCoordinatorHarness {
+        try buildCoordinatorHarness(
+            supportDirectory: supportDirectory,
+            defaultDirectoryPrefix: "ClipBookCoordinatorTests",
+            keyProvider: keyProvider,
+            probeStoreBeforeInit: probeStoreBeforeInit,
+            wrapStore: { $0 },
+            now: now,
+            recognizeImageData: recognizeImageData,
+            recognizeImageFile: recognizeImageFile,
+            bindsMonitorDelegate: bindsMonitorDelegate,
+            configureInitialPreferences: configureInitialPreferences
+        ).harness
+    }
+
+    @MainActor
+    static func makeSpiedTestCoordinator(
+        recognizeImageData: @escaping @Sendable (Data) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofPNGData:),
+        recognizeImageFile: @escaping @Sendable (URL) -> RecognizedImageContent = ImageTextRecognizer.recognizeContent(ofImageAt:)
+    ) throws -> (harness: TestCoordinatorHarness, spyStore: SpyHistoryStore, pasteService: PasteService) {
+        var capturedSpyStore: SpyHistoryStore?
+        let (harness, pasteService) = try buildCoordinatorHarness(
+            supportDirectory: nil,
+            defaultDirectoryPrefix: "ClipBookSpiedCoordinatorTests",
+            keyProvider: InMemoryDatabaseKeyProvider(),
+            probeStoreBeforeInit: false,
+            wrapStore: { baseStore in
+                let spy = SpyHistoryStore(base: baseStore)
+                capturedSpyStore = spy
+                return spy
+            },
+            now: { Date() },
+            recognizeImageData: recognizeImageData,
+            recognizeImageFile: recognizeImageFile,
+            bindsMonitorDelegate: true,
+            configureInitialPreferences: nil
+        )
+        let spyStore = try #require(capturedSpyStore)
+        return (harness, spyStore, pasteService)
+    }
+
+    @MainActor
+    private static func collectDrainTargets(from roots: [AnyObject]) -> [AnyObject] {
+        var visited = Set<ObjectIdentifier>()
+        var collected: [AnyObject] = []
+
+        func visit(_ object: AnyObject) {
+            guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+            collected.append(object)
+
+            if let historyWindow = object as? HistoryWindow {
+                visit(historyWindow.window)
+            } else if let window = object as? NSWindow {
+                if let contentVC = window.contentViewController {
+                    visit(contentVC)
+                }
+                for accessory in window.titlebarAccessoryViewControllers {
+                    visit(accessory)
+                }
+                if let contentView = window.contentView {
+                    visit(contentView)
+                }
+            } else if let controller = object as? NSViewController {
+                for child in controller.children {
+                    visit(child)
+                }
+                for presented in controller.presentedViewControllers ?? [] {
+                    visit(presented)
+                }
+                if controller.isViewLoaded {
+                    visit(controller.view)
+                }
+            } else if let view = object as? NSView {
+                for subview in view.subviews {
+                    visit(subview)
+                }
+            }
+        }
+
+        for root in roots {
+            visit(root)
+        }
+        return collected
+    }
+
+    @MainActor
+    static func drainDelayedPerforms(_ targets: [AnyObject]) {
+        let allTargets = collectDrainTargets(from: targets)
+        withExtendedLifetime((targets, allTargets)) {
+            for target in allTargets {
+                NSObject.cancelPreviousPerformRequests(withTarget: target)
+            }
+        }
+    }
+
+    @MainActor
+    static func tearDownWindow(_ window: NSWindow, keepingAlive extraTargets: [AnyObject] = []) {
+        drainDelayedPerforms([window] + extraTargets)
+        if let sheet = window.attachedSheet {
+            window.endSheet(sheet)
+        }
+        window.orderOut(nil)
+        drainDelayedPerforms([window] + extraTargets)
+    }
+
+    @MainActor
+    static func tearDownHistoryWindow(_ historyWindow: HistoryWindow, keepingAlive extraTargets: [AnyObject] = []) {
+        tearDownWindow(historyWindow.window, keepingAlive: [historyWindow] + extraTargets)
     }
 
     @MainActor
@@ -382,6 +769,10 @@ enum TestSupport {
         view.appearance = NSAppearance(named: appearance)
         container.addSubview(view)
         window.contentView = container
+        defer {
+            window.orderOut(nil)
+            NSObject.cancelPreviousPerformRequests(withTarget: view)
+        }
 
         container.layoutSubtreeIfNeeded()
         view.layoutSubtreeIfNeeded()
@@ -400,7 +791,6 @@ enum TestSupport {
         image.addRepresentation(bitmap)
         let pngData = try #require(bitmap.representation(using: .png, properties: [:]))
 
-        window.orderOut(nil)
         return RenderedViewSnapshot(image: image, bitmap: bitmap, pngData: pngData)
     }
 
